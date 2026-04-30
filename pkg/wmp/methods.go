@@ -24,12 +24,12 @@ const (
 
 // SessionCreateParams are the params for wmp.session.create.
 type SessionCreateParams struct {
-	WMP               Metadata     `json:"wmp"`
-	Participants      []string     `json:"participants,omitempty"`
-	AcceptedSchemes   []string     `json:"accepted_schemes,omitempty"`
+	WMP                 Metadata     `json:"wmp"`
+	Participants        []string     `json:"participants,omitempty"`
+	AcceptedSchemes     []string     `json:"accepted_schemes,omitempty"`
 	CapabilitiesOffered Capabilities `json:"capabilities_offered,omitempty"`
-	Security          SecurityMode `json:"security"`
-	TTL               int          `json:"ttl,omitempty"`
+	Security            SecurityMode `json:"security"`
+	TTL                 int          `json:"ttl,omitempty"`
 }
 
 // SessionCreateResult is the result for wmp.session.create.
@@ -37,6 +37,7 @@ type SessionCreateResult struct {
 	WMP          Metadata     `json:"wmp"`
 	Capabilities Capabilities `json:"capabilities,omitempty"`
 	Security     SecurityMode `json:"security"`
+	Challenge    string       `json:"challenge,omitempty"`
 }
 
 // SessionResumeParams are the params for wmp.session.resume.
@@ -54,9 +55,9 @@ type SessionCloseParams struct {
 
 // Close reason constants.
 const (
-	ReasonComplete     = "complete"
-	ReasonTimeout      = "timeout"
-	ReasonError        = "error"
+	ReasonComplete      = "complete"
+	ReasonTimeout       = "timeout"
+	ReasonError         = "error"
 	ReasonUserCancelled = "user_cancelled"
 )
 

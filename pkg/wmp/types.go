@@ -33,11 +33,14 @@ type Signature struct {
 
 // IdentityAssertion binds a cryptographic identifier to a legal identity.
 type IdentityAssertion struct {
-	Type         string      `json:"type"`
-	Format       string      `json:"format,omitempty"`
-	Credential   string      `json:"credential,omitempty"`
-	Certificates []string    `json:"certificates,omitempty"`
-	TrustHints   []TrustHint `json:"trust_hints,omitempty"`
+	Type            string      `json:"type"`
+	Format          string      `json:"format,omitempty"`
+	VPToken         string      `json:"vp_token,omitempty"`
+	Audience        string      `json:"audience,omitempty"`
+	Nonce           string      `json:"nonce,omitempty"`
+	DisclosedClaims []string    `json:"disclosed_claims,omitempty"`
+	Certificates    []string    `json:"certificates,omitempty"`
+	TrustHints      []TrustHint `json:"trust_hints,omitempty"`
 }
 
 // TrustHint suggests a trust framework for verifying an identity assertion.
