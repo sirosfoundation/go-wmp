@@ -10,17 +10,17 @@ const Version = "0.1"
 
 // Metadata is the "wmp" envelope present in every WMP message.
 type Metadata struct {
-	Version            string               `json:"version"`
-	SessionID          string               `json:"session_id,omitempty"`
-	Sender             string               `json:"sender,omitempty"`
-	Timestamp          *time.Time           `json:"timestamp,omitempty"`
-	TimestampToken     string               `json:"timestamp_token,omitempty"`
-	Encrypted          bool                 `json:"encrypted,omitempty"`
-	Epoch              *int                 `json:"epoch,omitempty"`
-	Signature          *Signature           `json:"signature,omitempty"`
-	IdentityAssertions []IdentityAssertion  `json:"identity_assertions,omitempty"`
-	RelayChain         []RelayEntry         `json:"relay_chain,omitempty"`
-	TraceID            string               `json:"trace_id,omitempty"`
+	Version            string              `json:"version"`
+	SessionID          string              `json:"session_id,omitempty"`
+	Sender             string              `json:"sender,omitempty"`
+	Timestamp          *time.Time          `json:"timestamp,omitempty"`
+	TimestampToken     string              `json:"timestamp_token,omitempty"`
+	Encrypted          bool                `json:"encrypted,omitempty"`
+	Epoch              *int                `json:"epoch,omitempty"`
+	Signature          *Signature          `json:"signature,omitempty"`
+	IdentityAssertions []IdentityAssertion `json:"identity_assertions,omitempty"`
+	RelayChain         []RelayEntry        `json:"relay_chain,omitempty"`
+	TraceID            string              `json:"trace_id,omitempty"`
 }
 
 // Signature provides non-repudiation for a message.
@@ -39,7 +39,7 @@ type IdentityAssertion struct {
 	Audience        string      `json:"audience,omitempty"`
 	Nonce           string      `json:"nonce,omitempty"`
 	DisclosedClaims []string    `json:"disclosed_claims,omitempty"`
-	Certificates    []string    `json:"certificates,omitempty"`
+	X5C             []string    `json:"x5c,omitempty"`
 	TrustHints      []TrustHint `json:"trust_hints,omitempty"`
 }
 
@@ -66,12 +66,12 @@ type RelayEntry struct {
 
 // SecurityMode represents the session security configuration.
 type SecurityMode struct {
-	Mode                    string   `json:"mode"`
-	MinTLSVersion           string   `json:"min_tls_version,omitempty"`
-	CipherSuites            []int    `json:"cipher_suites,omitempty"`
-	CipherSuite             *int     `json:"cipher_suite,omitempty"`
-	MLSGroupInfo            string   `json:"mls_group_info,omitempty"`
-	EncryptedCapabilities   []string `json:"encrypted_capabilities,omitempty"`
+	Mode                  string   `json:"mode"`
+	MinTLSVersion         string   `json:"min_tls_version,omitempty"`
+	CipherSuites          []int    `json:"cipher_suites,omitempty"`
+	CipherSuite           *int     `json:"cipher_suite,omitempty"`
+	MLSGroupInfo          string   `json:"mls_group_info,omitempty"`
+	EncryptedCapabilities []string `json:"encrypted_capabilities,omitempty"`
 }
 
 // Capabilities maps capability names to their parameters.
