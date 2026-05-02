@@ -17,18 +17,10 @@ type Metadata struct {
 	TimestampToken     string              `json:"timestamp_token,omitempty"`
 	Encrypted          bool                `json:"encrypted,omitempty"`
 	Epoch              *int                `json:"epoch,omitempty"`
-	Signature          *Signature          `json:"signature,omitempty"`
+	Signature          string              `json:"signature,omitempty"`
 	IdentityAssertions []IdentityAssertion `json:"identity_assertions,omitempty"`
 	RelayChain         []RelayEntry        `json:"relay_chain,omitempty"`
 	TraceID            string              `json:"trace_id,omitempty"`
-}
-
-// Signature provides non-repudiation for a message.
-type Signature struct {
-	Alg   string   `json:"alg"`
-	Kid   string   `json:"kid"`
-	Value string   `json:"value"`
-	X5C   []string `json:"x5c,omitempty"`
 }
 
 // IdentityAssertion binds a cryptographic identifier to a legal identity.
@@ -57,11 +49,11 @@ type TrustHint struct {
 
 // RelayEntry records provenance when messages traverse a relay.
 type RelayEntry struct {
-	Relay        string     `json:"relay"`
-	RelayID      string     `json:"relay_id"`
-	Timestamp    time.Time  `json:"timestamp"`
-	Signature    *Signature `json:"signature,omitempty"`
-	ServiceClass string     `json:"service_class,omitempty"`
+	Relay        string    `json:"relay"`
+	RelayID      string    `json:"relay_id"`
+	Timestamp    time.Time `json:"timestamp"`
+	Signature    string    `json:"signature,omitempty"`
+	ServiceClass string    `json:"service_class,omitempty"`
 }
 
 // SecurityMode represents the session security configuration.

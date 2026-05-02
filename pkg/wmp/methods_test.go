@@ -11,7 +11,7 @@ func TestSessionCreateParams_Marshal(t *testing.T) {
 			Version: Version,
 			Sender:  "did:web:alice.example.com",
 		},
-		Participants:      []string{"did:web:bob.example.com"},
+		Participants: []string{"did:web:bob.example.com"},
 		CapabilitiesOffered: Capabilities{
 			"messaging": mustMarshal(MessagingCap{MaxSize: 65536}),
 		},

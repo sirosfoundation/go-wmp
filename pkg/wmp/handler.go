@@ -45,9 +45,9 @@ func (BaseHandler) SessionCreate(context.Context, *SessionCreateParams) (*Sessio
 func (BaseHandler) SessionResume(context.Context, *SessionResumeParams) (*SessionCreateResult, error) {
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }
-func (BaseHandler) SessionClose(context.Context, *SessionCloseParams) {}
+func (BaseHandler) SessionClose(context.Context, *SessionCloseParams)     {}
 func (BaseHandler) MessageDeliver(context.Context, *MessageDeliverParams) {}
-func (BaseHandler) MessageAck(context.Context, *MessageAckParams)        {}
+func (BaseHandler) MessageAck(context.Context, *MessageAckParams)         {}
 func (BaseHandler) MessagePoll(context.Context, *MessagePollParams) (*MessagePollResult, error) {
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }
