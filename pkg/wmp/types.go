@@ -49,11 +49,12 @@ type TrustHint struct {
 
 // RelayEntry records provenance when messages traverse a relay.
 type RelayEntry struct {
-	Relay        string    `json:"relay"`
-	RelayID      string    `json:"relay_id"`
-	Timestamp    time.Time `json:"timestamp"`
-	Signature    string    `json:"signature,omitempty"`
-	ServiceClass string    `json:"service_class,omitempty"`
+	Relay          string    `json:"relay"`
+	RelayID        string    `json:"relay_id"`
+	Timestamp      time.Time `json:"timestamp"`
+	TimestampToken string    `json:"timestamp_token,omitempty"`
+	Signature      string    `json:"signature,omitempty"`
+	ServiceClass   string    `json:"service_class,omitempty"`
 }
 
 // SecurityMode represents the session security configuration.
