@@ -1,4 +1,3 @@
-package httpsse
 // Package httpsse provides an HTTPS+SSE transport for WMP.
 package httpsse
 

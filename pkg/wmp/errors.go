@@ -13,8 +13,10 @@ const (
 	ErrParticipantNotFound     = -31008
 	ErrEvidenceRequired        = -31009
 	ErrSignatureInvalid        = -31010
-	ErrTimestampInvalid        = -31011
+	ErrTimestampInvalid         = -31011
 	ErrIdentityAssertionInvalid = -31012
+	ErrVersionNotSupported      = -31013
+	ErrQueueFull                = -31014
 )
 
 // Standard JSON-RPC 2.0 error codes.
@@ -55,6 +57,10 @@ func ErrorMessage(code int) string {
 		return "Timestamp invalid"
 	case ErrIdentityAssertionInvalid:
 		return "Identity assertion invalid"
+	case ErrVersionNotSupported:
+		return "Version not supported"
+	case ErrQueueFull:
+		return "Queue full"
 	case ErrParseError:
 		return "Parse error"
 	case ErrInvalidRequest:

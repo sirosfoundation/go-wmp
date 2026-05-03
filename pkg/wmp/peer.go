@@ -4,17 +4,37 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 )
 
+// SupportedVersions is the list of protocol versions this implementation supports.
+var SupportedVersions = []string{Version}
+
+// PeerOption configures a Peer.
+type PeerOption func(*Peer)
+
+// WithLogger sets a structured logger for the Peer.
+func WithLogger(logger *slog.Logger) PeerOption {
+	return func(p *Peer) { p.logger = logger }
+}
+
+// WithMaxMessageSize sets the maximum incoming message size in bytes.
+// Messages exceeding this limit are rejected. Default: 1MB.
+func WithMaxMessageSize(size int) PeerOption {
+	return func(p *Peer) { p.maxMessageSize = size }
+}
+
 // Peer represents one side of a WMP connection. It handles incoming messages
 // by dispatching to a Handler, and provides methods to send outgoing messages.
 type Peer struct {
-	transport Transport
-	handler   Handler
-	registry  *registry
-	sessions  SessionStore
+	transport      Transport
+	handler        Handler
+	registry       *registry
+	sessions       SessionStore
+	logger         *slog.Logger
+	maxMessageSize int
 
 	mu      sync.Mutex
 	pending map[string]chan *Response // keyed by request ID
@@ -23,13 +43,19 @@ type Peer struct {
 }
 
 // NewPeer creates a new Peer over the given transport, dispatching to handler.
-func NewPeer(transport Transport, handler Handler) *Peer {
-	return &Peer{
-		transport: transport,
-		handler:   handler,
-		registry:  newRegistry(),
-		pending:   make(map[string]chan *Response),
+func NewPeer(transport Transport, handler Handler, opts ...PeerOption) *Peer {
+	p := &Peer{
+		transport:      transport,
+		handler:        handler,
+		registry:       newRegistry(),
+		pending:        make(map[string]chan *Response),
+		logger:         slog.Default(),
+		maxMessageSize: 1 << 20, // 1MB default
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // Use registers a profile with this Peer. Profiles are initialized immediately.
@@ -80,6 +106,16 @@ func (p *Peer) Serve(ctx context.Context) error {
 				return ctx.Err()
 			}
 			return fmt.Errorf("read: %w", err)
+		}
+
+		// Enforce message size limit.
+		if len(data) > p.maxMessageSize {
+			p.logger.Warn("message exceeds size limit", "size", len(data), "max", p.maxMessageSize)
+			resp := NewErrorResponse(nil, NewRPCError(ErrInvalidRequest, map[string]string{
+				"reason": "message too large",
+			}))
+			p.sendJSON(ctx, resp)
+			continue
 		}
 
 		// Try batch first.
@@ -133,6 +169,21 @@ func (p *Peer) handleResponse(resp *Response) {
 }
 
 func (p *Peer) handleRequest(ctx context.Context, req *Request) {
+	// Extract WMP metadata for context enrichment.
+	var meta struct {
+		WMP Metadata `json:"wmp"`
+	}
+	if err := json.Unmarshal(req.Params, &meta); err == nil {
+		if meta.WMP.Sender != "" {
+			ctx = ContextWithSender(ctx, meta.WMP.Sender)
+		}
+		if meta.WMP.SessionID != "" && p.sessions != nil {
+			if sess, ok := p.sessions.Get(meta.WMP.SessionID); ok {
+				ctx = ContextWithSession(ctx, sess)
+			}
+		}
+	}
+
 	// Run through middleware chain, then dispatch.
 	result, err := p.registry.runMiddleware(ctx, req.Method, req.Params, func(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
 		return p.dispatchMethodInternal(ctx, method, params)
@@ -171,12 +222,40 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		return p.handler.SessionCreate(ctx, &ps)
+		// Version negotiation: reject unsupported versions.
+		if !isSupportedVersion(ps.WMP.Version) {
+			return nil, NewRPCError(ErrVersionNotSupported, map[string]interface{}{
+				"supported_versions": SupportedVersions,
+			})
+		}
+		result, err := p.handler.SessionCreate(ctx, &ps)
+		if err != nil {
+			return nil, err
+		}
+		// Run session create hooks if we have a session store.
+		if result != nil && p.sessions != nil && result.WMP.SessionID != "" {
+			sess := &Session{
+				ID:           result.WMP.SessionID,
+				Participants: ps.Participants,
+				Capabilities: result.Capabilities,
+				Security:     result.Security,
+			}
+			if hookErr := p.registry.runSessionCreateHooks(ctx, sess, &ps); hookErr != nil {
+				return nil, toRPCError(hookErr)
+			}
+			_ = p.sessions.Create(sess)
+		}
+		return result, nil
 
 	case MethodSessionResume:
 		var ps SessionResumeParams
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
+		}
+		if !isSupportedVersion(ps.WMP.Version) {
+			return nil, NewRPCError(ErrVersionNotSupported, map[string]interface{}{
+				"supported_versions": SupportedVersions,
+			})
 		}
 		return p.handler.SessionResume(ctx, &ps)
 
@@ -187,6 +266,13 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		}
 		p.handler.SessionClose(ctx, &ps)
 		return nil, nil
+
+	case MethodSessionAuthenticate:
+		var ps SessionAuthenticateParams
+		if err := json.Unmarshal(params, &ps); err != nil {
+			return nil, NewRPCError(ErrInvalidParams, nil)
+		}
+		return p.handler.SessionAuthenticate(ctx, &ps)
 
 	case MethodMessageDeliver:
 		var ps MessageDeliverParams
@@ -202,6 +288,14 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
 		p.handler.MessageAck(ctx, &ps)
+		return nil, nil
+
+	case MethodMessageStatus:
+		var ps MessageStatusParams
+		if err := json.Unmarshal(params, &ps); err != nil {
+			return nil, NewRPCError(ErrInvalidParams, nil)
+		}
+		p.handler.MessageStatus(ctx, &ps)
 		return nil, nil
 
 	case MethodMessagePoll:
@@ -287,6 +381,17 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		}
 		p.handler.FlowError(ctx, &ps)
 		return nil, nil
+
+	case MethodFlowCancel:
+		var ps FlowCancelParams
+		if err := json.Unmarshal(params, &ps); err != nil {
+			return nil, NewRPCError(ErrInvalidParams, nil)
+		}
+		// Untrack the flow if it's managed by a profile.
+		if _, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
+			p.registry.untrackFlow(ps.FlowID)
+		}
+		return p.handler.FlowCancel(ctx, &ps)
 
 	case MethodResolve:
 		var ps ResolveParams
@@ -382,4 +487,14 @@ func toRPCError(err error) *RPCError {
 		return rpcErr
 	}
 	return NewRPCError(ErrInternalError, nil)
+}
+
+// isSupportedVersion returns true if the given version is in SupportedVersions.
+func isSupportedVersion(version string) bool {
+	for _, v := range SupportedVersions {
+		if v == version {
+			return true
+		}
+	}
+	return false
 }

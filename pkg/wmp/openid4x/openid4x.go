@@ -10,6 +10,7 @@ package openid4x
 import (
 	"context"
 	"encoding/json"
+	"sync"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 )
@@ -102,6 +103,7 @@ type Profile struct {
 	peer   wmp.PeerContext
 
 	// Track which flow type each flow_id belongs to.
+	mu        sync.Mutex
 	flowTypes map[string]string
 }
 
@@ -150,10 +152,14 @@ func (p *Profile) StartFlow(ctx context.Context, params *wmp.FlowStartParams) (*
 	switch params.FlowType {
 	case FlowTypeOID4VCI:
 		if p.config.OnVCIStart != nil {
+			p.mu.Lock()
 			p.flowTypes[params.FlowID] = FlowTypeOID4VCI
+			p.mu.Unlock()
 			return p.config.OnVCIStart(ctx, p.peer, params)
 		}
+		p.mu.Lock()
 		p.flowTypes[params.FlowID] = FlowTypeOID4VCI
+		p.mu.Unlock()
 		return &wmp.FlowStartResult{
 			WMP:      params.WMP,
 			FlowID:   params.FlowID,
@@ -162,10 +168,14 @@ func (p *Profile) StartFlow(ctx context.Context, params *wmp.FlowStartParams) (*
 
 	case FlowTypeOID4VP:
 		if p.config.OnVPStart != nil {
+			p.mu.Lock()
 			p.flowTypes[params.FlowID] = FlowTypeOID4VP
+			p.mu.Unlock()
 			return p.config.OnVPStart(ctx, p.peer, params)
 		}
+		p.mu.Lock()
 		p.flowTypes[params.FlowID] = FlowTypeOID4VP
+		p.mu.Unlock()
 		return &wmp.FlowStartResult{
 			WMP:      params.WMP,
 			FlowID:   params.FlowID,
@@ -178,7 +188,9 @@ func (p *Profile) StartFlow(ctx context.Context, params *wmp.FlowStartParams) (*
 }
 
 func (p *Profile) HandleAction(ctx context.Context, params *wmp.FlowActionParams) (*wmp.FlowActionResult, error) {
+	p.mu.Lock()
 	flowType := p.flowTypes[params.FlowID]
+	p.mu.Unlock()
 	switch flowType {
 	case FlowTypeOID4VCI:
 		if p.config.OnVCIAction != nil {
@@ -202,11 +214,15 @@ func (p *Profile) HandleProgress(ctx context.Context, params *wmp.FlowProgressPa
 }
 
 func (p *Profile) HandleComplete(ctx context.Context, params *wmp.FlowCompleteParams) {
+	p.mu.Lock()
 	delete(p.flowTypes, params.FlowID)
+	p.mu.Unlock()
 }
 
 func (p *Profile) HandleError(ctx context.Context, params *wmp.FlowErrorParams) {
+	p.mu.Lock()
 	delete(p.flowTypes, params.FlowID)
+	p.mu.Unlock()
 }
 
 // --- wmp.ResolveHandler interface ---

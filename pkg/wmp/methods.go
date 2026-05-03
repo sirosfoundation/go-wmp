@@ -4,20 +4,23 @@ import "encoding/json"
 
 // Method constants for all WMP methods.
 const (
-	MethodSessionCreate    = "wmp.session.create"
-	MethodSessionResume    = "wmp.session.resume"
-	MethodSessionClose     = "wmp.session.close"
-	MethodMessageDeliver   = "wmp.message.deliver"
-	MethodMessageAck       = "wmp.message.ack"
-	MethodMessagePoll      = "wmp.message.poll"
-	MethodCapabilityUpdate = "wmp.capability.update"
-	MethodCapabilityList   = "wmp.capability.list"
-	MethodFlowStart        = "wmp.flow.start"
-	MethodFlowProgress     = "wmp.flow.progress"
-	MethodFlowAction       = "wmp.flow.action"
-	MethodFlowComplete     = "wmp.flow.complete"
-	MethodFlowError        = "wmp.flow.error"
-	MethodResolve          = "wmp.resolve"
+	MethodSessionCreate       = "wmp.session.create"
+	MethodSessionResume        = "wmp.session.resume"
+	MethodSessionClose         = "wmp.session.close"
+	MethodSessionAuthenticate  = "wmp.session.authenticate"
+	MethodMessageDeliver       = "wmp.message.deliver"
+	MethodMessageAck           = "wmp.message.ack"
+	MethodMessagePoll          = "wmp.message.poll"
+	MethodMessageStatus        = "wmp.message.status"
+	MethodCapabilityUpdate     = "wmp.capability.update"
+	MethodCapabilityList       = "wmp.capability.list"
+	MethodFlowStart            = "wmp.flow.start"
+	MethodFlowProgress         = "wmp.flow.progress"
+	MethodFlowAction           = "wmp.flow.action"
+	MethodFlowComplete         = "wmp.flow.complete"
+	MethodFlowError            = "wmp.flow.error"
+	MethodFlowCancel           = "wmp.flow.cancel"
+	MethodResolve              = "wmp.resolve"
 )
 
 // --- Session ---
@@ -26,10 +29,10 @@ const (
 type SessionCreateParams struct {
 	WMP                 Metadata     `json:"wmp"`
 	Participants        []string     `json:"participants,omitempty"`
-	AcceptedSchemes     []string     `json:"accepted_schemes,omitempty"`
 	CapabilitiesOffered Capabilities `json:"capabilities_offered,omitempty"`
 	Security            SecurityMode `json:"security"`
 	TTL                 int          `json:"ttl,omitempty"`
+	Auth                *AuthObject  `json:"auth,omitempty"`
 }
 
 // SessionCreateResult is the result for wmp.session.create.
@@ -137,6 +140,7 @@ type FlowStartParams struct {
 	FlowType string          `json:"flow_type"`
 	FlowID   string          `json:"flow_id"`
 	Params   json.RawMessage `json:"params,omitempty"`
+	Timeout  int             `json:"timeout,omitempty"`
 }
 
 // FlowStartResult is the result for wmp.flow.start.
@@ -219,4 +223,77 @@ const (
 	ResolveTypeTrust            = "trust"
 	ResolveTypeEndpoint         = "endpoint"
 	ResolveTypeOpenIDFederation = "openid_federation"
+)
+
+// --- Flow Cancel ---
+
+// FlowCancelParams are the params for wmp.flow.cancel.
+type FlowCancelParams struct {
+	WMP    Metadata `json:"wmp"`
+	FlowID string   `json:"flow_id"`
+	Reason string   `json:"reason,omitempty"`
+}
+
+// FlowCancelResult is the result for wmp.flow.cancel.
+type FlowCancelResult struct {
+	WMP    Metadata `json:"wmp"`
+	FlowID string   `json:"flow_id"`
+	Status string   `json:"status"`
+}
+
+// Flow cancel reason constants.
+const (
+	CancelReasonUserCancelled = "user_cancelled"
+	CancelReasonSuperseded    = "superseded"
+	CancelReasonNoLongerNeeded = "no_longer_needed"
+)
+
+// --- Message Status ---
+
+// MessageStatusParams are the params for wmp.message.status (notification).
+type MessageStatusParams struct {
+	WMP       Metadata `json:"wmp"`
+	MessageID string   `json:"message_id"`
+	Status    string   `json:"status"`
+	Reason    string   `json:"reason,omitempty"`
+}
+
+// Message status constants.
+const (
+	MessageStatusQueued    = "queued"
+	MessageStatusDelivered = "delivered"
+	MessageStatusExpired   = "expired"
+	MessageStatusDropped   = "dropped"
+)
+
+// --- Session Authentication ---
+
+// AuthObject represents the auth field in session.create or session.authenticate.
+type AuthObject struct {
+	Type      string          `json:"type"`
+	Token     string          `json:"token,omitempty"`
+	Proof     string          `json:"proof,omitempty"`
+	Challenge string          `json:"challenge,omitempty"`
+	DIDAuth   json.RawMessage `json:"did_auth,omitempty"`
+}
+
+// SessionAuthenticateParams are the params for wmp.session.authenticate.
+type SessionAuthenticateParams struct {
+	WMP  Metadata   `json:"wmp"`
+	Auth AuthObject `json:"auth"`
+}
+
+// SessionAuthenticateResult is the result for wmp.session.authenticate.
+type SessionAuthenticateResult struct {
+	WMP           Metadata `json:"wmp"`
+	Authenticated bool     `json:"authenticated"`
+	Identity      string   `json:"identity,omitempty"`
+}
+
+// Authentication type constants.
+const (
+	AuthTypeBearer  = "bearer"
+	AuthTypeDPoP    = "dpop"
+	AuthTypeMTLS    = "mtls"
+	AuthTypeDIDAuth = "did_auth"
 )

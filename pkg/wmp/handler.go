@@ -14,11 +14,13 @@ type Handler interface {
 	SessionCreate(ctx context.Context, params *SessionCreateParams) (*SessionCreateResult, error)
 	SessionResume(ctx context.Context, params *SessionResumeParams) (*SessionCreateResult, error)
 	SessionClose(ctx context.Context, params *SessionCloseParams)
+	SessionAuthenticate(ctx context.Context, params *SessionAuthenticateParams) (*SessionAuthenticateResult, error)
 
 	// Message delivery
 	MessageDeliver(ctx context.Context, params *MessageDeliverParams)
 	MessageAck(ctx context.Context, params *MessageAckParams)
 	MessagePoll(ctx context.Context, params *MessagePollParams) (*MessagePollResult, error)
+	MessageStatus(ctx context.Context, params *MessageStatusParams)
 
 	// Capability negotiation
 	CapabilityUpdate(ctx context.Context, params *CapabilityUpdateParams) (*CapabilityUpdateResult, error)
@@ -30,6 +32,7 @@ type Handler interface {
 	FlowAction(ctx context.Context, params *FlowActionParams) (*FlowActionResult, error)
 	FlowComplete(ctx context.Context, params *FlowCompleteParams)
 	FlowError(ctx context.Context, params *FlowErrorParams)
+	FlowCancel(ctx context.Context, params *FlowCancelParams) (*FlowCancelResult, error)
 
 	// Metadata resolution
 	Resolve(ctx context.Context, params *ResolveParams) (*ResolveResult, error)
@@ -46,8 +49,12 @@ func (BaseHandler) SessionResume(context.Context, *SessionResumeParams) (*Sessio
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }
 func (BaseHandler) SessionClose(context.Context, *SessionCloseParams)     {}
+func (BaseHandler) SessionAuthenticate(context.Context, *SessionAuthenticateParams) (*SessionAuthenticateResult, error) {
+	return nil, NewRPCError(ErrMethodNotFound, nil)
+}
 func (BaseHandler) MessageDeliver(context.Context, *MessageDeliverParams) {}
 func (BaseHandler) MessageAck(context.Context, *MessageAckParams)         {}
+func (BaseHandler) MessageStatus(context.Context, *MessageStatusParams)   {}
 func (BaseHandler) MessagePoll(context.Context, *MessagePollParams) (*MessagePollResult, error) {
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }
@@ -66,6 +73,9 @@ func (BaseHandler) FlowAction(context.Context, *FlowActionParams) (*FlowActionRe
 }
 func (BaseHandler) FlowComplete(context.Context, *FlowCompleteParams) {}
 func (BaseHandler) FlowError(context.Context, *FlowErrorParams)       {}
+func (BaseHandler) FlowCancel(context.Context, *FlowCancelParams) (*FlowCancelResult, error) {
+	return nil, NewRPCError(ErrMethodNotFound, nil)
+}
 func (BaseHandler) Resolve(context.Context, *ResolveParams) (*ResolveResult, error) {
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }

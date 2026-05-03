@@ -15,6 +15,7 @@ type Metadata struct {
 	Sender             string              `json:"sender,omitempty"`
 	Timestamp          *time.Time          `json:"timestamp,omitempty"`
 	TimestampToken     string              `json:"timestamp_token,omitempty"`
+	ExpiresAt          *time.Time          `json:"expires_at,omitempty"`
 	Encrypted          bool                `json:"encrypted,omitempty"`
 	Epoch              *int                `json:"epoch,omitempty"`
 	Signature          string              `json:"signature,omitempty"`
