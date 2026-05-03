@@ -13,6 +13,8 @@ import (
 type Peer struct {
 	transport Transport
 	handler   Handler
+	registry  *registry
+	sessions  SessionStore
 
 	mu      sync.Mutex
 	pending map[string]chan *Response // keyed by request ID
@@ -25,8 +27,47 @@ func NewPeer(transport Transport, handler Handler) *Peer {
 	return &Peer{
 		transport: transport,
 		handler:   handler,
+		registry:  newRegistry(),
 		pending:   make(map[string]chan *Response),
 	}
+}
+
+// Use registers a profile with this Peer. Profiles are initialized immediately.
+// Call Use() before Serve(). Returns an error if the profile's handlers conflict
+// with already-registered handlers.
+func (p *Peer) Use(profile Profile) error {
+	if err := p.registry.register(profile); err != nil {
+		return err
+	}
+	return profile.Init(p)
+}
+
+// UseMiddleware adds middleware to the processing chain. Middleware is called
+// in registration order for every incoming request.
+func (p *Peer) UseMiddleware(mw Middleware) {
+	p.registry.addMiddleware(mw)
+}
+
+// SetSessionStore sets the session store used for session hooks.
+func (p *Peer) SetSessionStore(store SessionStore) {
+	p.sessions = store
+}
+
+// Session returns the session for the given ID, or nil. Implements PeerContext.
+func (p *Peer) Session(id string) *Session {
+	if p.sessions == nil {
+		return nil
+	}
+	s, _ := p.sessions.Get(id)
+	return s
+}
+
+// ResolveIdentifier attempts to discover the WMP endpoint for a given
+// identifier using registered IdentifierResolvers. Returns nil if no
+// resolver can handle the identifier (caller should fall back to
+// well-known configuration or session parameters).
+func (p *Peer) ResolveIdentifier(ctx context.Context, identifier string) (*DiscoveredEndpoint, error) {
+	return p.registry.resolveIdentifier(ctx, identifier)
 }
 
 // Serve reads messages from the transport and dispatches them to the handler.
@@ -92,141 +133,177 @@ func (p *Peer) handleResponse(resp *Response) {
 }
 
 func (p *Peer) handleRequest(ctx context.Context, req *Request) {
-	result, rpcErr := p.dispatchMethod(ctx, req)
+	// Run through middleware chain, then dispatch.
+	result, err := p.registry.runMiddleware(ctx, req.Method, req.Params, func(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
+		return p.dispatchMethodInternal(ctx, method, params)
+	})
 
 	// Notifications get no response.
 	if req.IsNotification() {
 		return
 	}
 
-	if rpcErr != nil {
+	if err != nil {
+		rpcErr := toRPCError(err)
 		resp := NewErrorResponse(req.ID, rpcErr)
 		p.sendJSON(ctx, resp)
 		return
 	}
 
-	resp, err := NewResponse(req.ID, result)
-	if err != nil {
+	if result == nil {
+		// Notification-style methods that return no result — send empty success.
+		resp, _ := NewResponse(req.ID, struct{}{})
+		p.sendJSON(ctx, resp)
+		return
+	}
+
+	resp, marshalErr := NewResponse(req.ID, result)
+	if marshalErr != nil {
 		resp = NewErrorResponse(req.ID, NewRPCError(ErrInternalError, nil))
 	}
 	p.sendJSON(ctx, resp)
 }
 
-func (p *Peer) dispatchMethod(ctx context.Context, req *Request) (interface{}, *RPCError) {
-	switch req.Method {
+func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
+	switch method {
 	case MethodSessionCreate:
-		var params SessionCreateParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps SessionCreateParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		result, err := p.handler.SessionCreate(ctx, &params)
-		return result, toRPCError(err)
+		return p.handler.SessionCreate(ctx, &ps)
 
 	case MethodSessionResume:
-		var params SessionResumeParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps SessionResumeParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		result, err := p.handler.SessionResume(ctx, &params)
-		return result, toRPCError(err)
+		return p.handler.SessionResume(ctx, &ps)
 
 	case MethodSessionClose:
-		var params SessionCloseParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps SessionCloseParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		p.handler.SessionClose(ctx, &params)
+		p.handler.SessionClose(ctx, &ps)
 		return nil, nil
 
 	case MethodMessageDeliver:
-		var params MessageDeliverParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps MessageDeliverParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		p.handler.MessageDeliver(ctx, &params)
+		p.handler.MessageDeliver(ctx, &ps)
 		return nil, nil
 
 	case MethodMessageAck:
-		var params MessageAckParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps MessageAckParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		p.handler.MessageAck(ctx, &params)
+		p.handler.MessageAck(ctx, &ps)
 		return nil, nil
 
 	case MethodMessagePoll:
-		var params MessagePollParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps MessagePollParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		result, err := p.handler.MessagePoll(ctx, &params)
-		return result, toRPCError(err)
+		return p.handler.MessagePoll(ctx, &ps)
 
 	case MethodCapabilityUpdate:
-		var params CapabilityUpdateParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps CapabilityUpdateParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		result, err := p.handler.CapabilityUpdate(ctx, &params)
-		return result, toRPCError(err)
+		return p.handler.CapabilityUpdate(ctx, &ps)
 
 	case MethodCapabilityList:
-		var params CapabilityListParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps CapabilityListParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		result, err := p.handler.CapabilityList(ctx, &params)
-		return result, toRPCError(err)
+		return p.handler.CapabilityList(ctx, &ps)
 
 	case MethodFlowStart:
-		var params FlowStartParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps FlowStartParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		result, err := p.handler.FlowStart(ctx, &params)
-		return result, toRPCError(err)
+		// Check if a profile handles this flow type.
+		if fh, ok := p.registry.lookupFlowHandler(ps.FlowType); ok {
+			result, err := fh.StartFlow(ctx, &ps)
+			if err == nil && result != nil {
+				p.registry.trackFlow(ps.FlowID, fh)
+			}
+			return result, err
+		}
+		return p.handler.FlowStart(ctx, &ps)
 
 	case MethodFlowProgress:
-		var params FlowProgressParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps FlowProgressParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		p.handler.FlowProgress(ctx, &params)
+		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
+			fh.HandleProgress(ctx, &ps)
+			return nil, nil
+		}
+		p.handler.FlowProgress(ctx, &ps)
 		return nil, nil
 
 	case MethodFlowAction:
-		var params FlowActionParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps FlowActionParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		result, err := p.handler.FlowAction(ctx, &params)
-		return result, toRPCError(err)
+		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
+			return fh.HandleAction(ctx, &ps)
+		}
+		return p.handler.FlowAction(ctx, &ps)
 
 	case MethodFlowComplete:
-		var params FlowCompleteParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps FlowCompleteParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		p.handler.FlowComplete(ctx, &params)
+		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
+			fh.HandleComplete(ctx, &ps)
+			p.registry.untrackFlow(ps.FlowID)
+			return nil, nil
+		}
+		p.handler.FlowComplete(ctx, &ps)
 		return nil, nil
 
 	case MethodFlowError:
-		var params FlowErrorParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps FlowErrorParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		p.handler.FlowError(ctx, &params)
+		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
+			fh.HandleError(ctx, &ps)
+			p.registry.untrackFlow(ps.FlowID)
+			return nil, nil
+		}
+		p.handler.FlowError(ctx, &ps)
 		return nil, nil
 
 	case MethodResolve:
-		var params ResolveParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		var ps ResolveParams
+		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		result, err := p.handler.Resolve(ctx, &params)
-		return result, toRPCError(err)
+		// Check if a profile handles this resolve type.
+		if rh, ok := p.registry.lookupResolver(ps.Type); ok {
+			return rh.HandleResolve(ctx, &ps)
+		}
+		return p.handler.Resolve(ctx, &ps)
 
 	default:
+		// Check if a profile handles this custom method.
+		if mh, ok := p.registry.lookupMethod(method); ok {
+			return mh.HandleMethod(ctx, method, params)
+		}
 		return nil, NewRPCError(ErrMethodNotFound, nil)
 	}
 }
