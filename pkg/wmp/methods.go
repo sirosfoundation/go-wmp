@@ -21,6 +21,7 @@ const (
 	MethodFlowError           = "wmp.flow.error"
 	MethodFlowCancel          = "wmp.flow.cancel"
 	MethodResolve             = "wmp.resolve"
+	MethodRelayRegister       = "wmp.relay.register"
 )
 
 // --- Session ---
@@ -296,4 +297,27 @@ const (
 	AuthTypeDPoP    = "dpop"
 	AuthTypeMTLS    = "mtls"
 	AuthTypeDIDAuth = "did_auth"
+)
+
+// --- Relay Registration ---
+
+// RelayRegisterParams are the params for wmp.relay.register.
+type RelayRegisterParams struct {
+	WMP  Metadata    `json:"wmp"`
+	Auth *AuthObject `json:"auth,omitempty"`
+}
+
+// RelayRegisterResult is the result for wmp.relay.register.
+type RelayRegisterResult struct {
+	WMP        Metadata `json:"wmp"`
+	Registered bool     `json:"registered"`
+	TTL        int      `json:"ttl,omitempty"`
+}
+
+// Relay service class constants.
+const (
+	ServiceClassBestEffort = "best_effort"
+	ServiceClassStandard   = "standard"
+	ServiceClassRegistered = "registered"
+	ServiceClassCertified  = "certified"
 )
