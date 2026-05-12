@@ -460,6 +460,68 @@ func (p *Peer) Call(ctx context.Context, method string, params interface{}, resu
 	}
 }
 
+// HandleRequestSync dispatches a single JSON-RPC request synchronously and
+// returns the JSON-RPC response bytes. This is intended for HTTP endpoint
+// handlers where each POST carries one request and expects a response.
+// Notifications (no ID) are processed but return nil bytes.
+func (p *Peer) HandleRequestSync(ctx context.Context, data []byte) ([]byte, error) {
+	msg, err := DecodeMessage(data)
+	if err != nil {
+		resp := NewErrorResponse(nil, NewRPCError(ErrParseError, nil))
+		return json.Marshal(resp)
+	}
+
+	if msg.IsResponse() {
+		// Responses are routed to pending Call() waiters.
+		p.handleResponse(msg.AsResponse())
+		return nil, nil
+	}
+
+	req := msg.AsRequest()
+
+	// Extract WMP metadata for context enrichment.
+	var meta struct {
+		WMP Metadata `json:"wmp"`
+	}
+	if err := json.Unmarshal(req.Params, &meta); err == nil {
+		if meta.WMP.Sender != "" {
+			ctx = ContextWithSender(ctx, meta.WMP.Sender)
+		}
+		if meta.WMP.SessionID != "" && p.sessions != nil {
+			if sess, ok := p.sessions.Get(meta.WMP.SessionID); ok {
+				ctx = ContextWithSession(ctx, sess)
+			}
+		}
+	}
+
+	// Run through middleware chain, then dispatch.
+	result, dispatchErr := p.registry.runMiddleware(ctx, req.Method, req.Params, func(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
+		return p.dispatchMethodInternal(ctx, method, params)
+	})
+
+	// Notifications get no response.
+	if req.IsNotification() {
+		return nil, nil
+	}
+
+	if dispatchErr != nil {
+		rpcErr := toRPCError(dispatchErr)
+		resp := NewErrorResponse(req.ID, rpcErr)
+		return json.Marshal(resp)
+	}
+
+	if result == nil {
+		resp, _ := NewResponse(req.ID, struct{}{})
+		return json.Marshal(resp)
+	}
+
+	resp, marshalErr := NewResponse(req.ID, result)
+	if marshalErr != nil {
+		resp = NewErrorResponse(req.ID, NewRPCError(ErrInternalError, nil))
+	}
+	return json.Marshal(resp)
+}
+
 // Close closes the peer and its underlying transport.
 func (p *Peer) Close() error {
 	if p.closed.CompareAndSwap(false, true) {
