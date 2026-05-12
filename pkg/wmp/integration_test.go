@@ -16,7 +16,7 @@ type testProfile struct {
 	initPeer PeerContext
 }
 
-func (p *testProfile) Name() string          { return p.name }
+func (p *testProfile) Name() string           { return p.name }
 func (p *testProfile) Capabilities() []string { return p.caps }
 func (p *testProfile) Init(ctx PeerContext) error {
 	p.initPeer = ctx

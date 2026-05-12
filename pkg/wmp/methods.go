@@ -5,22 +5,22 @@ import "encoding/json"
 // Method constants for all WMP methods.
 const (
 	MethodSessionCreate       = "wmp.session.create"
-	MethodSessionResume        = "wmp.session.resume"
-	MethodSessionClose         = "wmp.session.close"
-	MethodSessionAuthenticate  = "wmp.session.authenticate"
-	MethodMessageDeliver       = "wmp.message.deliver"
-	MethodMessageAck           = "wmp.message.ack"
-	MethodMessagePoll          = "wmp.message.poll"
-	MethodMessageStatus        = "wmp.message.status"
-	MethodCapabilityUpdate     = "wmp.capability.update"
-	MethodCapabilityList       = "wmp.capability.list"
-	MethodFlowStart            = "wmp.flow.start"
-	MethodFlowProgress         = "wmp.flow.progress"
-	MethodFlowAction           = "wmp.flow.action"
-	MethodFlowComplete         = "wmp.flow.complete"
-	MethodFlowError            = "wmp.flow.error"
-	MethodFlowCancel           = "wmp.flow.cancel"
-	MethodResolve              = "wmp.resolve"
+	MethodSessionResume       = "wmp.session.resume"
+	MethodSessionClose        = "wmp.session.close"
+	MethodSessionAuthenticate = "wmp.session.authenticate"
+	MethodMessageDeliver      = "wmp.message.deliver"
+	MethodMessageAck          = "wmp.message.ack"
+	MethodMessagePoll         = "wmp.message.poll"
+	MethodMessageStatus       = "wmp.message.status"
+	MethodCapabilityUpdate    = "wmp.capability.update"
+	MethodCapabilityList      = "wmp.capability.list"
+	MethodFlowStart           = "wmp.flow.start"
+	MethodFlowProgress        = "wmp.flow.progress"
+	MethodFlowAction          = "wmp.flow.action"
+	MethodFlowComplete        = "wmp.flow.complete"
+	MethodFlowError           = "wmp.flow.error"
+	MethodFlowCancel          = "wmp.flow.cancel"
+	MethodResolve             = "wmp.resolve"
 )
 
 // --- Session ---
@@ -243,8 +243,8 @@ type FlowCancelResult struct {
 
 // Flow cancel reason constants.
 const (
-	CancelReasonUserCancelled = "user_cancelled"
-	CancelReasonSuperseded    = "superseded"
+	CancelReasonUserCancelled  = "user_cancelled"
+	CancelReasonSuperseded     = "superseded"
 	CancelReasonNoLongerNeeded = "no_longer_needed"
 )
 

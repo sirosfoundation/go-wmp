@@ -13,8 +13,8 @@ import (
 // served at /.well-known/wmp-configuration.
 type WellKnownConfig struct {
 	SupportedVersions []string               `json:"supported_versions"`
-	Endpoints         map[string]string       `json:"endpoints"`
-	Capabilities      map[string]interface{}  `json:"capabilities,omitempty"`
+	Endpoints         map[string]string      `json:"endpoints"`
+	Capabilities      map[string]interface{} `json:"capabilities,omitempty"`
 	AcceptedSchemes   []string               `json:"accepted_schemes,omitempty"`
 	SecurityModes     []string               `json:"security_modes,omitempty"`
 	MLSKeyPackages    string                 `json:"mls_key_packages,omitempty"`

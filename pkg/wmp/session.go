@@ -11,6 +11,7 @@ type Session struct {
 	Participants []string
 	Capabilities Capabilities
 	Security     SecurityMode
+	Metadata     map[string]string
 	CreatedAt    time.Time
 	ExpiresAt    time.Time
 }
@@ -42,6 +43,12 @@ type SessionStore interface {
 	Get(id string) (*Session, bool)
 	Update(session *Session) error
 	Delete(id string) error
+	// GetByMetadata returns all sessions where Metadata[key] == value.
+	GetByMetadata(key, value string) ([]*Session, error)
+	// List returns all active (non-expired) sessions.
+	List() ([]*Session, error)
+	// Cleanup removes all expired sessions and returns the count removed.
+	Cleanup() (int, error)
 }
 
 // MemorySessionStore is a thread-safe in-memory SessionStore.
@@ -81,4 +88,41 @@ func (s *MemorySessionStore) Delete(id string) error {
 	defer s.mu.Unlock()
 	delete(s.sessions, id)
 	return nil
+}
+
+func (s *MemorySessionStore) GetByMetadata(key, value string) ([]*Session, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*Session
+	for _, sess := range s.sessions {
+		if sess.Metadata != nil && sess.Metadata[key] == value && !sess.IsExpired() {
+			result = append(result, sess)
+		}
+	}
+	return result, nil
+}
+
+func (s *MemorySessionStore) List() ([]*Session, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*Session
+	for _, sess := range s.sessions {
+		if !sess.IsExpired() {
+			result = append(result, sess)
+		}
+	}
+	return result, nil
+}
+
+func (s *MemorySessionStore) Cleanup() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for id, sess := range s.sessions {
+		if sess.IsExpired() {
+			delete(s.sessions, id)
+			count++
+		}
+	}
+	return count, nil
 }

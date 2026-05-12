@@ -29,6 +29,9 @@ type Transport struct {
 	incoming chan []byte
 	mu       sync.Mutex
 	closed   bool
+
+	// Last received event ID for reconnection.
+	lastEventID string
 }
 
 // ClientOption configures a client-side HTTPS transport.
@@ -61,6 +64,8 @@ func NewClientTransport(endpoint string, opts ...ClientOption) *Transport {
 
 // ConnectSSE establishes an SSE connection for server-initiated messages.
 // This should be called after session creation, passing the session ID.
+// On reconnection, it sends the Last-Event-ID header so the server can
+// replay missed events.
 func (t *Transport) ConnectSSE(ctx context.Context, sessionID string) error {
 	url := t.endpoint + "/events?session_id=" + sessionID
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -72,6 +77,13 @@ func (t *Transport) ConnectSSE(ctx context.Context, sessionID string) error {
 		for _, v := range vs {
 			req.Header.Add(k, v)
 		}
+	}
+	// Send Last-Event-ID for replay on reconnection.
+	t.mu.Lock()
+	lastID := t.lastEventID
+	t.mu.Unlock()
+	if lastID != "" {
+		req.Header.Set("Last-Event-ID", lastID)
 	}
 
 	resp, err := t.httpClient.Do(req)
@@ -92,17 +104,34 @@ func (t *Transport) ConnectSSE(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+// LastEventID returns the ID of the most recently received SSE event.
+// Use this value when reconnecting to resume from where the client left off.
+func (t *Transport) LastEventID() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastEventID
+}
+
 func (t *Transport) readSSE() {
 	defer t.sseResp.Body.Close()
+	var currentID string
 	for {
 		line, err := t.sseReader.ReadString('\n')
 		if err != nil {
 			return
 		}
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "data: ") {
+		if strings.HasPrefix(line, "id: ") {
+			currentID = strings.TrimPrefix(line, "id: ")
+		} else if strings.HasPrefix(line, "data: ") {
 			data := strings.TrimPrefix(line, "data: ")
 			t.incoming <- []byte(data)
+			if currentID != "" {
+				t.mu.Lock()
+				t.lastEventID = currentID
+				t.mu.Unlock()
+				currentID = ""
+			}
 		}
 	}
 }
@@ -177,15 +206,69 @@ func (t *Transport) Close() error {
 // wmp.Transport. Use this on the server side to accept HTTPS WMP connections.
 //
 // For each POST, the handler reads the JSON-RPC request, pushes it to the
-// incoming channel, and writes the response. SSE is handled via GET.
+// incoming channel, and writes the response. SSE is handled via GET with
+// event ID tracking and Last-Event-ID replay.
 type ServerHandler struct {
 	mu       sync.RWMutex
 	sessions map[string]*serverSession
 }
 
+type serverEvent struct {
+	ID   string
+	Data []byte
+}
+
 type serverSession struct {
 	incoming chan []byte // client → server
 	outgoing chan []byte // server → client (SSE)
+
+	// Event buffer for Last-Event-ID replay.
+	bufMu    sync.Mutex
+	events   []serverEvent
+	nextID   int64
+	maxEvents int
+}
+
+func newServerSession(maxEvents int) *serverSession {
+	if maxEvents <= 0 {
+		maxEvents = 200
+	}
+	return &serverSession{
+		incoming:  make(chan []byte, 64),
+		outgoing:  make(chan []byte, 64),
+		maxEvents: maxEvents,
+	}
+}
+
+// bufferEvent stores an event with a monotonic ID for replay.
+func (s *serverSession) bufferEvent(data []byte) string {
+	s.bufMu.Lock()
+	defer s.bufMu.Unlock()
+	s.nextID++
+	id := fmt.Sprintf("evt-%d", s.nextID)
+	s.events = append(s.events, serverEvent{ID: id, Data: data})
+	// Evict oldest if over cap.
+	if len(s.events) > s.maxEvents {
+		s.events = s.events[len(s.events)-s.maxEvents:]
+	}
+	return id
+}
+
+// replayAfter returns all buffered events after the given event ID.
+func (s *serverSession) replayAfter(lastEventID string) []serverEvent {
+	if lastEventID == "" {
+		return nil
+	}
+	s.bufMu.Lock()
+	defer s.bufMu.Unlock()
+	for i, ev := range s.events {
+		if ev.ID == lastEventID && i+1 < len(s.events) {
+			result := make([]serverEvent, len(s.events)-i-1)
+			copy(result, s.events[i+1:])
+			return result
+		}
+	}
+	return nil
 }
 
 // NewServerHandler creates a server-side HTTPS handler.
@@ -195,6 +278,9 @@ func NewServerHandler() *ServerHandler {
 	}
 }
 
+// ServerOption configures the server handler.
+type ServerOption func(*ServerHandler)
+
 // Transport returns a wmp.Transport for the given session ID.
 // Call this after session creation to get a transport for the Peer.
 func (h *ServerHandler) Transport(sessionID string) *ServerTransport {
@@ -202,10 +288,7 @@ func (h *ServerHandler) Transport(sessionID string) *ServerTransport {
 	defer h.mu.Unlock()
 	sess, ok := h.sessions[sessionID]
 	if !ok {
-		sess = &serverSession{
-			incoming: make(chan []byte, 64),
-			outgoing: make(chan []byte, 64),
-		}
+		sess = newServerSession(200)
 		h.sessions[sessionID] = sess
 	}
 	return &ServerTransport{sess: sess}
@@ -251,10 +334,7 @@ func (h *ServerHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 
 	if !ok {
 		// For session creation, create a placeholder.
-		sess = &serverSession{
-			incoming: make(chan []byte, 64),
-			outgoing: make(chan []byte, 64),
-		}
+		sess = newServerSession(200)
 		h.mu.Lock()
 		h.sessions[sessionID] = sess
 		h.mu.Unlock()
@@ -299,13 +379,23 @@ func (h *ServerHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	flusher.Flush()
 
+	// Replay missed events if Last-Event-ID is set.
+	lastEventID := r.Header.Get("Last-Event-ID")
+	if lastEventID != "" {
+		for _, ev := range sess.replayAfter(lastEventID) {
+			fmt.Fprintf(w, "id: %s\nevent: wmp\ndata: %s\n\n", ev.ID, ev.Data)
+		}
+		flusher.Flush()
+	}
+
 	for {
 		select {
 		case data, open := <-sess.outgoing:
 			if !open {
 				return
 			}
-			fmt.Fprintf(w, "event: wmp\ndata: %s\n\n", data)
+			id := sess.bufferEvent(data)
+			fmt.Fprintf(w, "id: %s\nevent: wmp\ndata: %s\n\n", id, data)
 			flusher.Flush()
 		case <-r.Context().Done():
 			return

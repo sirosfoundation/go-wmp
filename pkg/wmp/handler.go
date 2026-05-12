@@ -48,7 +48,7 @@ func (BaseHandler) SessionCreate(context.Context, *SessionCreateParams) (*Sessio
 func (BaseHandler) SessionResume(context.Context, *SessionResumeParams) (*SessionCreateResult, error) {
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }
-func (BaseHandler) SessionClose(context.Context, *SessionCloseParams)     {}
+func (BaseHandler) SessionClose(context.Context, *SessionCloseParams) {}
 func (BaseHandler) SessionAuthenticate(context.Context, *SessionAuthenticateParams) (*SessionAuthenticateResult, error) {
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }
