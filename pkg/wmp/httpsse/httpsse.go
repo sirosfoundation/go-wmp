@@ -223,9 +223,9 @@ type serverSession struct {
 	outgoing chan []byte // server → client (SSE)
 
 	// Event buffer for Last-Event-ID replay.
-	bufMu    sync.Mutex
-	events   []serverEvent
-	nextID   int64
+	bufMu     sync.Mutex
+	events    []serverEvent
+	nextID    int64
 	maxEvents int
 }
 
