@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/wmp-security.json",
+  "title": "WMP Security Configuration",
+  "description": "Security mode negotiation for session creation.",
+  "type": "object",
+  "required": ["mode"],
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["tls", "mls", "mls-optional"],
+      "description": "Encryption model for the session."
+    },
+    "min_tls_version": {
+      "type": "string",
+      "description": "Minimum TLS version (for tls mode).",
+      "examples": ["1.3"]
+    },
+    "cipher_suites": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "description": "MLS cipher suite identifiers (for mls/mls-optional modes)."
+    },
+    "cipher_suite": {
+      "type": "integer",
+      "description": "Negotiated MLS cipher suite (in response)."
+    },
+    "encrypted_capabilities": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Capabilities that MUST use MLS encryption (mls-optional mode)."
+    },
+    "mls_group_info": {
+      "type": "string",
+      "description": "Base64url-encoded MLS GroupInfo (in response)."
+    }
+  },
+  "additionalProperties": false
+}

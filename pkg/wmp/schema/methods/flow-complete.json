@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/flow-complete.json",
+  "title": "wmp.flow.complete — Notification",
+  "description": "Flow reached a terminal state successfully.",
+  "type": "object",
+  "required": ["jsonrpc", "method", "params"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "method": { "const": "wmp.flow.complete" },
+    "params": {
+      "type": "object",
+      "required": ["wmp", "flow_id"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "flow_id": { "type": "string" },
+        "result": {
+          "type": "object",
+          "description": "Flow-type-specific result data."
+        }
+      }
+    }
+  }
+}

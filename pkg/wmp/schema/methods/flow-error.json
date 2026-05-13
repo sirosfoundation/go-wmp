@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/flow-error.json",
+  "title": "wmp.flow.error — Notification",
+  "description": "Flow failed.",
+  "type": "object",
+  "required": ["jsonrpc", "method", "params"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "method": { "const": "wmp.flow.error" },
+    "params": {
+      "type": "object",
+      "required": ["wmp", "flow_id", "code", "message"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "flow_id": { "type": "string" },
+        "code": { "type": "integer" },
+        "message": { "type": "string" },
+        "data": { "type": "object" }
+      }
+    }
+  }
+}

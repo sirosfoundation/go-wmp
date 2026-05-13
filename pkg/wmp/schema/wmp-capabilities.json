@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/wmp-capabilities.json",
+  "title": "WMP Capabilities Map",
+  "description": "A map of capability names to capability-specific parameters.",
+  "type": "object",
+  "properties": {
+    "messaging": {
+      "type": "object",
+      "properties": {
+        "max_size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum message body size in bytes."
+        }
+      },
+      "additionalProperties": false
+    },
+    "flows": {
+      "type": "object",
+      "properties": {
+        "max_concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum number of concurrent flows."
+        }
+      },
+      "additionalProperties": false
+    },
+    "sign": {
+      "type": "object",
+      "properties": {
+        "proof_types": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Supported proof types."
+        }
+      },
+      "additionalProperties": false
+    },
+    "mcp": {
+      "type": "object",
+      "properties": {
+        "tools": { "type": "boolean" },
+        "resources": { "type": "boolean" },
+        "prompts": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "relay": {
+      "type": "object",
+      "properties": {
+        "destinations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Allowed destination patterns."
+        }
+      },
+      "additionalProperties": false
+    },
+    "offline": {
+      "type": "object",
+      "properties": {
+        "max_queued": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum number of queued messages."
+        },
+        "ttl": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Queue retention in seconds."
+        }
+      },
+      "additionalProperties": false
+    },
+    "resolve": {
+      "type": "object",
+      "properties": {
+        "supported_types": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Resolution types this endpoint can serve."
+        }
+      },
+      "additionalProperties": false
+    },
+    "oid4vci": {
+      "type": "object",
+      "properties": {
+        "supported_grants": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "supported_formats": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "oid4vp": {
+      "type": "object",
+      "properties": {
+        "supported_response_modes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "supported_formats": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": {
+    "type": "object",
+    "description": "Custom capabilities defined by profiles or applications."
+  }
+}

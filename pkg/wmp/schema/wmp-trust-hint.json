@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/wmp-trust-hint.json",
+  "title": "WMP Trust Hint",
+  "description": "A suggestion from the sender indicating a trust framework under which a credential may be verifiable. The RP's local trust policy determines whether to act on any hint.",
+  "type": "object",
+  "required": ["framework"],
+  "properties": {
+    "framework": {
+      "type": "string",
+      "description": "Trust framework identifier.",
+      "enum": ["eidas_lote", "openid_federation", "x509_pki", "external"]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "framework": { "const": "eidas_lote" } } },
+      "then": {
+        "properties": {
+          "framework": true,
+          "lote_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "URL of the LoTE/LoTL to search."
+          },
+          "issuer_service_id": {
+            "type": "string",
+            "description": "Service identifier of the issuer within the list (speeds lookup)."
+          }
+        },
+        "required": ["framework", "lote_url"]
+      }
+    },
+    {
+      "if": { "properties": { "framework": { "const": "openid_federation" } } },
+      "then": {
+        "properties": {
+          "framework": true,
+          "trust_anchor": {
+            "type": "string",
+            "description": "Entity ID of the trust anchor."
+          },
+          "entity_statement": {
+            "type": "string",
+            "description": "Pre-fetched subordinate statement JWT (optional; avoids discovery round-trip)."
+          }
+        },
+        "required": ["framework", "trust_anchor"]
+      }
+    },
+    {
+      "if": { "properties": { "framework": { "const": "x509_pki" } } },
+      "then": {
+        "properties": {
+          "framework": true,
+          "root_ca": {
+            "type": "string",
+            "description": "Issuer DN or SKI of the expected root CA."
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "framework": { "const": "external" } } },
+      "then": {
+        "properties": {
+          "framework": true,
+          "uri": {
+            "type": "string",
+            "format": "uri",
+            "description": "Framework identifier URI."
+          },
+          "validation_endpoint": {
+            "type": "string",
+            "format": "uri",
+            "description": "URL of a status/validation service."
+          }
+        },
+        "required": ["framework", "uri"]
+      }
+    }
+  ]
+}

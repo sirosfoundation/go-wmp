@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/flow-start.json",
+  "title": "wmp.flow.start — Request",
+  "description": "Initiate a new structured flow.",
+  "type": "object",
+  "required": ["jsonrpc", "id", "method", "params"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "id": { "type": ["string", "integer"] },
+    "method": { "const": "wmp.flow.start" },
+    "params": {
+      "type": "object",
+      "required": ["wmp", "flow_type", "flow_id"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "flow_type": {
+          "type": "string",
+          "description": "Flow type identifier (e.g., sign, approval, oid4vci, oid4vp)."
+        },
+        "flow_id": {
+          "type": "string",
+          "description": "Unique flow identifier scoped to session."
+        },
+        "params": {
+          "type": "object",
+          "description": "Flow-type-specific parameters."
+        }
+      }
+    }
+  }
+}

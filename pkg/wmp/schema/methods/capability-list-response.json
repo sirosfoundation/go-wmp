@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/capability-list-response.json",
+  "title": "wmp.capability.list — Response",
+  "description": "Current negotiated capabilities and security mode.",
+  "type": "object",
+  "required": ["jsonrpc", "id", "result"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "id": { "type": ["string", "integer"] },
+    "result": {
+      "type": "object",
+      "required": ["wmp", "capabilities"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "capabilities": { "$ref": "../wmp-capabilities.json" },
+        "security": { "$ref": "../wmp-security.json" }
+      }
+    }
+  }
+}

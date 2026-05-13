@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/flow-action.json",
+  "title": "wmp.flow.action — Request",
+  "description": "Participant input or decision within a flow.",
+  "type": "object",
+  "required": ["jsonrpc", "id", "method", "params"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "id": { "type": ["string", "integer"] },
+    "method": { "const": "wmp.flow.action" },
+    "params": {
+      "type": "object",
+      "required": ["wmp", "flow_id", "action"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "flow_id": { "type": "string" },
+        "action": {
+          "type": "string",
+          "description": "Action identifier."
+        },
+        "params": {
+          "type": "object",
+          "description": "Action-specific parameters."
+        }
+      }
+    }
+  }
+}

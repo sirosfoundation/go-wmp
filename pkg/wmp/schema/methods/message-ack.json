@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/message-ack.json",
+  "title": "wmp.message.ack — Notification",
+  "description": "Acknowledge receipt of one or more messages.",
+  "type": "object",
+  "required": ["jsonrpc", "method", "params"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "method": { "const": "wmp.message.ack" },
+    "params": {
+      "type": "object",
+      "required": ["wmp", "message_ids", "status"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "message_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "IDs of acknowledged messages."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["received", "read", "processed", "failed"]
+        }
+      }
+    }
+  }
+}

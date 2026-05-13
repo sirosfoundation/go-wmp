@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/wmp-identity-assertion.json",
+  "title": "WMP Identity Assertion",
+  "description": "A verifiable binding between a cryptographic identifier and a legal identity.",
+  "type": "object",
+  "required": ["type"],
+  "oneOf": [
+    {
+      "properties": {
+        "type": { "const": "verifiable_presentation" },
+        "format": {
+          "type": "string",
+          "description": "Credential format identifier.",
+          "examples": ["vc+sd-jwt", "mso_mdoc", "jwt_vc_json", "ldp_vc"]
+        },
+        "vp_token": {
+          "type": "string",
+          "description": "The encoded Verifiable Presentation token."
+        },
+        "audience": {
+          "type": "string",
+          "description": "Session ID or MLS group ID binding the presentation to the session."
+        },
+        "nonce": {
+          "type": "string",
+          "description": "Session challenge nonce for replay protection."
+        },
+        "disclosed_claims": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Claim names disclosed in the VP, for RP convenience."
+        },
+        "trust_hints": {
+          "type": "array",
+          "items": { "$ref": "wmp-trust-hint.json" }
+        }
+      },
+      "required": ["type", "format", "vp_token", "audience", "nonce"]
+    },
+    {
+      "properties": {
+        "type": { "const": "x509_chain" },
+        "x5c": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Base64-encoded DER certificate chain (leaf first)."
+        },
+        "trust_hints": {
+          "type": "array",
+          "items": { "$ref": "wmp-trust-hint.json" }
+        }
+      },
+      "required": ["type", "x5c"]
+    }
+  ]
+}

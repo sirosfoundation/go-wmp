@@ -54,6 +54,50 @@ const (
 	ActionCancel            = "cancel"
 )
 
+// Credential format constants aligned with wallet-common VerifiableCredentialFormat.
+const (
+	FormatVCSDJWT   = "vc+sd-jwt"   // SD-JWT VC (IETF draft)
+	FormatDCSDJWT   = "dc+sd-jwt"   // Digital Credentials SD-JWT (HAIP/EU variant)
+	FormatMSOmDOC   = "mso_mdoc"    // ISO 18013-5 mDL / mDOC
+	FormatJWTVCJSON = "jwt_vc_json" // W3C JWT VC (legacy)
+)
+
+// Grant type constants for OID4VCI.
+const (
+	GrantAuthorizationCode = "authorization_code"
+	GrantPreAuthorizedCode = "pre-authorized_code"
+)
+
+// Response mode constants for OID4VP.
+const (
+	ResponseModeDirectPost    = "direct_post"
+	ResponseModeDirectPostJWT = "direct_post.jwt"
+	ResponseModeDCAPI         = "dc_api"
+	ResponseModeDCAPIJWT      = "dc_api.jwt"
+)
+
+// Proof type constants.
+const (
+	ProofTypeJWT         = "jwt"
+	ProofTypeAttestation = "attestation"
+	ProofTypeCWT         = "cwt"
+)
+
+// AllFormats returns the set of all supported credential formats.
+func AllFormats() []string {
+	return []string{FormatVCSDJWT, FormatDCSDJWT, FormatMSOmDOC, FormatJWTVCJSON}
+}
+
+// IsValidFormat checks if a format string is a known credential format.
+func IsValidFormat(format string) bool {
+	switch format {
+	case FormatVCSDJWT, FormatDCSDJWT, FormatMSOmDOC, FormatJWTVCJSON:
+		return true
+	default:
+		return false
+	}
+}
+
 // OID4VCICapability holds negotiated parameters for the oid4vci capability.
 type OID4VCICapability struct {
 	SupportedGrants     []string `json:"supported_grants"`
@@ -67,6 +111,74 @@ type OID4VPCapability struct {
 	SupportedResponseModes []string `json:"supported_response_modes"`
 	SupportedFormats       []string `json:"supported_formats"`
 	SupportedAlgorithms    []string `json:"supported_algorithms,omitempty"`
+}
+
+// CredentialConfigurationSupported describes a credential the issuer can issue.
+// Discriminated by Format: sd-jwt variants have VCT, mDOC has Doctype.
+type CredentialConfigurationSupported struct {
+	Format                              string                 `json:"format"`
+	Scope                               string                 `json:"scope,omitempty"`
+	VCT                                 string                 `json:"vct,omitempty"`     // sd-jwt formats
+	Doctype                             string                 `json:"doctype,omitempty"` // mso_mdoc
+	CryptographicBindingMethods         []string               `json:"cryptographic_binding_methods_supported,omitempty"`
+	CredentialSigningAlgValuesSupported []string               `json:"credential_signing_alg_values_supported,omitempty"`
+	ProofTypesSupported                 map[string]interface{} `json:"proof_types_supported,omitempty"`
+	Display                             []CredentialDisplay    `json:"display,omitempty"`
+}
+
+// CredentialDisplay holds display metadata for a credential configuration.
+type CredentialDisplay struct {
+	Name            string `json:"name"`
+	Locale          string `json:"locale,omitempty"`
+	Description     string `json:"description,omitempty"`
+	LogoURI         string `json:"logo_uri,omitempty"`
+	LogoAltText     string `json:"logo_alt_text,omitempty"`
+	BackgroundColor string `json:"background_color,omitempty"`
+	TextColor       string `json:"text_color,omitempty"`
+}
+
+// CredentialResult represents an issued credential in a flow completion.
+type CredentialResult struct {
+	Format     string `json:"format"`
+	Credential string `json:"credential"`
+	VCT        string `json:"vct,omitempty"`
+	CNonce     string `json:"c_nonce,omitempty"`
+}
+
+// VPTokenResult represents a VP flow completion.
+type VPTokenResult struct {
+	VPToken                string      `json:"vp_token,omitempty"`
+	PresentationSubmission interface{} `json:"presentation_submission,omitempty"`
+	ResponseCode           string      `json:"response_code,omitempty"`
+}
+
+// SignSubFlowParams are flow-type-specific params for the sign sub-flow
+// nested inside an OID4VCI flow.
+type SignSubFlowParams struct {
+	Action       string `json:"action"`
+	Nonce        string `json:"nonce"`
+	Audience     string `json:"audience"`
+	ProofType    string `json:"proof_type,omitempty"`
+	ParentFlowID string `json:"parent_flow_id"`
+}
+
+// SelectionAction is the action params for accept_offer.
+type SelectionAction struct {
+	SelectedIndices []int `json:"selected_indices"`
+	Consent         bool  `json:"consent"`
+}
+
+// ConsentAction is the action params for select_credentials (VP).
+type ConsentAction struct {
+	Selections []CredentialSelection `json:"selections"`
+	Consent    bool                  `json:"consent"`
+}
+
+// CredentialSelection represents a user's credential disclosure selection.
+type CredentialSelection struct {
+	CredentialID      string   `json:"credential_id"`
+	CredentialQueryID string   `json:"credential_query_id,omitempty"`
+	DisclosedClaims   []string `json:"disclosed_claims"`
 }
 
 // FlowStartHandler is called when an OID4VCI or OID4VP flow is started.
@@ -149,6 +261,13 @@ func (p *Profile) FlowTypes() []string {
 }
 
 func (p *Profile) StartFlow(ctx context.Context, params *wmp.FlowStartParams) (*wmp.FlowStartResult, error) {
+	// Validate flow params.
+	if params.Params != nil {
+		if err := p.validateFlowStartParams(params.FlowType, params.Params); err != nil {
+			return nil, err
+		}
+	}
+
 	switch params.FlowType {
 	case FlowTypeOID4VCI:
 		if p.config.OnVCIStart != nil {
@@ -229,6 +348,90 @@ func (p *Profile) HandleError(ctx context.Context, params *wmp.FlowErrorParams) 
 
 func (p *Profile) ResolveTypes() []string {
 	return []string{"vctm", "issuer_metadata"}
+}
+
+// --- Validation ---
+
+// validateFlowStartParams validates flow-type-specific start parameters.
+func (p *Profile) validateFlowStartParams(flowType string, rawParams json.RawMessage) error {
+	var params map[string]interface{}
+	if err := json.Unmarshal(rawParams, &params); err != nil {
+		return wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{
+			"reason": "invalid flow params JSON",
+		})
+	}
+
+	switch flowType {
+	case FlowTypeOID4VCI:
+		return validateVCIStartParams(params)
+	case FlowTypeOID4VP:
+		return validateVPStartParams(params)
+	default:
+		return wmp.NewRPCError(wmp.ErrFlowError, map[string]string{
+			"reason": "unknown flow type: " + flowType,
+		})
+	}
+}
+
+// validateVCIStartParams validates OID4VCI flow start params.
+func validateVCIStartParams(params map[string]interface{}) error {
+	_, hasOffer := params["credential_offer"]
+	_, hasOfferURI := params["credential_offer_uri"]
+	_, hasOffer2 := params["offer"]
+	_, hasAuthCode := params["auth_code"]
+
+	// auth_code is valid for resumption flows
+	if hasAuthCode {
+		return nil
+	}
+
+	if !hasOffer && !hasOfferURI && !hasOffer2 {
+		return wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{
+			"reason": "OID4VCI flow requires credential_offer, credential_offer_uri, or offer",
+		})
+	}
+	return nil
+}
+
+// validateVPStartParams validates OID4VP flow start params.
+func validateVPStartParams(params map[string]interface{}) error {
+	_, hasRequestURI := params["request_uri"]
+	_, hasRequestURIRef := params["request_uri_ref"]
+	_, hasPD := params["presentation_definition"]
+	_, hasDCQL := params["dcql_query"]
+
+	if !hasRequestURI && !hasRequestURIRef && !hasPD && !hasDCQL {
+		return wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{
+			"reason": "OID4VP flow requires request_uri, request_uri_ref, presentation_definition, or dcql_query",
+		})
+	}
+	return nil
+}
+
+// ValidateAction validates a flow action identifier for the given flow type.
+func ValidateAction(flowType, action string) error {
+	switch flowType {
+	case FlowTypeOID4VCI:
+		switch action {
+		case ActionAcceptOffer, ActionProvideTxCode, ActionAuthorize, ActionCancel:
+			return nil
+		}
+	case FlowTypeOID4VP:
+		switch action {
+		case ActionSelectCredentials, ActionCancel:
+			return nil
+		}
+	}
+	// Allow sign_response, match_response, trust_result, consent, etc. from the engine.
+	switch action {
+	case "sign_response", "match_response", "trust_result", "consent",
+		"select_credential", "authorization_complete", "provide_pin",
+		"credentials_matched", "decline":
+		return nil
+	}
+	return wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{
+		"reason": "unknown action for flow type " + flowType + ": " + action,
+	})
 }
 
 func (p *Profile) HandleResolve(ctx context.Context, params *wmp.ResolveParams) (*wmp.ResolveResult, error) {

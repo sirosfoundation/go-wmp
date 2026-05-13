@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/wmp-metadata.json",
+  "title": "WMP Metadata Object",
+  "description": "The 'wmp' object carried in params or result of every WMP message.",
+  "type": "object",
+  "required": ["version"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Protocol version.",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "examples": ["0.1"]
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Session identifier. Omitted for session creation requests.",
+      "pattern": "^ses-[a-zA-Z0-9]+$"
+    },
+    "sender": {
+      "type": "string",
+      "description": "Sender identifier (DID, URI, X.509 fingerprint, or opaque ID)."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp."
+    },
+    "timestamp_token": {
+      "type": "string",
+      "description": "Base64url-encoded RFC 3161 TimeStampToken or sct:-prefixed SCT."
+    },
+    "encrypted": {
+      "type": "boolean",
+      "default": false,
+      "description": "true if the payload is MLS-encrypted."
+    },
+    "epoch": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "MLS epoch number when encrypted is true."
+    },
+    "signature": { "$ref": "wmp-signature.json" },
+    "identity_assertions": {
+      "type": "array",
+      "items": { "$ref": "wmp-identity-assertion.json" },
+      "description": "Legal identity bindings."
+    },
+    "relay_chain": {
+      "type": "array",
+      "items": { "$ref": "wmp-relay-entry.json" },
+      "description": "Relay provenance chain."
+    },
+    "trace_id": {
+      "type": "string",
+      "description": "Distributed tracing identifier."
+    }
+  },
+  "additionalProperties": false
+}

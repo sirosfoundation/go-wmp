@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/session-close.json",
+  "title": "wmp.session.close — Notification",
+  "description": "Close a WMP session.",
+  "type": "object",
+  "required": ["jsonrpc", "method", "params"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "method": { "const": "wmp.session.close" },
+    "params": {
+      "type": "object",
+      "required": ["wmp", "reason"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "reason": {
+          "type": "string",
+          "enum": ["complete", "timeout", "error", "user_cancelled"]
+        }
+      }
+    }
+  }
+}

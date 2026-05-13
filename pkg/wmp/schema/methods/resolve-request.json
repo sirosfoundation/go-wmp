@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/resolve-request.json",
+  "title": "wmp.resolve — Request",
+  "description": "Resolve metadata for an identifier or URI.",
+  "type": "object",
+  "required": ["jsonrpc", "id", "method", "params"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "id": { "type": ["string", "integer"] },
+    "method": { "const": "wmp.resolve" },
+    "params": {
+      "type": "object",
+      "required": ["wmp", "type", "uri"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "type": {
+          "type": "string",
+          "description": "Resolution type.",
+          "examples": ["vctm", "issuer_metadata", "trust", "endpoint", "openid_federation"]
+        },
+        "uri": {
+          "type": "string",
+          "description": "Identifier or URI to resolve."
+        },
+        "options": {
+          "type": "object",
+          "description": "Type-specific resolution options."
+        }
+      }
+    }
+  }
+}

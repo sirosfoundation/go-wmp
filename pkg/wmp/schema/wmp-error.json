@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/wmp-error.json",
+  "title": "WMP Error Response",
+  "description": "JSON-RPC 2.0 error response with WMP error codes.",
+  "type": "object",
+  "required": ["jsonrpc", "id", "error"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "id": { "type": ["string", "integer", "null"] },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "integer",
+          "description": "Error code. Standard JSON-RPC: -32700 to -32603. WMP: -31000 to -31012."
+        },
+        "message": { "type": "string" },
+        "data": {
+          "description": "Additional error context."
+        }
+      }
+    }
+  }
+}

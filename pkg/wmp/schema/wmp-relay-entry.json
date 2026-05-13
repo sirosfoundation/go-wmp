@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/wmp-relay-entry.json",
+  "title": "WMP Relay Chain Entry",
+  "description": "A single hop in the relay provenance chain.",
+  "type": "object",
+  "required": ["relay", "relay_id", "timestamp"],
+  "properties": {
+    "relay": {
+      "type": "string",
+      "format": "uri",
+      "description": "Relay endpoint URI."
+    },
+    "relay_id": {
+      "type": "string",
+      "description": "Relay identifier (WMP identifier scheme)."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when relay processed the message."
+    },
+    "timestamp_token": {
+      "type": "string",
+      "description": "RFC 3161 timestamp token for the relay hop."
+    },
+    "signature": { "$ref": "wmp-signature.json" },
+    "service_class": {
+      "type": "string",
+      "enum": ["best_effort", "standard", "registered", "certified"],
+      "description": "Service class of this relay hop."
+    }
+  },
+  "additionalProperties": false
+}

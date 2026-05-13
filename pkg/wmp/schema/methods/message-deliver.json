@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/message-deliver.json",
+  "title": "wmp.message.deliver — Notification",
+  "description": "Deliver a message within a session. Supports both plaintext and MLS-encrypted payloads.",
+  "type": "object",
+  "required": ["jsonrpc", "method", "params"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "method": { "const": "wmp.message.deliver" },
+    "params": {
+      "type": "object",
+      "required": ["wmp"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "to": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Recipient identifiers (for direct messages)."
+        },
+        "content_type": {
+          "type": "string",
+          "description": "MIME type of the body."
+        },
+        "body": {
+          "description": "Message content (when plaintext)."
+        },
+        "ciphertext": {
+          "type": "string",
+          "description": "Base64url-encoded MLS MLSMessage (when encrypted)."
+        }
+      }
+    }
+  }
+}

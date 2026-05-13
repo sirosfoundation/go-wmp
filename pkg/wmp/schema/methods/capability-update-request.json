@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/capability-update-request.json",
+  "title": "wmp.capability.update — Request",
+  "description": "Renegotiate capabilities mid-session.",
+  "type": "object",
+  "required": ["jsonrpc", "id", "method", "params"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "id": { "type": ["string", "integer"] },
+    "method": { "const": "wmp.capability.update" },
+    "params": {
+      "type": "object",
+      "required": ["wmp"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "add": { "$ref": "../wmp-capabilities.json" },
+        "remove": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Capability names to remove."
+        },
+        "security": { "$ref": "../wmp-security.json" }
+      }
+    }
+  }
+}

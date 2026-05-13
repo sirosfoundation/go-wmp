@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/flow-progress.json",
+  "title": "wmp.flow.progress — Notification",
+  "description": "Flow state update sent by the responder.",
+  "type": "object",
+  "required": ["jsonrpc", "method", "params"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "method": { "const": "wmp.flow.progress" },
+    "params": {
+      "type": "object",
+      "required": ["wmp", "flow_id", "step"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "flow_id": { "type": "string" },
+        "step": {
+          "type": "string",
+          "description": "Current step identifier."
+        },
+        "payload": {
+          "type": "object",
+          "description": "Step-specific data."
+        }
+      }
+    }
+  }
+}

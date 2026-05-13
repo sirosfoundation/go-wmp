@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/methods/resolve-response.json",
+  "title": "wmp.resolve — Response",
+  "description": "Response to a resolve request.",
+  "type": "object",
+  "required": ["jsonrpc", "id", "result"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "id": { "type": ["string", "integer"] },
+    "result": {
+      "type": "object",
+      "required": ["wmp", "type", "uri"],
+      "properties": {
+        "wmp": { "$ref": "../wmp-metadata.json" },
+        "type": { "type": "string" },
+        "uri": { "type": "string" },
+        "metadata": {
+          "description": "Resolved metadata (null if not found)."
+        },
+        "trust_info": {
+          "type": "object",
+          "properties": {
+            "trusted": { "type": "boolean" },
+            "source": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
