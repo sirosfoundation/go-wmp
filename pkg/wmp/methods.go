@@ -38,17 +38,29 @@ type SessionCreateParams struct {
 
 // SessionCreateResult is the result for wmp.session.create.
 type SessionCreateResult struct {
-	WMP          Metadata     `json:"wmp"`
-	Capabilities Capabilities `json:"capabilities,omitempty"`
-	Security     SecurityMode `json:"security"`
-	Challenge    string       `json:"challenge,omitempty"`
+	WMP              Metadata     `json:"wmp"`
+	Capabilities     Capabilities `json:"capabilities,omitempty"`
+	Security         SecurityMode `json:"security"`
+	Challenge        string       `json:"challenge,omitempty"`
+	ResumptionToken  string       `json:"resumption_token,omitempty"`
 }
 
 // SessionResumeParams are the params for wmp.session.resume.
 type SessionResumeParams struct {
-	WMP           Metadata `json:"wmp"`
-	SessionID     string   `json:"session_id"`
-	LastMessageID string   `json:"last_message_id,omitempty"`
+	WMP             Metadata `json:"wmp"`
+	SessionID       string   `json:"session_id"`
+	ResumptionToken string   `json:"resumption_token"`
+	LastReceivedID  string   `json:"last_received_id,omitempty"`
+}
+
+// SessionResumeResult is the result for wmp.session.resume.
+type SessionResumeResult struct {
+	WMP              Metadata     `json:"wmp"`
+	Resumed          bool         `json:"resumed"`
+	ResumptionToken  string       `json:"resumption_token,omitempty"`
+	MissedMessages   int          `json:"missed_messages"`
+	Capabilities     Capabilities `json:"capabilities,omitempty"`
+	Security         SecurityMode `json:"security"`
 }
 
 // SessionCloseParams are the params for wmp.session.close (notification).

@@ -12,7 +12,7 @@ import "context"
 type Handler interface {
 	// Session lifecycle
 	SessionCreate(ctx context.Context, params *SessionCreateParams) (*SessionCreateResult, error)
-	SessionResume(ctx context.Context, params *SessionResumeParams) (*SessionCreateResult, error)
+	SessionResume(ctx context.Context, params *SessionResumeParams) (*SessionResumeResult, error)
 	SessionClose(ctx context.Context, params *SessionCloseParams)
 	SessionAuthenticate(ctx context.Context, params *SessionAuthenticateParams) (*SessionAuthenticateResult, error)
 
@@ -45,7 +45,7 @@ type BaseHandler struct{}
 func (BaseHandler) SessionCreate(context.Context, *SessionCreateParams) (*SessionCreateResult, error) {
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }
-func (BaseHandler) SessionResume(context.Context, *SessionResumeParams) (*SessionCreateResult, error) {
+func (BaseHandler) SessionResume(context.Context, *SessionResumeParams) (*SessionResumeResult, error) {
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }
 func (BaseHandler) SessionClose(context.Context, *SessionCloseParams) {}

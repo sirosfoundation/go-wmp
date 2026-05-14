@@ -223,7 +223,7 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
 		// Version negotiation: reject unsupported versions.
-		if !isSupportedVersion(ps.WMP.Version) {
+		if !IsSupportedVersion(ps.WMP.Version) {
 			return nil, NewRPCError(ErrVersionNotSupported, map[string]interface{}{
 				"supported_versions": SupportedVersions,
 			})
@@ -252,7 +252,7 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		if !isSupportedVersion(ps.WMP.Version) {
+		if !IsSupportedVersion(ps.WMP.Version) {
 			return nil, NewRPCError(ErrVersionNotSupported, map[string]interface{}{
 				"supported_versions": SupportedVersions,
 			})
@@ -551,8 +551,8 @@ func toRPCError(err error) *RPCError {
 	return NewRPCError(ErrInternalError, nil)
 }
 
-// isSupportedVersion returns true if the given version is in SupportedVersions.
-func isSupportedVersion(version string) bool {
+// IsSupportedVersion returns true if the given version is in SupportedVersions.
+func IsSupportedVersion(version string) bool {
 	for _, v := range SupportedVersions {
 		if v == version {
 			return true

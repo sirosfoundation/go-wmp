@@ -7,13 +7,14 @@ import (
 
 // Session represents the state of an active WMP session.
 type Session struct {
-	ID           string
-	Participants []string
-	Capabilities Capabilities
-	Security     SecurityMode
-	Metadata     map[string]string
-	CreatedAt    time.Time
-	ExpiresAt    time.Time
+	ID              string
+	Participants    []string
+	Capabilities    Capabilities
+	Security        SecurityMode
+	Metadata        map[string]string
+	ResumptionToken string
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
 }
 
 // IsExpired returns true if the session has exceeded its TTL.
