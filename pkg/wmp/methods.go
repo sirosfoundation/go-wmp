@@ -34,6 +34,7 @@ type SessionCreateParams struct {
 	Security            SecurityMode `json:"security"`
 	TTL                 int          `json:"ttl,omitempty"`
 	Auth                *AuthObject  `json:"auth,omitempty"`
+	InvitationNonce     string       `json:"invitation_nonce,omitempty"`
 }
 
 // SessionCreateResult is the result for wmp.session.create.
