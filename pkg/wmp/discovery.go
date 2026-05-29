@@ -22,7 +22,9 @@ type WellKnownConfig struct {
 }
 
 // DiscoverConfig fetches the WMP well-known configuration for the given domain.
-// For did:web identifiers with sub-paths, use DiscoverConfigForDID instead.
+// This is the primary discovery mechanism for all domain-based identifiers
+// (x509:san:dns, https://, did:web). Use ExtractDomain to get the domain
+// from any WMP identifier.
 func DiscoverConfig(ctx context.Context, domain string) (*WellKnownConfig, error) {
 	return fetchConfig(ctx, "https://"+domain+"/.well-known/wmp-configuration", nil)
 }
@@ -33,22 +35,35 @@ func DiscoverConfigWithClient(ctx context.Context, domain string, client *http.C
 	return fetchConfig(ctx, "https://"+domain+"/.well-known/wmp-configuration", client)
 }
 
+// DiscoverConfigForIdentifier fetches the well-known configuration for any
+// WMP identifier by extracting its domain and fetching /.well-known/wmp-configuration.
+// Returns an error if no domain can be extracted from the identifier.
+func DiscoverConfigForIdentifier(ctx context.Context, identifier string, client *http.Client) (*WellKnownConfig, error) {
+	domain := ExtractDomain(identifier)
+	if domain == "" {
+		return nil, fmt.Errorf("cannot extract domain from identifier %q: use session parameters or a profile resolver", identifier)
+	}
+	if client != nil {
+		return DiscoverConfigWithClient(ctx, domain, client)
+	}
+	return DiscoverConfig(ctx, domain)
+}
+
 // DiscoverConfigForDID resolves the well-known configuration for a did:web identifier.
-// Handles sub-path resolution for hosted wallets (e.g., did:web:example.com:users:alice).
+//
+// Deprecated: Per the WMP spec privacy principle (§7.5), per-user sub-path
+// resolution (e.g., did:web:example.com:users:alice) publicly exposes the
+// user-to-provider binding. Use DiscoverConfigForIdentifier or
+// DiscoverConfig(ExtractDomain(identifier)) instead, which always resolves
+// to the provider's domain-level configuration.
 func DiscoverConfigForDID(ctx context.Context, did string, client *http.Client) (*WellKnownConfig, error) {
-	domain, path, err := parseDIDWeb(did)
+	domain, _, err := parseDIDWeb(did)
 	if err != nil {
 		return nil, err
 	}
-
-	var url string
-	if path != "" {
-		// Sub-path resolution for hosted wallets.
-		url = "https://" + domain + "/" + path + "/.well-known/wmp-configuration"
-	} else {
-		url = "https://" + domain + "/.well-known/wmp-configuration"
-	}
-	return fetchConfig(ctx, url, client)
+	// Always resolve at domain level — sub-path resolution is deprecated
+	// per WMP spec §7.5.5 privacy principle.
+	return fetchConfig(ctx, "https://"+domain+"/.well-known/wmp-configuration", client)
 }
 
 // ExtractDomain extracts the domain from a WMP identifier for well-known resolution.

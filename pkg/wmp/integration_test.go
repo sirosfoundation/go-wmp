@@ -152,7 +152,7 @@ func TestPeer_VersionNegotiation_Supported(t *testing.T) {
 	go client.Serve(ctx)
 
 	params := SessionCreateParams{
-		WMP:      Metadata{Version: Version, Sender: "did:web:alice.example.com"},
+		WMP:      Metadata{Version: Version, Sender: "x509:san:dns:alice.example.com"},
 		Security: SecurityMode{Mode: "tls"},
 	}
 
@@ -179,7 +179,7 @@ func TestPeer_VersionNegotiation_Unsupported(t *testing.T) {
 	go client.Serve(ctx)
 
 	params := SessionCreateParams{
-		WMP:      Metadata{Version: "99.0", Sender: "did:web:alice.example.com"},
+		WMP:      Metadata{Version: "99.0", Sender: "x509:san:dns:alice.example.com"},
 		Security: SecurityMode{Mode: "tls"},
 	}
 
@@ -327,7 +327,7 @@ func TestPeer_SessionAuthenticate(t *testing.T) {
 	go client.Serve(ctx)
 
 	params := SessionAuthenticateParams{
-		WMP: Metadata{Version: Version, SessionID: "ses-auth", Sender: "did:web:alice.example.com"},
+		WMP: Metadata{Version: Version, SessionID: "ses-auth", Sender: "x509:san:dns:alice.example.com"},
 		Auth: AuthObject{
 			Type:  AuthTypeBearer,
 			Token: "valid-token",
@@ -342,7 +342,7 @@ func TestPeer_SessionAuthenticate(t *testing.T) {
 	if !result.Authenticated {
 		t.Fatal("expected authenticated=true")
 	}
-	if result.Identity != "did:web:alice.example.com" {
+	if result.Identity != "x509:san:dns:alice.example.com" {
 		t.Fatalf("identity: got %q", result.Identity)
 	}
 }
@@ -396,7 +396,7 @@ func TestPeer_Middleware(t *testing.T) {
 	go client.Serve(ctx)
 
 	params := SessionCreateParams{
-		WMP:      Metadata{Version: Version, Sender: "did:web:alice.example.com"},
+		WMP:      Metadata{Version: Version, Sender: "x509:san:dns:alice.example.com"},
 		Security: SecurityMode{Mode: "tls"},
 	}
 
@@ -459,8 +459,8 @@ func TestPeer_SessionStoreIntegration(t *testing.T) {
 	go client.Serve(ctx)
 
 	params := SessionCreateParams{
-		WMP:          Metadata{Version: Version, Sender: "did:web:alice.example.com"},
-		Participants: []string{"did:web:bob.example.com"},
+		WMP:          Metadata{Version: Version, Sender: "x509:san:dns:alice.example.com"},
+		Participants: []string{"x509:san:dns:bob.example.com"},
 		Security:     SecurityMode{Mode: "tls"},
 	}
 
@@ -509,7 +509,7 @@ func TestPeer_ContextPropagation(t *testing.T) {
 	go client.Serve(ctx)
 
 	params := SessionCreateParams{
-		WMP:      Metadata{Version: Version, Sender: "did:web:alice.example.com", SessionID: "ses-prev"},
+		WMP:      Metadata{Version: Version, Sender: "x509:san:dns:alice.example.com", SessionID: "ses-prev"},
 		Security: SecurityMode{Mode: "tls"},
 	}
 
@@ -521,7 +521,7 @@ func TestPeer_ContextPropagation(t *testing.T) {
 
 	// Handler's context should have the sender.
 	sender := SenderFromContext(handler.lastCtx)
-	if sender != "did:web:alice.example.com" {
+	if sender != "x509:san:dns:alice.example.com" {
 		t.Fatalf("sender from context: got %q", sender)
 	}
 }

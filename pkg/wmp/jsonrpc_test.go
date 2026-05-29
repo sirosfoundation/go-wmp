@@ -6,7 +6,7 @@ import (
 )
 
 func TestDecodeMessage_Request(t *testing.T) {
-	data := []byte(`{"jsonrpc":"2.0","id":"msg-001","method":"wmp.session.create","params":{"wmp":{"version":"0.1","sender":"did:web:alice.example.com"},"security":{"mode":"tls"}}}`)
+	data := []byte(`{"jsonrpc":"2.0","id":"msg-001","method":"wmp.session.create","params":{"wmp":{"version":"0.1","sender":"x509:san:dns:alice.example.com"},"security":{"mode":"tls"}}}`)
 	msg, err := DecodeMessage(data)
 	if err != nil {
 		t.Fatal(err)
@@ -27,7 +27,7 @@ func TestDecodeMessage_Request(t *testing.T) {
 }
 
 func TestDecodeMessage_Notification(t *testing.T) {
-	data := []byte(`{"jsonrpc":"2.0","method":"wmp.message.deliver","params":{"wmp":{"version":"0.1","session_id":"ses-abc","sender":"did:web:alice.example.com"},"body":{"text":"hello"}}}`)
+	data := []byte(`{"jsonrpc":"2.0","method":"wmp.message.deliver","params":{"wmp":{"version":"0.1","session_id":"ses-abc","sender":"x509:san:dns:alice.example.com"},"body":{"text":"hello"}}}`)
 	msg, err := DecodeMessage(data)
 	if err != nil {
 		t.Fatal(err)
@@ -103,7 +103,7 @@ func TestDecodeBatch_NotArray(t *testing.T) {
 
 func TestNewRequest(t *testing.T) {
 	params := SessionCreateParams{
-		WMP:      Metadata{Version: Version, Sender: "did:web:alice.example.com"},
+		WMP:      Metadata{Version: Version, Sender: "x509:san:dns:alice.example.com"},
 		Security: SecurityMode{Mode: "tls"},
 	}
 	req, err := NewRequest("msg-001", MethodSessionCreate, params)
