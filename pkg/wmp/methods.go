@@ -34,15 +34,16 @@ type SessionCreateParams struct {
 	Security            SecurityMode `json:"security"`
 	TTL                 int          `json:"ttl,omitempty"`
 	Auth                *AuthObject  `json:"auth,omitempty"`
+	InvitationNonce     string       `json:"invitation_nonce,omitempty"`
 }
 
 // SessionCreateResult is the result for wmp.session.create.
 type SessionCreateResult struct {
-	WMP              Metadata     `json:"wmp"`
-	Capabilities     Capabilities `json:"capabilities,omitempty"`
-	Security         SecurityMode `json:"security"`
-	Challenge        string       `json:"challenge,omitempty"`
-	ResumptionToken  string       `json:"resumption_token,omitempty"`
+	WMP             Metadata     `json:"wmp"`
+	Capabilities    Capabilities `json:"capabilities,omitempty"`
+	Security        SecurityMode `json:"security"`
+	Challenge       string       `json:"challenge,omitempty"`
+	ResumptionToken string       `json:"resumption_token,omitempty"`
 }
 
 // SessionResumeParams are the params for wmp.session.resume.
@@ -55,12 +56,12 @@ type SessionResumeParams struct {
 
 // SessionResumeResult is the result for wmp.session.resume.
 type SessionResumeResult struct {
-	WMP              Metadata     `json:"wmp"`
-	Resumed          bool         `json:"resumed"`
-	ResumptionToken  string       `json:"resumption_token,omitempty"`
-	MissedMessages   int          `json:"missed_messages"`
-	Capabilities     Capabilities `json:"capabilities,omitempty"`
-	Security         SecurityMode `json:"security"`
+	WMP             Metadata     `json:"wmp"`
+	Resumed         bool         `json:"resumed"`
+	ResumptionToken string       `json:"resumption_token,omitempty"`
+	MissedMessages  int          `json:"missed_messages"`
+	Capabilities    Capabilities `json:"capabilities,omitempty"`
+	Security        SecurityMode `json:"security"`
 }
 
 // SessionCloseParams are the params for wmp.session.close (notification).
@@ -287,6 +288,8 @@ type AuthObject struct {
 	Token     string          `json:"token,omitempty"`
 	Proof     string          `json:"proof,omitempty"`
 	Challenge string          `json:"challenge,omitempty"`
+	Signature string          `json:"signature,omitempty"`
+	X5C       []string        `json:"x5c,omitempty"`
 	DIDAuth   json.RawMessage `json:"did_auth,omitempty"`
 }
 
@@ -305,9 +308,13 @@ type SessionAuthenticateResult struct {
 
 // Authentication type constants.
 const (
-	AuthTypeBearer  = "bearer"
-	AuthTypeDPoP    = "dpop"
-	AuthTypeMTLS    = "mtls"
+	AuthTypeBearer          = "bearer"
+	AuthTypeDPoP            = "dpop"
+	AuthTypeMTLS            = "mtls"
+	AuthTypeSignedChallenge = "signed_challenge"
+	AuthTypeX5C             = "x5c"
+
+	// Deprecated: Use AuthTypeSignedChallenge instead.
 	AuthTypeDIDAuth = "did_auth"
 )
 

@@ -139,13 +139,13 @@ func TestProfileDispatch(t *testing.T) {
 		}},
 		{MethodGroupAdd, GroupAddParams{
 			WMP:         wmp.Metadata{Version: "0.1", SessionID: "s1"},
-			Participant: "did:web:dave.example.com",
+			Participant: "x509:san:dns:dave.example.com",
 			Commit:      "Y29tbWl0",
 			Welcome:     "d2VsY29tZQ",
 		}},
 		{MethodGroupRemove, GroupRemoveParams{
 			WMP:         wmp.Metadata{Version: "0.1", SessionID: "s1"},
-			Participant: "did:web:carol.example.com",
+			Participant: "x509:san:dns:carol.example.com",
 			Commit:      "Y29tbWl0",
 		}},
 		{MethodGroupUpdate, GroupUpdateParams{
@@ -220,8 +220,8 @@ func TestGroupCreateParamsJSON(t *testing.T) {
 		AcceptedIdentitySchemes: []string{"did", "x509", "uri"},
 		GroupInfo:               "Z3JvdXBpbmZv",
 		Welcomes: map[string]string{
-			"did:web:bob.example.com":   "d2VsY29tZS1ib2I",
-			"did:web:carol.example.com": "d2VsY29tZS1jYXJvbA",
+			"x509:san:dns:bob.example.com":   "d2VsY29tZS1ib2I",
+			"x509:san:dns:carol.example.com": "d2VsY29tZS1jYXJvbA",
 		},
 	}
 
@@ -254,7 +254,7 @@ func TestEncryptedEnvelopeJSON(t *testing.T) {
 			SessionID: "ses-abc",
 			Encrypted: true,
 			Epoch:     &epoch,
-			Sender:    "did:web:alice.example.com",
+			Sender:    "x509:san:dns:alice.example.com",
 		},
 		Ciphertext: "Y2lwaGVydGV4dC1kYXRh",
 	}

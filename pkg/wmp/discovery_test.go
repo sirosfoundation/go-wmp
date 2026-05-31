@@ -99,3 +99,11 @@ func TestDiscoverConfig_NotFound(t *testing.T) {
 		t.Fatal("expected error for 404")
 	}
 }
+
+func TestDiscoverConfigForIdentifier_BadScheme(t *testing.T) {
+	ctx := context.Background()
+	_, err := DiscoverConfigForIdentifier(ctx, "did:key:z6Mkf5rGMoatrSj1f3JWKc", nil)
+	if err == nil {
+		t.Fatal("expected error for did:key identifier")
+	}
+}

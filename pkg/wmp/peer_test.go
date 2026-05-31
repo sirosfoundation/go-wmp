@@ -81,7 +81,7 @@ func TestPeer_CallSessionCreate(t *testing.T) {
 	params := SessionCreateParams{
 		WMP: Metadata{
 			Version: Version,
-			Sender:  "did:web:alice.example.com",
+			Sender:  "x509:san:dns:alice.example.com",
 		},
 		CapabilitiesOffered: Capabilities{
 			"messaging": mustMarshal(MessagingCap{MaxSize: 65536}),
@@ -183,9 +183,9 @@ func TestPeer_Notify(t *testing.T) {
 		WMP: Metadata{
 			Version:   Version,
 			SessionID: "ses-abc",
-			Sender:    "did:web:alice.example.com",
+			Sender:    "x509:san:dns:alice.example.com",
 		},
-		To:          []string{"did:web:bob.example.com"},
+		To:          []string{"x509:san:dns:bob.example.com"},
 		ContentType: "text/plain",
 		Body:        json.RawMessage(`"Hello"`),
 	}
@@ -196,7 +196,7 @@ func TestPeer_Notify(t *testing.T) {
 	}
 
 	got := <-delivered
-	if got.WMP.Sender != "did:web:alice.example.com" {
+	if got.WMP.Sender != "x509:san:dns:alice.example.com" {
 		t.Fatalf("sender: got %q", got.WMP.Sender)
 	}
 }

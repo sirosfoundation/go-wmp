@@ -9,9 +9,9 @@ func TestSessionCreateParams_Marshal(t *testing.T) {
 	params := SessionCreateParams{
 		WMP: Metadata{
 			Version: Version,
-			Sender:  "did:web:alice.example.com",
+			Sender:  "x509:san:dns:alice.example.com",
 		},
-		Participants: []string{"did:web:bob.example.com"},
+		Participants: []string{"x509:san:dns:bob.example.com"},
 		CapabilitiesOffered: Capabilities{
 			"messaging": mustMarshal(MessagingCap{MaxSize: 65536}),
 		},
@@ -37,7 +37,7 @@ func TestSessionCreateParams_Marshal(t *testing.T) {
 	if decoded.TTL != 3600 {
 		t.Fatalf("ttl: got %d", decoded.TTL)
 	}
-	if len(decoded.Participants) != 1 || decoded.Participants[0] != "did:web:bob.example.com" {
+	if len(decoded.Participants) != 1 || decoded.Participants[0] != "x509:san:dns:bob.example.com" {
 		t.Fatalf("participants: got %v", decoded.Participants)
 	}
 }
@@ -81,9 +81,9 @@ func TestMessageDeliverParams_Plaintext(t *testing.T) {
 		WMP: Metadata{
 			Version:   Version,
 			SessionID: "ses-abc",
-			Sender:    "did:web:alice.example.com",
+			Sender:    "x509:san:dns:alice.example.com",
 		},
-		To:          []string{"did:web:bob.example.com"},
+		To:          []string{"x509:san:dns:bob.example.com"},
 		ContentType: "application/json",
 		Body:        json.RawMessage(`{"text":"Hello, Bob!"}`),
 	}
@@ -111,7 +111,7 @@ func TestMessageDeliverParams_Encrypted(t *testing.T) {
 		WMP: Metadata{
 			Version:   Version,
 			SessionID: "ses-abc",
-			Sender:    "did:web:alice.example.com",
+			Sender:    "x509:san:dns:alice.example.com",
 			Encrypted: true,
 			Epoch:     &epoch,
 		},
@@ -140,7 +140,7 @@ func TestFlowStartParams(t *testing.T) {
 		WMP: Metadata{
 			Version:   Version,
 			SessionID: "ses-abc",
-			Sender:    "did:web:alice.example.com",
+			Sender:    "x509:san:dns:alice.example.com",
 		},
 		FlowType: FlowTypeApproval,
 		FlowID:   "flow-7890",
@@ -193,10 +193,10 @@ func TestCapabilityUpdateParams(t *testing.T) {
 		WMP: Metadata{
 			Version:   Version,
 			SessionID: "ses-abc",
-			Sender:    "did:web:alice.example.com",
+			Sender:    "x509:san:dns:alice.example.com",
 		},
 		Add: Capabilities{
-			"relay": mustMarshal(RelayCap{Destinations: []string{"did:web:carol.example.com"}}),
+			"relay": mustMarshal(RelayCap{Destinations: []string{"x509:san:dns:carol.example.com"}}),
 		},
 		Remove: []string{"oid4vp"},
 		Security: &SecurityMode{

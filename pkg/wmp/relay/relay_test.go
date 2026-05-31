@@ -13,7 +13,7 @@ func TestRegister(t *testing.T) {
 	r := New(Config{RegistrationTTL: 1 * time.Hour})
 
 	params := wmp.RelayRegisterParams{
-		WMP: wmp.Metadata{Version: "0.1", Sender: "did:web:alice.example.com"},
+		WMP: wmp.Metadata{Version: "0.1", Sender: "x509:san:dns:alice.example.com"},
 	}
 	raw, _ := json.Marshal(params)
 
@@ -33,7 +33,7 @@ func TestRegister(t *testing.T) {
 		t.Fatalf("TTL = %d, want 3600", res.TTL)
 	}
 
-	if !r.IsRegistered("did:web:alice.example.com") {
+	if !r.IsRegistered("x509:san:dns:alice.example.com") {
 		t.Fatal("alice should be registered")
 	}
 }
@@ -64,7 +64,7 @@ func TestUnknownMethod(t *testing.T) {
 func TestEnqueueAndDrain(t *testing.T) {
 	r := New(Config{MaxQueueSize: 10, MessageTTL: 1 * time.Hour})
 
-	participant := "did:web:alice.example.com"
+	participant := "x509:san:dns:alice.example.com"
 	msg1 := []byte(`{"jsonrpc":"2.0","method":"wmp.message.deliver","params":{}}`)
 	msg2 := []byte(`{"jsonrpc":"2.0","method":"wmp.message.deliver","params":{"body":"hello"}}`)
 
@@ -93,7 +93,7 @@ func TestEnqueueAndDrain(t *testing.T) {
 func TestEnqueueQueueFull(t *testing.T) {
 	r := New(Config{MaxQueueSize: 2, MessageTTL: 1 * time.Hour})
 
-	participant := "did:web:bob.example.com"
+	participant := "x509:san:dns:bob.example.com"
 	msg := []byte(`{}`)
 
 	r.Enqueue(participant, msg)
@@ -109,19 +109,19 @@ func TestUnregister(t *testing.T) {
 	r := New(Config{})
 
 	params := wmp.RelayRegisterParams{
-		WMP: wmp.Metadata{Version: "0.1", Sender: "did:web:alice.example.com"},
+		WMP: wmp.Metadata{Version: "0.1", Sender: "x509:san:dns:alice.example.com"},
 	}
 	raw, _ := json.Marshal(params)
 
 	r.HandleMethod(context.Background(), wmp.MethodRelayRegister, raw)
 
-	if !r.IsRegistered("did:web:alice.example.com") {
+	if !r.IsRegistered("x509:san:dns:alice.example.com") {
 		t.Fatal("should be registered")
 	}
 
-	r.Unregister("did:web:alice.example.com")
+	r.Unregister("x509:san:dns:alice.example.com")
 
-	if r.IsRegistered("did:web:alice.example.com") {
+	if r.IsRegistered("x509:san:dns:alice.example.com") {
 		t.Fatal("should not be registered after unregister")
 	}
 }
@@ -132,7 +132,7 @@ func TestPurgeExpired(t *testing.T) {
 		MessageTTL:      1 * time.Millisecond,
 	})
 
-	participant := "did:web:alice.example.com"
+	participant := "x509:san:dns:alice.example.com"
 
 	// Register
 	params := wmp.RelayRegisterParams{
@@ -167,7 +167,7 @@ func TestMethods(t *testing.T) {
 
 func TestDrainEmpty(t *testing.T) {
 	r := New(Config{})
-	messages := r.Drain("did:web:nobody.example.com")
+	messages := r.Drain("x509:san:dns:nobody.example.com")
 	if messages != nil {
 		t.Fatalf("Drain on empty = %v, want nil", messages)
 	}
@@ -176,7 +176,7 @@ func TestDrainEmpty(t *testing.T) {
 func TestEnqueueDefensiveCopy(t *testing.T) {
 	r := New(Config{MaxQueueSize: 10, MessageTTL: 1 * time.Hour})
 
-	participant := "did:web:alice.example.com"
+	participant := "x509:san:dns:alice.example.com"
 	data := []byte(`{"original": true}`)
 	r.Enqueue(participant, data)
 
