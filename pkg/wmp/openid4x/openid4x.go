@@ -152,14 +152,30 @@ type VPTokenResult struct {
 	ResponseCode           string      `json:"response_code,omitempty"`
 }
 
+// TransactionData represents a single transaction data object from
+// the verifier's OID4VP authorization request (TS12/SCA).
+//
+// Each item carries a type (e.g. "payment", "login_risk", "account_access",
+// "e_mandate") and type-specific fields in the Params map.
+type TransactionData struct {
+	Type   string                 `json:"type"`
+	Params map[string]interface{} `json:"params,omitempty"`
+
+	// Credential-binding fields per OID4VP draft §7.4
+	CredentialIDs          []string `json:"credential_ids,omitempty"`
+	HashAlgorithm          string   `json:"hash_alg,omitempty"`
+	TransactionDataHashesAlg string `json:"transaction_data_hashes_alg,omitempty"`
+}
+
 // SignSubFlowParams are flow-type-specific params for the sign sub-flow
-// nested inside an OID4VCI flow.
+// nested inside an OID4VCI or OID4VP flow.
 type SignSubFlowParams struct {
-	Action       string `json:"action"`
-	Nonce        string `json:"nonce"`
-	Audience     string `json:"audience"`
-	ProofType    string `json:"proof_type,omitempty"`
-	ParentFlowID string `json:"parent_flow_id"`
+	Action          string             `json:"action"`
+	Nonce           string             `json:"nonce"`
+	Audience        string             `json:"audience"`
+	ProofType       string             `json:"proof_type,omitempty"`
+	ParentFlowID    string             `json:"parent_flow_id"`
+	TransactionData []TransactionData  `json:"transaction_data,omitempty"`
 }
 
 // SelectionAction is the action params for accept_offer.
