@@ -3,7 +3,6 @@ package openid4x
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"testing"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
@@ -198,8 +197,11 @@ func TestCredentialResultOmitsEmptyNotificationID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := string(data)
-	if strings.Contains(s, "notification_id") {
-		t.Errorf("expected notification_id to be omitted, got %s", s)
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["notification_id"]; ok {
+		t.Error("expected notification_id key to be absent")
 	}
 }

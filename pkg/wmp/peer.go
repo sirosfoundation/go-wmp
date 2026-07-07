@@ -405,12 +405,15 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		return p.handler.Resolve(ctx, &ps)
 
 	case MethodCredentialNotification:
-		var ps CredentialNotificationParams
-		if err := json.Unmarshal(params, &ps); err != nil {
-			return nil, NewRPCError(ErrInvalidParams, nil)
+		if cnh, ok := p.handler.(CredentialNotificationHandler); ok {
+			var ps CredentialNotificationParams
+			if err := json.Unmarshal(params, &ps); err != nil {
+				return nil, NewRPCError(ErrInvalidParams, nil)
+			}
+			cnh.CredentialNotification(ctx, &ps)
+			return nil, nil
 		}
-		p.handler.CredentialNotification(ctx, &ps)
-		return nil, nil
+		return nil, NewRPCError(ErrMethodNotFound, nil)
 
 	default:
 		// Check if a profile handles this custom method.

@@ -36,8 +36,13 @@ type Handler interface {
 
 	// Metadata resolution
 	Resolve(ctx context.Context, params *ResolveParams) (*ResolveResult, error)
+}
 
-	// OID4VCI §10 credential lifecycle notification
+// CredentialNotificationHandler is an optional interface that handlers can
+// implement to receive OID4VCI §10 credential lifecycle notifications.
+// Keeping this separate from Handler avoids a breaking API change for
+// existing consumers.
+type CredentialNotificationHandler interface {
 	CredentialNotification(ctx context.Context, params *CredentialNotificationParams)
 }
 
@@ -82,4 +87,6 @@ func (BaseHandler) FlowCancel(context.Context, *FlowCancelParams) (*FlowCancelRe
 func (BaseHandler) Resolve(context.Context, *ResolveParams) (*ResolveResult, error) {
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }
+// CredentialNotification is a no-op so that BaseHandler satisfies
+// CredentialNotificationHandler. Override to handle OID4VCI §10 events.
 func (BaseHandler) CredentialNotification(context.Context, *CredentialNotificationParams) {}
