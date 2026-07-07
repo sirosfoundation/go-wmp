@@ -139,11 +139,18 @@ type CredentialDisplay struct {
 
 // CredentialResult represents an issued credential in a flow completion.
 type CredentialResult struct {
-	Format     string `json:"format"`
-	Credential string `json:"credential"`
-	VCT        string `json:"vct,omitempty"`
-	CNonce     string `json:"c_nonce,omitempty"`
+	Format         string `json:"format"`
+	Credential     string `json:"credential"`
+	VCT            string `json:"vct,omitempty"`
+	CNonce         string `json:"c_nonce,omitempty"`
+	NotificationID string `json:"notification_id,omitempty"`
 }
+
+// OID4VCI §10 credential lifecycle events.
+const (
+	CredentialEventAccepted = "credential_accepted"
+	CredentialEventFailure  = "credential_failure"
+)
 
 // VPTokenResult represents a VP flow completion.
 type VPTokenResult struct {

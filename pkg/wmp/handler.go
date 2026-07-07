@@ -36,6 +36,9 @@ type Handler interface {
 
 	// Metadata resolution
 	Resolve(ctx context.Context, params *ResolveParams) (*ResolveResult, error)
+
+	// OID4VCI §10 credential lifecycle notification
+	CredentialNotification(ctx context.Context, params *CredentialNotificationParams)
 }
 
 // BaseHandler provides no-op implementations of all Handler methods.
@@ -79,3 +82,4 @@ func (BaseHandler) FlowCancel(context.Context, *FlowCancelParams) (*FlowCancelRe
 func (BaseHandler) Resolve(context.Context, *ResolveParams) (*ResolveResult, error) {
 	return nil, NewRPCError(ErrMethodNotFound, nil)
 }
+func (BaseHandler) CredentialNotification(context.Context, *CredentialNotificationParams) {}

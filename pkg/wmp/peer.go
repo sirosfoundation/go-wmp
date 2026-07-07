@@ -404,6 +404,14 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		}
 		return p.handler.Resolve(ctx, &ps)
 
+	case MethodCredentialNotification:
+		var ps CredentialNotificationParams
+		if err := json.Unmarshal(params, &ps); err != nil {
+			return nil, NewRPCError(ErrInvalidParams, nil)
+		}
+		p.handler.CredentialNotification(ctx, &ps)
+		return nil, nil
+
 	default:
 		// Check if a profile handles this custom method.
 		if mh, ok := p.registry.lookupMethod(method); ok {

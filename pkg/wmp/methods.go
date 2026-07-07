@@ -20,6 +20,7 @@ const (
 	MethodFlowComplete        = "wmp.flow.complete"
 	MethodFlowError           = "wmp.flow.error"
 	MethodFlowCancel          = "wmp.flow.cancel"
+	MethodCredentialNotification = "wmp.credential.notification"
 	MethodResolve             = "wmp.resolve"
 	MethodRelayRegister       = "wmp.relay.register"
 )
@@ -210,6 +211,19 @@ const (
 	FlowTypeSign     = "sign"
 	FlowTypeMessage  = "message"
 )
+
+// --- Credential Notification ---
+
+// CredentialNotificationParams are the params for wmp.credential.notification.
+// Carries an OID4VCI §10 credential lifecycle event from the client to the
+// server, which forwards it to the issuer's notification endpoint.
+type CredentialNotificationParams struct {
+	WMP              Metadata `json:"wmp"`
+	FlowID           string   `json:"flow_id"`
+	NotificationID   string   `json:"notification_id"`
+	Event            string   `json:"event"`
+	EventDescription string   `json:"event_description,omitempty"`
+}
 
 // --- Resolve ---
 

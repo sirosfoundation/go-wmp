@@ -3,6 +3,7 @@ package openid4x
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
@@ -167,9 +168,10 @@ func TestCredentialTypes(t *testing.T) {
 
 func TestCredentialResult(t *testing.T) {
 	cr := CredentialResult{
-		Format:     FormatVCSDJWT,
-		Credential: "eyJ...",
-		VCT:        "https://credentials.example.com/identity",
+		Format:         FormatVCSDJWT,
+		Credential:     "eyJ...",
+		VCT:            "https://credentials.example.com/identity",
+		NotificationID: "notif-abc-123",
 	}
 	data, err := json.Marshal(cr)
 	if err != nil {
@@ -181,5 +183,23 @@ func TestCredentialResult(t *testing.T) {
 	}
 	if decoded.Format != FormatVCSDJWT {
 		t.Errorf("format = %q, want %q", decoded.Format, FormatVCSDJWT)
+	}
+	if decoded.NotificationID != "notif-abc-123" {
+		t.Errorf("notification_id = %q, want %q", decoded.NotificationID, "notif-abc-123")
+	}
+}
+
+func TestCredentialResultOmitsEmptyNotificationID(t *testing.T) {
+	cr := CredentialResult{
+		Format:     FormatVCSDJWT,
+		Credential: "eyJ...",
+	}
+	data, err := json.Marshal(cr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if strings.Contains(s, "notification_id") {
+		t.Errorf("expected notification_id to be omitted, got %s", s)
 	}
 }
