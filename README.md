@@ -110,6 +110,7 @@ This initial release covers:
 
 Not yet implemented: MLS encryption, eDelivery profile, evidence profile.
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sirosfoundation/go-wmp/badge)](https://scorecard.dev/viewer/?uri=github.com/sirosfoundation/go-wmp)
 ## License
 
 Apache 2.0
