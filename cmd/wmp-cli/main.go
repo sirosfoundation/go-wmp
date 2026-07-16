@@ -300,7 +300,6 @@ func main() {
 }
 
 func sendMessage(ctx context.Context, peer *wmp.Peer, sessionID, sender, text string) {
-	body, _ := json.Marshal(map[string]string{"text": text})
 	now := time.Now()
 	err := peer.Notify(ctx, wmp.MethodMessageDeliver, &wmp.MessageDeliverParams{
 		WMP: wmp.Metadata{
@@ -310,7 +309,7 @@ func sendMessage(ctx context.Context, peer *wmp.Peer, sessionID, sender, text st
 			Timestamp: &now,
 		},
 		ContentType: "text/plain",
-		Body:        body,
+		Body:        json.RawMessage(`"` + text + `"`),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error sending: %v\n", err)
