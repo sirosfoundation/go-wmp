@@ -39,10 +39,27 @@ type rpcError struct {
 }
 
 // vectorsDir returns the path to the wmp/vectors/ directory.
+// Searches multiple locations: sibling checkout (local dev), and
+// wmp-spec/vectors/ (GitHub Actions CI).
 func vectorsDir() string {
 	_, file, _, _ := runtime.Caller(0)
-	// go-wmp/pkg/wmp/conformance_test.go → ../../wmp/vectors/
-	return filepath.Join(filepath.Dir(file), "..", "..", "..", "wmp", "vectors")
+	base := filepath.Dir(file)
+
+	// Local dev: sibling ../wmp/vectors/ (3 levels up from pkg/wmp/)
+	candidates := []string{
+		filepath.Join(base, "..", "..", "..", "wmp", "vectors"),
+		// CI: wmp-spec/ inside the repo checkout
+		filepath.Join(base, "..", "..", "wmp-spec", "vectors"),
+	}
+
+	for _, dir := range candidates {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+	}
+
+	// Return first candidate (will trigger skip in loadVectors)
+	return candidates[0]
 }
 
 func loadVectors(t *testing.T, filename string) []TestVector {
