@@ -236,3 +236,79 @@ type captureHandler struct {
 func (h *captureHandler) MessageDeliver(_ context.Context, params *MessageDeliverParams) {
 	h.delivered <- params
 }
+
+// notificationHandler captures credential notifications (optional interface).
+type notificationHandler struct {
+	BaseHandler
+	received chan *CredentialNotificationParams
+}
+
+func (h *notificationHandler) CredentialNotification(_ context.Context, params *CredentialNotificationParams) {
+	h.received <- params
+}
+
+func TestPeer_CredentialNotification_Handled(t *testing.T) {
+	clientT, serverT := newChanTransportPair()
+
+	received := make(chan *CredentialNotificationParams, 1)
+	handler := &notificationHandler{received: received}
+
+	server := NewPeer(serverT, handler)
+	client := NewPeer(clientT, &BaseHandler{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go server.Serve(ctx)
+	go client.Serve(ctx)
+
+	params := CredentialNotificationParams{
+		WMP:            Metadata{Version: Version, SessionID: "ses-1"},
+		FlowID:         "flow-42",
+		NotificationID: "notif-abc",
+		Event:          "credential_accepted",
+	}
+
+	err := client.Notify(ctx, MethodCredentialNotification, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := <-received
+	if got.NotificationID != "notif-abc" {
+		t.Fatalf("notification_id: got %q, want %q", got.NotificationID, "notif-abc")
+	}
+	if got.Event != "credential_accepted" {
+		t.Fatalf("event: got %q, want %q", got.Event, "credential_accepted")
+	}
+}
+
+func TestPeer_CredentialNotification_NotImplemented(t *testing.T) {
+	clientT, serverT := newChanTransportPair()
+
+	// BaseHandler does NOT satisfy CredentialNotificationHandler via type assert
+	// in the dispatch (only via embedding). The peer should return MethodNotFound.
+	server := NewPeer(serverT, &echoHandler{})
+	client := NewPeer(clientT, &BaseHandler{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go server.Serve(ctx)
+	go client.Serve(ctx)
+
+	// Sending as a Call (not Notify) so we get an error response back.
+	var result json.RawMessage
+	err := client.Call(ctx, MethodCredentialNotification, json.RawMessage(`{
+		"wmp": {"version": "1.0"},
+		"flow_id": "f",
+		"notification_id": "n",
+		"event": "credential_accepted"
+	}`), &result)
+
+	// echoHandler embeds BaseHandler but does not override CredentialNotification.
+	// BaseHandler satisfies CredentialNotificationHandler, so this should succeed.
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

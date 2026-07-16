@@ -167,9 +167,10 @@ func TestCredentialTypes(t *testing.T) {
 
 func TestCredentialResult(t *testing.T) {
 	cr := CredentialResult{
-		Format:     FormatVCSDJWT,
-		Credential: "eyJ...",
-		VCT:        "https://credentials.example.com/identity",
+		Format:         FormatVCSDJWT,
+		Credential:     "eyJ...",
+		VCT:            "https://credentials.example.com/identity",
+		NotificationID: "notif-abc-123",
 	}
 	data, err := json.Marshal(cr)
 	if err != nil {
@@ -181,5 +182,26 @@ func TestCredentialResult(t *testing.T) {
 	}
 	if decoded.Format != FormatVCSDJWT {
 		t.Errorf("format = %q, want %q", decoded.Format, FormatVCSDJWT)
+	}
+	if decoded.NotificationID != "notif-abc-123" {
+		t.Errorf("notification_id = %q, want %q", decoded.NotificationID, "notif-abc-123")
+	}
+}
+
+func TestCredentialResultOmitsEmptyNotificationID(t *testing.T) {
+	cr := CredentialResult{
+		Format:     FormatVCSDJWT,
+		Credential: "eyJ...",
+	}
+	data, err := json.Marshal(cr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["notification_id"]; ok {
+		t.Error("expected notification_id key to be absent")
 	}
 }
