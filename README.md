@@ -1,5 +1,16 @@
 # go-wmp
 
+<div align="center">
+
+[![CI](https://github.com/sirosfoundation/go-wmp/actions/workflows/ci.yml/badge.svg)](https://github.com/sirosfoundation/go-wmp/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/sirosfoundation/go-wmp.svg)](https://pkg.go.dev/github.com/sirosfoundation/go-wmp)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=sirosfoundation_go-wmp&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=sirosfoundation_go-wmp)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sirosfoundation/go-wmp/badge)](https://scorecard.dev/viewer/?uri=github.com/sirosfoundation/go-wmp)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/sirosfoundation/go-wmp)](https://go.dev/)
+[![License](https://img.shields.io/badge/License-BSD_2--Clause-orange.svg)](LICENSE)
+
+</div>
+
 Go library for the [Wallet Messaging Protocol (WMP)](https://github.com/sirosfoundation/wmp) — a JSON-RPC 2.0 based multi-party messaging protocol with optional MLS end-to-end encryption.
 
 ## Installation
