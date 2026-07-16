@@ -50,6 +50,9 @@ func loadVectors(t *testing.T, filename string) []TestVector {
 	path := filepath.Join(vectorsDir(), filename)
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skipf("Vectors not available (%s); checkout leifj/wmp as sibling", path)
+		}
 		t.Fatalf("Failed to read %s: %v", path, err)
 	}
 	var vectors []TestVector

@@ -22,6 +22,12 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
+    - name: Checkout WMP spec (test vectors)
+      uses: actions/checkout@v7
+      with:
+        repository: leifj/wmp
+        path: ../wmp
+
     - name: Set up Go
       uses: actions/setup-go@v6
       with:
