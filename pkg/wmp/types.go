@@ -22,6 +22,8 @@ type Metadata struct {
 	IdentityAssertions []IdentityAssertion `json:"identity_assertions,omitempty"`
 	RelayChain         []RelayEntry        `json:"relay_chain,omitempty"`
 	TraceID            string              `json:"trace_id,omitempty"`
+	SenderDelegate     *SenderDelegate     `json:"sender_delegate,omitempty"`
+	DeliverAfter       *time.Time          `json:"deliver_after,omitempty"`
 }
 
 // IdentityAssertion binds a cryptographic identifier to a legal identity.
@@ -56,6 +58,21 @@ type RelayEntry struct {
 	TimestampToken string    `json:"timestamp_token,omitempty"`
 	Signature      string    `json:"signature,omitempty"`
 	ServiceClass   string    `json:"service_class,omitempty"`
+}
+
+// SenderDelegate represents a delegated sender acting on behalf of the original sender.
+type SenderDelegate struct {
+	ID                 string                 `json:"id"`
+	IdentityAssertions []IdentityAssertion    `json:"identity_assertions,omitempty"`
+	Authorization      *DelegateAuthorization `json:"authorization,omitempty"`
+}
+
+// DelegateAuthorization describes the authorization for a sender delegate.
+type DelegateAuthorization struct {
+	Type       string   `json:"type"`
+	Credential string   `json:"credential,omitempty"`
+	Scope      []string `json:"scope,omitempty"`
+	ValidUntil string   `json:"valid_until,omitempty"`
 }
 
 // SecurityMode represents the session security configuration.

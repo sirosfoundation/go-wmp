@@ -4,25 +4,25 @@ import "encoding/json"
 
 // Method constants for all WMP methods.
 const (
-	MethodSessionCreate       = "wmp.session.create"
-	MethodSessionResume       = "wmp.session.resume"
-	MethodSessionClose        = "wmp.session.close"
-	MethodSessionAuthenticate = "wmp.session.authenticate"
-	MethodMessageDeliver      = "wmp.message.deliver"
-	MethodMessageAck          = "wmp.message.ack"
-	MethodMessagePoll         = "wmp.message.poll"
-	MethodMessageStatus       = "wmp.message.status"
-	MethodCapabilityUpdate    = "wmp.capability.update"
-	MethodCapabilityList      = "wmp.capability.list"
-	MethodFlowStart           = "wmp.flow.start"
-	MethodFlowProgress        = "wmp.flow.progress"
-	MethodFlowAction          = "wmp.flow.action"
-	MethodFlowComplete        = "wmp.flow.complete"
-	MethodFlowError           = "wmp.flow.error"
-	MethodFlowCancel          = "wmp.flow.cancel"
+	MethodSessionCreate          = "wmp.session.create"
+	MethodSessionResume          = "wmp.session.resume"
+	MethodSessionClose           = "wmp.session.close"
+	MethodSessionAuthenticate    = "wmp.session.authenticate"
+	MethodMessageDeliver         = "wmp.message.deliver"
+	MethodMessageAck             = "wmp.message.ack"
+	MethodMessagePoll            = "wmp.message.poll"
+	MethodMessageStatus          = "wmp.message.status"
+	MethodCapabilityUpdate       = "wmp.capability.update"
+	MethodCapabilityList         = "wmp.capability.list"
+	MethodFlowStart              = "wmp.flow.start"
+	MethodFlowProgress           = "wmp.flow.progress"
+	MethodFlowAction             = "wmp.flow.action"
+	MethodFlowComplete           = "wmp.flow.complete"
+	MethodFlowError              = "wmp.flow.error"
+	MethodFlowCancel             = "wmp.flow.cancel"
 	MethodCredentialNotification = "wmp.credential.notification"
-	MethodResolve             = "wmp.resolve"
-	MethodRelayRegister       = "wmp.relay.register"
+	MethodResolve                = "wmp.resolve"
+	MethodRelayRegister          = "wmp.relay.register"
 )
 
 // --- Session ---
@@ -88,6 +88,13 @@ type MessageDeliverParams struct {
 	ContentType string          `json:"content_type,omitempty"`
 	Body        json.RawMessage `json:"body,omitempty"`
 	Ciphertext  string          `json:"ciphertext,omitempty"`
+	// ERDS delivery metadata
+	ReplyTo                 string   `json:"reply_to,omitempty"`
+	InReplyTo               string   `json:"in_reply_to,omitempty"`
+	MessageType             string   `json:"message_type,omitempty"`
+	ConsignmentMode         string   `json:"consignment_mode,omitempty"`
+	RecipientAssuranceLevel string   `json:"recipient_assurance_level,omitempty"`
+	ApplicablePolicies      []string `json:"applicable_policies,omitempty"`
 }
 
 // MessageAckParams are the params for wmp.message.ack (notification).
