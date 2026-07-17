@@ -12,13 +12,15 @@ import (
 // WellKnownConfig represents a WMP well-known configuration document
 // served at /.well-known/wmp-configuration.
 type WellKnownConfig struct {
-	SupportedVersions []string               `json:"supported_versions"`
-	Endpoints         map[string]string      `json:"endpoints"`
-	Capabilities      map[string]interface{} `json:"capabilities,omitempty"`
-	AcceptedSchemes   []string               `json:"accepted_schemes,omitempty"`
-	SecurityModes     []string               `json:"security_modes,omitempty"`
-	MLSKeyPackages    string                 `json:"mls_key_packages,omitempty"`
-	Relay             string                 `json:"relay,omitempty"`
+	SupportedVersions  []string               `json:"supported_versions"`
+	Endpoints          map[string]string      `json:"endpoints"`
+	Capabilities       map[string]interface{} `json:"capabilities,omitempty"`
+	AcceptedSchemes    []string               `json:"accepted_schemes,omitempty"`
+	SecurityModes      []string               `json:"security_modes,omitempty"`
+	MLSKeyPackages     string                 `json:"mls_key_packages,omitempty"`
+	Relay              string                 `json:"relay,omitempty"`
+	IdentityProviders  []string               `json:"identity_providers,omitempty"`
+	TrustFrameworks    []string               `json:"trust_frameworks,omitempty"`
 }
 
 // DiscoverConfig fetches the WMP well-known configuration for the given domain.

@@ -38,11 +38,13 @@ const (
 
 // Step constants for OID4VP flows.
 const (
-	StepParsingRequest         = "parsing_request"
-	StepRequestParsed          = "request_parsed"
-	StepMatchingCredentials    = "matching_credentials"
-	StepAwaitingConsent        = "awaiting_consent"
-	StepGeneratingPresentation = "generating_presentation"
+	StepParsingRequest              = "parsing_request"
+	StepRequestParsed               = "request_parsed"
+	StepVPEvaluatingTrust           = "evaluating_trust"
+	StepVPTrustEvaluated            = "trust_evaluated"
+	StepMatchingCredentials         = "matching_credentials"
+	StepAwaitingConsent             = "awaiting_consent"
+	StepGeneratingPresentation      = "generating_presentation"
 )
 
 // Action constants.
