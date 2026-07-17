@@ -2,21 +2,25 @@ package wmp
 
 // WMP error codes as defined in the specification.
 const (
-	ErrSessionNotFound          = -31000
-	ErrSessionExpired           = -31001
-	ErrNotAuthorized            = -31002
-	ErrEncryptionRequired       = -31003
-	ErrMLSError                 = -31004
-	ErrCapabilityNotSupported   = -31005
-	ErrFlowError                = -31006
-	ErrRateLimited              = -31007
-	ErrParticipantNotFound      = -31008
-	ErrEvidenceRequired         = -31009
-	ErrSignatureInvalid         = -31010
-	ErrTimestampInvalid         = -31011
-	ErrIdentityAssertionInvalid = -31012
-	ErrVersionNotSupported      = -31013
-	ErrQueueFull                = -31014
+	ErrSessionNotFound            = -31000
+	ErrSessionExpired             = -31001
+	ErrNotAuthorized              = -31002
+	ErrEncryptionRequired         = -31003
+	ErrMLSError                   = -31004
+	ErrCapabilityNotSupported     = -31005
+	ErrFlowError                  = -31006
+	ErrRateLimited                = -31007
+	ErrParticipantNotFound        = -31008
+	ErrEvidenceRequired           = -31009
+	ErrSignatureInvalid           = -31010
+	ErrTimestampInvalid           = -31011
+	ErrIdentityAssertionInvalid   = -31012
+	ErrVersionNotSupported        = -31013
+	ErrQueueFull                  = -31014
+	ErrDelegationInvalid          = -31015
+	ErrConsignmentModeUnsupported = -31016
+	ErrAssuranceLevelUnsupported  = -31017
+	ErrPolicyUnsupported          = -31018
 )
 
 // Standard JSON-RPC 2.0 error codes.
@@ -61,6 +65,14 @@ func ErrorMessage(code int) string {
 		return "Version not supported"
 	case ErrQueueFull:
 		return "Queue full"
+	case ErrDelegationInvalid:
+		return "Delegation invalid"
+	case ErrConsignmentModeUnsupported:
+		return "Consignment mode unsupported"
+	case ErrAssuranceLevelUnsupported:
+		return "Assurance level unsupported"
+	case ErrPolicyUnsupported:
+		return "Policy unsupported"
 	case ErrParseError:
 		return "Parse error"
 	case ErrInvalidRequest:

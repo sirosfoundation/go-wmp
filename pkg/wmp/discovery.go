@@ -12,15 +12,36 @@ import (
 // WellKnownConfig represents a WMP well-known configuration document
 // served at /.well-known/wmp-configuration.
 type WellKnownConfig struct {
-	SupportedVersions  []string               `json:"supported_versions"`
-	Endpoints          map[string]string      `json:"endpoints"`
-	Capabilities       map[string]interface{} `json:"capabilities,omitempty"`
-	AcceptedSchemes    []string               `json:"accepted_schemes,omitempty"`
-	SecurityModes      []string               `json:"security_modes,omitempty"`
-	MLSKeyPackages     string                 `json:"mls_key_packages,omitempty"`
-	Relay              string                 `json:"relay,omitempty"`
-	IdentityProviders  []string               `json:"identity_providers,omitempty"`
-	TrustFrameworks    []string               `json:"trust_frameworks,omitempty"`
+	SupportedVersions []string               `json:"supported_versions"`
+	Endpoints         map[string]string      `json:"endpoints"`
+	Capabilities      map[string]interface{} `json:"capabilities,omitempty"`
+	AcceptedSchemes   []string               `json:"accepted_schemes,omitempty"`
+	SecurityModes     []string               `json:"security_modes,omitempty"`
+	MLSKeyPackages    string                 `json:"mls_key_packages,omitempty"`
+	Relay             string                 `json:"relay,omitempty"`
+	IdentityProviders []string               `json:"identity_providers,omitempty"`
+	TrustFrameworks   []string               `json:"trust_frameworks,omitempty"`
+	ERDS              *ErdsMetadata          `json:"erds,omitempty"`
+	RecipientMetadata *RecipientMetadata     `json:"recipient_metadata,omitempty"`
+}
+
+// ErdsMetadata advertises ERDS (Electronic Registered Delivery Service) capabilities.
+type ErdsMetadata struct {
+	ConsignmentModes   []string `json:"consignment_modes,omitempty"`
+	AssuranceLevels    []string `json:"assurance_levels,omitempty"`
+	SupportedPolicies  []string `json:"supported_policies,omitempty"`
+	Delegation         bool     `json:"delegation,omitempty"`
+	EvidenceRepository string   `json:"evidence_repository,omitempty"`
+	EvidenceRetention  string   `json:"evidence_retention,omitempty"`
+	ScheduledDelivery  bool     `json:"scheduled_delivery,omitempty"`
+}
+
+// RecipientMetadata advertises a recipient's delivery preferences.
+type RecipientMetadata struct {
+	AcceptedContentTypes   []string `json:"accepted_content_types,omitempty"`
+	MaxMessageSize         int      `json:"max_message_size,omitempty"`
+	ConsignmentPreferences string   `json:"consignment_preferences,omitempty"`
+	EncryptionRequired     bool     `json:"encryption_required,omitempty"`
 }
 
 // DiscoverConfig fetches the WMP well-known configuration for the given domain.
