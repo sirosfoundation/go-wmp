@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 )
@@ -188,6 +189,9 @@ func DecodeMessage(data []byte, opts ...*DecodeOptions) (*Message, error) {
 	if err := checkMessageDepth(&msg, opt.maxDepth()); err != nil {
 		return nil, err
 	}
+	if err := requireEOF(dec); err != nil {
+		return nil, err
+	}
 	return &msg, nil
 }
 
@@ -221,7 +225,22 @@ func DecodeBatch(data []byte, opts ...*DecodeOptions) ([]*Message, error) {
 			return nil, err
 		}
 	}
+	if err := requireEOF(dec); err != nil {
+		return nil, err
+	}
 	return msgs, nil
+}
+
+// requireEOF returns an error if the decoder has remaining non-whitespace data.
+func requireEOF(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err == io.EOF {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("decode error: %w", err)
+	}
+	return fmt.Errorf("trailing data after JSON-RPC message: %v", tok)
 }
 
 func trimSpace(data []byte) []byte {

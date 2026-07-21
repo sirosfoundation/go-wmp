@@ -236,7 +236,7 @@ func (s *MemoryInvitationStore) Cleanup() (int, error) {
 // or a JSON-RPC-style error code and message on failure.
 // If verifier is non-nil, the invitation's signature is verified before it is
 // accepted; a failed verification is treated the same as an invalid nonce.
-func ValidateInvitationNonce(store InvitationStore, nonce string, verifier InvitationVerifier) (*Invitation, int, string) {
+func ValidateInvitationNonce(ctx context.Context, store InvitationStore, nonce string, verifier InvitationVerifier) (*Invitation, int, string) {
 	if nonce == "" {
 		return nil, ErrNotAuthorized, "missing invitation_nonce"
 	}
@@ -248,7 +248,7 @@ func ValidateInvitationNonce(store InvitationStore, nonce string, verifier Invit
 		return nil, ErrNotAuthorized, "invitation expired"
 	}
 	if verifier != nil {
-		if err := verifier.VerifyInvitation(context.Background(), inv); err != nil {
+		if err := verifier.VerifyInvitation(ctx, inv); err != nil {
 			return nil, ErrNotAuthorized, "invitation signature verification failed"
 		}
 	}

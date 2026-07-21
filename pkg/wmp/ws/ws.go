@@ -55,8 +55,8 @@ func checkSameOrigin(r *http.Request) bool {
 
 // Dial connects to a WMP WebSocket endpoint.
 // Only secure schemes (wss/https) are accepted unless allowInsecure is true.
-func Dial(ctx context.Context, url string, header http.Header, allowInsecure bool) (*Transport, *http.Response, error) {
-	u, err := parseAndValidateURL(url, allowInsecure)
+func Dial(ctx context.Context, rawURL string, header http.Header, allowInsecure bool) (*Transport, *http.Response, error) {
+	u, err := parseAndValidateURL(rawURL, allowInsecure)
 	if err != nil {
 		return nil, nil, err
 	}

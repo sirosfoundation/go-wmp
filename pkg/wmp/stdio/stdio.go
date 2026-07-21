@@ -77,10 +77,6 @@ func (t *Transport) ReadMessage(ctx context.Context) ([]byte, error) {
 		if len(line) == 0 {
 			continue
 		}
-		if len(line) > t.maxLine {
-			// Line exceeded the configured limit; drop it and keep reading.
-			continue
-		}
 		// Validate it's at least valid JSON
 		if !json.Valid(line) {
 			continue

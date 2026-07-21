@@ -43,9 +43,9 @@ var methodSchemaMap = map[string]string{
 
 // responseSchemaMap maps WMP method names to their response schema file paths.
 var responseSchemaMap = map[string]string{
-	"wmp.session.create":    "methods/session-create-response.json",
-	"wmp.resolve":           "methods/resolve-response.json",
-	"wmp.capability.list":   "methods/capability-list-response.json",
+	"wmp.session.create":  "methods/session-create-response.json",
+	"wmp.resolve":         "methods/resolve-response.json",
+	"wmp.capability.list": "methods/capability-list-response.json",
 }
 
 // Validator validates WMP messages against embedded JSON Schemas.

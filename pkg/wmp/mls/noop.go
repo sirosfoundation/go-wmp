@@ -141,9 +141,9 @@ func (h *NoopMLSHandler) MessageFetch(_ context.Context, params *MessageFetchPar
 // creates a NoopMLSProvider without the opt-in will return errors from
 // Encrypt/Decrypt rather than silently leak plaintext.
 type NoopMLSProvider struct {
-	mu             sync.Mutex
-	groups         map[string]*noopProviderGroup
-	allowInsecure  bool
+	mu            sync.Mutex
+	groups        map[string]*noopProviderGroup
+	allowInsecure bool
 }
 
 type noopProviderGroup struct {

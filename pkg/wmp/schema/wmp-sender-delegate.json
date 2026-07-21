@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/leifj/wmp/schema/wmp-sender-delegate.json",
+  "title": "WMP Sender Delegate",
+  "description": "A delegated sender acting on behalf of the original sender.",
+  "type": "object",
+  "required": ["id"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Identifier of the delegated sender."
+    },
+    "identity_assertions": {
+      "type": "array",
+      "items": { "$ref": "wmp-identity-assertion.json" },
+      "description": "Legal identity bindings for the delegate."
+    },
+    "authorization": {
+      "type": "object",
+      "description": "Authorization for the sender delegate.",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Authorization type."
+        },
+        "credential": {
+          "type": "string",
+          "description": "Credential proving the authorization."
+        },
+        "scope": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Authorized scopes."
+        },
+        "valid_until": {
+          "type": "string",
+          "description": "ISO 8601 expiration of the authorization."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

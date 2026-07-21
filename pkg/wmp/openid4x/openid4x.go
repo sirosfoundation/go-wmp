@@ -38,13 +38,13 @@ const (
 
 // Step constants for OID4VP flows.
 const (
-	StepParsingRequest              = "parsing_request"
-	StepRequestParsed               = "request_parsed"
-	StepVPEvaluatingTrust           = "evaluating_trust"
-	StepVPTrustEvaluated            = "trust_evaluated"
-	StepMatchingCredentials         = "matching_credentials"
-	StepAwaitingConsent             = "awaiting_consent"
-	StepGeneratingPresentation      = "generating_presentation"
+	StepParsingRequest         = "parsing_request"
+	StepRequestParsed          = "request_parsed"
+	StepVPEvaluatingTrust      = "evaluating_trust"
+	StepVPTrustEvaluated       = "trust_evaluated"
+	StepMatchingCredentials    = "matching_credentials"
+	StepAwaitingConsent        = "awaiting_consent"
+	StepGeneratingPresentation = "generating_presentation"
 )
 
 // Action constants.
@@ -165,20 +165,20 @@ type TransactionData struct {
 	Params map[string]interface{} `json:"params,omitempty"`
 
 	// Credential-binding fields per OID4VP draft §7.4
-	CredentialIDs          []string `json:"credential_ids,omitempty"`
-	HashAlgorithm          string   `json:"hash_alg,omitempty"`
-	TransactionDataHashesAlg string `json:"transaction_data_hashes_alg,omitempty"`
+	CredentialIDs            []string `json:"credential_ids,omitempty"`
+	HashAlgorithm            string   `json:"hash_alg,omitempty"`
+	TransactionDataHashesAlg string   `json:"transaction_data_hashes_alg,omitempty"`
 }
 
 // SignSubFlowParams are flow-type-specific params for the sign sub-flow
 // nested inside an OID4VCI or OID4VP flow.
 type SignSubFlowParams struct {
-	Action          string             `json:"action"`
-	Nonce           string             `json:"nonce"`
-	Audience        string             `json:"audience"`
-	ProofType       string             `json:"proof_type,omitempty"`
-	ParentFlowID    string             `json:"parent_flow_id"`
-	TransactionData []TransactionData  `json:"transaction_data,omitempty"`
+	Action          string            `json:"action"`
+	Nonce           string            `json:"nonce"`
+	Audience        string            `json:"audience"`
+	ProofType       string            `json:"proof_type,omitempty"`
+	ParentFlowID    string            `json:"parent_flow_id"`
+	TransactionData []TransactionData `json:"transaction_data,omitempty"`
 }
 
 // SelectionAction is the action params for accept_offer.

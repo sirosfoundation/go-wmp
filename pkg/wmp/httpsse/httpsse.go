@@ -438,14 +438,14 @@ type ServerTransport struct {
 }
 
 // sseEscape escapes data so it cannot inject new SSE fields. It replaces
-// any newline that appears at the start of a line with a space, preventing
-// attackers from terminating the data field early.
+// line terminators (LF and CR) with spaces, preventing attackers from
+// terminating the data field early.
 func sseEscape(data []byte) []byte {
 	var b strings.Builder
 	b.Grow(len(data))
 	for i := 0; i < len(data); i++ {
 		c := data[i]
-		if c == '\n' {
+		if c == '\n' || c == '\r' {
 			b.WriteByte(' ')
 		} else {
 			b.WriteByte(c)
