@@ -207,7 +207,7 @@ func TestValidateInvitationNonce(t *testing.T) {
 	store.Put(inv.Nonce, inv)
 
 	// Valid nonce
-	got, code, _ := ValidateInvitationNonce(store, inv.Nonce)
+	got, code, _ := ValidateInvitationNonce(store, inv.Nonce, nil)
 	if code != 0 {
 		t.Fatalf("expected success, got error code %d", code)
 	}
@@ -216,7 +216,7 @@ func TestValidateInvitationNonce(t *testing.T) {
 	}
 
 	// Replay
-	_, code, msg := ValidateInvitationNonce(store, inv.Nonce)
+	_, code, msg := ValidateInvitationNonce(store, inv.Nonce, nil)
 	if code != ErrNotAuthorized {
 		t.Fatalf("expected ErrNotAuthorized, got %d", code)
 	}
@@ -225,7 +225,7 @@ func TestValidateInvitationNonce(t *testing.T) {
 	}
 
 	// Empty nonce
-	_, code, _ = ValidateInvitationNonce(store, "")
+	_, code, _ = ValidateInvitationNonce(store, "", nil)
 	if code != ErrNotAuthorized {
 		t.Fatal("empty nonce should fail")
 	}

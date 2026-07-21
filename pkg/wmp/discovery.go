@@ -49,13 +49,21 @@ type RecipientMetadata struct {
 // (x509:san:dns, https://, did:web). Use ExtractDomain to get the domain
 // from any WMP identifier.
 func DiscoverConfig(ctx context.Context, domain string) (*WellKnownConfig, error) {
-	return fetchConfig(ctx, "https://"+domain+"/.well-known/wmp-configuration", nil)
+	url, err := buildWellKnownURL(domain)
+	if err != nil {
+		return nil, err
+	}
+	return fetchConfig(ctx, url, nil)
 }
 
 // DiscoverConfigWithClient fetches the WMP well-known configuration using
 // a custom HTTP client (for testing or custom TLS configuration).
 func DiscoverConfigWithClient(ctx context.Context, domain string, client *http.Client) (*WellKnownConfig, error) {
-	return fetchConfig(ctx, "https://"+domain+"/.well-known/wmp-configuration", client)
+	url, err := buildWellKnownURL(domain)
+	if err != nil {
+		return nil, err
+	}
+	return fetchConfig(ctx, url, client)
 }
 
 // DiscoverConfigForIdentifier fetches the well-known configuration for any
@@ -87,6 +95,19 @@ func DiscoverConfigForDID(ctx context.Context, did string, client *http.Client) 
 	// Always resolve at domain level — sub-path resolution is deprecated
 	// per WMP spec §7.5.5 privacy principle.
 	return fetchConfig(ctx, "https://"+domain+"/.well-known/wmp-configuration", client)
+}
+
+// buildWellKnownURL safely constructs the well-known configuration URL for a
+// domain, rejecting domain values that contain path separators, query strings,
+// fragments, or userinfo that could redirect the request elsewhere.
+func buildWellKnownURL(domain string) (string, error) {
+	if domain == "" {
+		return "", fmt.Errorf("domain must not be empty")
+	}
+	if strings.ContainsAny(domain, "/?#@\\") {
+		return "", fmt.Errorf("invalid domain %q", domain)
+	}
+	return "https://" + domain + "/.well-known/wmp-configuration", nil
 }
 
 // ExtractDomain extracts the domain from a WMP identifier for well-known resolution.
@@ -164,6 +185,9 @@ func parseDIDWeb(did string) (domain string, path string, err error) {
 
 	// First part is the domain (with %3A for port).
 	domain = strings.ReplaceAll(parts[0], "%3A", ":")
+	if !isValidDIDWebDomain(domain) {
+		return "", "", fmt.Errorf("invalid did:web domain %q", domain)
+	}
 
 	// Remaining parts form the path.
 	if len(parts) > 1 {
@@ -171,4 +195,13 @@ func parseDIDWeb(did string) (domain string, path string, err error) {
 	}
 
 	return domain, path, nil
+}
+
+// isValidDIDWebDomain rejects domains that could be used to redirect discovery
+// to unexpected hosts (e.g., via embedded path separators or userinfo).
+func isValidDIDWebDomain(domain string) bool {
+	if domain == "" {
+		return false
+	}
+	return !strings.ContainsAny(domain, "/\\?#@") && !strings.HasPrefix(domain, ".")
 }

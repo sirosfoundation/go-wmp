@@ -97,7 +97,7 @@ func TestNoopMLSHandler_MessageFetch(t *testing.T) {
 }
 
 func TestNoopMLSProvider_EncryptDecrypt(t *testing.T) {
-	p := NewNoopMLSProvider()
+	p := NewNoopMLSProvider(WithAllowInsecure(true))
 	plaintext := []byte("hello world")
 	ct, epoch, err := p.Encrypt("g1", plaintext)
 	if err != nil {

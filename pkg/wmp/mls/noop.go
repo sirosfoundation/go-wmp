@@ -135,20 +135,41 @@ func (h *NoopMLSHandler) MessageFetch(_ context.Context, params *MessageFetchPar
 // NoopMLSProvider implements MLSProvider for TLS-only sessions.
 // It performs no actual MLS cryptographic operations — messages pass through
 // unencrypted, relying on transport-level TLS for confidentiality.
+//
+// Because this provider intentionally disables end-to-end encryption, it must
+// be enabled explicitly with WithAllowInsecure(). Code that accidentally
+// creates a NoopMLSProvider without the opt-in will return errors from
+// Encrypt/Decrypt rather than silently leak plaintext.
 type NoopMLSProvider struct {
-	mu     sync.Mutex
-	groups map[string]*noopProviderGroup
+	mu             sync.Mutex
+	groups         map[string]*noopProviderGroup
+	allowInsecure  bool
 }
 
 type noopProviderGroup struct {
 	epoch int
 }
 
-// NewNoopMLSProvider creates a provider suitable for TLS-only sessions.
-func NewNoopMLSProvider() *NoopMLSProvider {
-	return &NoopMLSProvider{
+// NoopMLSProviderOption configures a NoopMLSProvider.
+type NoopMLSProviderOption func(*NoopMLSProvider)
+
+// WithAllowInsecure explicitly enables the plaintext passthrough mode of the
+// no-op provider. Use only when the transport channel already provides
+// adequate confidentiality and integrity (e.g., mutually authenticated TLS).
+func WithAllowInsecure(allow bool) NoopMLSProviderOption {
+	return func(p *NoopMLSProvider) { p.allowInsecure = allow }
+}
+
+// NewNoopMLSProvider creates a no-op MLS provider. By default Encrypt and
+// Decrypt return errors; use WithAllowInsecure(true) to enable passthrough.
+func NewNoopMLSProvider(opts ...NoopMLSProviderOption) *NoopMLSProvider {
+	p := &NoopMLSProvider{
 		groups: make(map[string]*noopProviderGroup),
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 func (p *NoopMLSProvider) GenerateKeyPackage(cipherSuite int) (*KeyPackage, error) {
@@ -221,11 +242,21 @@ func (p *NoopMLSProvider) SelfUpdate(groupID string) (string, error) {
 }
 
 func (p *NoopMLSProvider) Encrypt(_ string, plaintext []byte) (string, int, error) {
+	if !p.allowInsecure {
+		return "", 0, wmp.NewRPCError(wmp.ErrMLSError, map[string]string{
+			"reason": "NoopMLSProvider plaintext mode is not enabled; use WithAllowInsecure(true) only when transport security is sufficient",
+		})
+	}
 	// Noop: return plaintext as-is (base64url would be applied by caller).
 	return string(plaintext), 0, nil
 }
 
 func (p *NoopMLSProvider) Decrypt(_ string, ciphertext string) ([]byte, int, error) {
+	if !p.allowInsecure {
+		return nil, 0, wmp.NewRPCError(wmp.ErrMLSError, map[string]string{
+			"reason": "NoopMLSProvider plaintext mode is not enabled; use WithAllowInsecure(true) only when transport security is sufficient",
+		})
+	}
 	// Noop: return ciphertext as-is.
 	return []byte(ciphertext), 0, nil
 }

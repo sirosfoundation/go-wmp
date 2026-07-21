@@ -148,12 +148,6 @@ type CredentialResult struct {
 	NotificationID string `json:"notification_id,omitempty"`
 }
 
-// OID4VCI §10 credential lifecycle events.
-const (
-	CredentialEventAccepted = "credential_accepted"
-	CredentialEventFailure  = "credential_failure"
-)
-
 // VPTokenResult represents a VP flow completion.
 type VPTokenResult struct {
 	VPToken                string      `json:"vp_token,omitempty"`

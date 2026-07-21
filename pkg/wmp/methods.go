@@ -221,6 +221,12 @@ const (
 
 // --- Credential Notification ---
 
+// OID4VCI §10 credential lifecycle events.
+const (
+	CredentialEventAccepted = "credential_accepted"
+	CredentialEventFailure  = "credential_failure"
+)
+
 // CredentialNotificationParams are the params for wmp.credential.notification.
 // Carries an OID4VCI §10 credential lifecycle event from the client to the
 // server, which forwards it to the issuer's notification endpoint.
@@ -230,6 +236,39 @@ type CredentialNotificationParams struct {
 	NotificationID   string   `json:"notification_id"`
 	Event            string   `json:"event"`
 	EventDescription string   `json:"event_description,omitempty"`
+}
+
+// ValidateCredentialNotification validates a wmp.credential.notification
+// message. The event must be a known OID4VCI lifecycle event and required
+// identifiers must be present.
+func ValidateCredentialNotification(params *CredentialNotificationParams) error {
+	if params.FlowID == "" {
+		return NewRPCError(ErrInvalidParams, map[string]string{
+			"reason": "flow_id is required",
+		})
+	}
+	if params.NotificationID == "" {
+		return NewRPCError(ErrInvalidParams, map[string]string{
+			"reason": "notification_id is required",
+		})
+	}
+	if !IsValidCredentialEvent(params.Event) {
+		return NewRPCError(ErrInvalidParams, map[string]string{
+			"reason": "unsupported credential event: " + params.Event,
+		})
+	}
+	return nil
+}
+
+// IsValidCredentialEvent reports whether event is a known OID4VCI credential
+// lifecycle event.
+func IsValidCredentialEvent(event string) bool {
+	switch event {
+	case CredentialEventAccepted, CredentialEventFailure:
+		return true
+	default:
+		return false
+	}
 }
 
 // --- Resolve ---

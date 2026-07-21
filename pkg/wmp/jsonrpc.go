@@ -1,9 +1,39 @@
 package wmp
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 )
+
+const (
+	defaultMaxMessageSize = 1 << 20 // 1 MB
+	defaultMaxDepth       = 32
+)
+
+// DecodeOptions controls safety limits for JSON-RPC decoding.
+type DecodeOptions struct {
+	// MaxSize is the maximum message size in bytes.
+	MaxSize int
+	// MaxDepth is the maximum nesting depth for arrays/objects.
+	MaxDepth int
+}
+
+func (o *DecodeOptions) maxSize() int {
+	if o == nil || o.MaxSize <= 0 {
+		return defaultMaxMessageSize
+	}
+	return o.MaxSize
+}
+
+func (o *DecodeOptions) maxDepth() int {
+	if o == nil || o.MaxDepth <= 0 {
+		return defaultMaxDepth
+	}
+	return o.MaxDepth
+}
 
 // Request is a JSON-RPC 2.0 request or notification.
 // Notifications have ID == nil.
@@ -136,31 +166,59 @@ func (m *Message) AsResponse() *Response {
 }
 
 // DecodeMessage decodes raw JSON into a Message.
-func DecodeMessage(data []byte) (*Message, error) {
+func DecodeMessage(data []byte, opts ...*DecodeOptions) (*Message, error) {
+	var opt *DecodeOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if len(data) > opt.maxSize() {
+		return nil, fmt.Errorf("message exceeds maximum size of %d bytes", opt.maxSize())
+	}
+
 	var msg Message
-	if err := json.Unmarshal(data, &msg); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&msg); err != nil {
 		return nil, fmt.Errorf("decode message: %w", err)
 	}
 	if msg.JSONRPC != "2.0" {
 		return nil, fmt.Errorf("unsupported jsonrpc version: %q", msg.JSONRPC)
+	}
+
+	if err := checkMessageDepth(&msg, opt.maxDepth()); err != nil {
+		return nil, err
 	}
 	return &msg, nil
 }
 
 // DecodeBatch attempts to decode a JSON array as a batch of messages.
 // Returns nil if the data is not a JSON array.
-func DecodeBatch(data []byte) ([]*Message, error) {
+func DecodeBatch(data []byte, opts ...*DecodeOptions) ([]*Message, error) {
+	var opt *DecodeOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if len(data) > opt.maxSize() {
+		return nil, fmt.Errorf("message exceeds maximum size of %d bytes", opt.maxSize())
+	}
+
 	data = trimSpace(data)
 	if len(data) == 0 || data[0] != '[' {
 		return nil, nil
 	}
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
 	var msgs []*Message
-	if err := json.Unmarshal(data, &msgs); err != nil {
+	if err := dec.Decode(&msgs); err != nil {
 		return nil, fmt.Errorf("decode batch: %w", err)
 	}
 	for _, msg := range msgs {
 		if msg.JSONRPC != "2.0" {
 			return nil, fmt.Errorf("unsupported jsonrpc version in batch: %q", msg.JSONRPC)
+		}
+		if err := checkMessageDepth(msg, opt.maxDepth()); err != nil {
+			return nil, err
 		}
 	}
 	return msgs, nil
@@ -171,4 +229,73 @@ func trimSpace(data []byte) []byte {
 		data = data[1:]
 	}
 	return data
+}
+
+// checkMessageDepth verifies that nested Params/Result/Error/Data raw messages
+// do not exceed the configured depth. It unmarshals the raw JSON into generic
+// values and measures nesting.
+func checkMessageDepth(msg *Message, maxDepth int) error {
+	check := func(raw json.RawMessage) error {
+		if len(raw) == 0 {
+			return nil
+		}
+		var v interface{}
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil // let normal decoding report parse errors later
+		}
+		if depth(v) > maxDepth {
+			return fmt.Errorf("message exceeds maximum nesting depth of %d", maxDepth)
+		}
+		return nil
+	}
+	if err := check(msg.Params); err != nil {
+		return err
+	}
+	if err := check(msg.Result); err != nil {
+		return err
+	}
+	if msg.Error != nil && msg.Error.Data != nil {
+		if err := check(msg.Error.Data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func depth(v interface{}) int {
+	switch x := v.(type) {
+	case map[string]interface{}:
+		max := 1
+		for _, child := range x {
+			if d := depth(child); d+1 > max {
+				max = d + 1
+			}
+		}
+		return max
+	case []interface{}:
+		max := 1
+		for _, child := range x {
+			if d := depth(child); d+1 > max {
+				max = d + 1
+			}
+		}
+		return max
+	case json.Number:
+		// Treat numbers as scalars, but also handle strings that look like
+		// numbers for safety — depth 1.
+		if _, err := x.Int64(); err == nil {
+			return 1
+		}
+		if _, err := strconv.ParseFloat(string(x), 64); err == nil {
+			return 1
+		}
+		return 1
+	case string:
+		if strings.TrimSpace(x) == "" {
+			return 1
+		}
+		return 1
+	default:
+		return 1
+	}
 }

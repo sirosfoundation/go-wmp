@@ -3,8 +3,11 @@ package ws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -12,6 +15,10 @@ import (
 
 // Subprotocol is the WebSocket subprotocol identifier for WMP.
 const Subprotocol = "wmp.v1"
+
+// allowedSchemes lists the WebSocket URL schemes accepted by Dial.
+// Only encrypted schemes are allowed for WMP transports.
+var allowedSchemes = []string{"wss", "https"}
 
 // Transport implements wmp.Transport over a gorilla/websocket connection.
 type Transport struct {
@@ -25,23 +32,61 @@ func NewTransport(conn *websocket.Conn) *Transport {
 }
 
 // Upgrader returns a websocket.Upgrader configured for the wmp.v1 subprotocol.
+// The returned upgrader rejects cross-origin requests; callers can override
+// CheckOrigin if their deployment requires a different policy.
 func Upgrader() websocket.Upgrader {
 	return websocket.Upgrader{
 		Subprotocols: []string{Subprotocol},
-		CheckOrigin:  func(r *http.Request) bool { return true },
+		CheckOrigin:  checkSameOrigin,
 	}
 }
 
+func checkSameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
 // Dial connects to a WMP WebSocket endpoint.
-func Dial(ctx context.Context, url string, header http.Header) (*Transport, *http.Response, error) {
+// Only secure schemes (wss/https) are accepted unless allowInsecure is true.
+func Dial(ctx context.Context, url string, header http.Header, allowInsecure bool) (*Transport, *http.Response, error) {
+	u, err := parseAndValidateURL(url, allowInsecure)
+	if err != nil {
+		return nil, nil, err
+	}
 	dialer := websocket.Dialer{
 		Subprotocols: []string{Subprotocol},
 	}
-	conn, resp, err := dialer.DialContext(ctx, url, header)
+	conn, resp, err := dialer.DialContext(ctx, u.String(), header)
 	if err != nil {
 		return nil, resp, fmt.Errorf("ws dial: %w", err)
 	}
 	return NewTransport(conn), resp, nil
+}
+
+func parseAndValidateURL(raw string, allowInsecure bool) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid websocket url: %w", err)
+	}
+	if u.Scheme == "" {
+		return nil, errors.New("invalid websocket url: missing scheme")
+	}
+	for _, s := range allowedSchemes {
+		if strings.EqualFold(u.Scheme, s) {
+			return u, nil
+		}
+	}
+	if allowInsecure && (strings.EqualFold(u.Scheme, "ws") || strings.EqualFold(u.Scheme, "http")) {
+		return u, nil
+	}
+	return nil, fmt.Errorf("unsupported websocket scheme %q", u.Scheme)
 }
 
 // Upgrade upgrades an HTTP request to a WMP WebSocket connection.

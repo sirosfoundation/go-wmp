@@ -1,6 +1,7 @@
 package wmp
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -10,6 +11,14 @@ import (
 	"sync"
 	"time"
 )
+
+// InvitationVerifier verifies the signature on an Invitation.
+// Implementations must check that the invitation was signed by the sender
+// (or a delegate authorized by the sender) and that the key material is
+// bound to the provider/sender identifier.
+type InvitationVerifier interface {
+	VerifyInvitation(ctx context.Context, inv *Invitation) error
+}
 
 // Invitation purpose constants.
 const (
@@ -225,13 +234,23 @@ func (s *MemoryInvitationStore) Cleanup() (int, error) {
 // ValidateInvitationNonce checks the invitation_nonce from a
 // wmp.session.create request. Returns the original invitation on success,
 // or a JSON-RPC-style error code and message on failure.
-func ValidateInvitationNonce(store InvitationStore, nonce string) (*Invitation, int, string) {
+// If verifier is non-nil, the invitation's signature is verified before it is
+// accepted; a failed verification is treated the same as an invalid nonce.
+func ValidateInvitationNonce(store InvitationStore, nonce string, verifier InvitationVerifier) (*Invitation, int, string) {
 	if nonce == "" {
 		return nil, ErrNotAuthorized, "missing invitation_nonce"
 	}
 	inv, ok := store.Consume(nonce)
 	if !ok {
 		return nil, ErrNotAuthorized, "invalid_invitation_nonce"
+	}
+	if inv.IsExpired() {
+		return nil, ErrNotAuthorized, "invitation expired"
+	}
+	if verifier != nil {
+		if err := verifier.VerifyInvitation(context.Background(), inv); err != nil {
+			return nil, ErrNotAuthorized, "invitation signature verification failed"
+		}
 	}
 	return inv, 0, ""
 }
