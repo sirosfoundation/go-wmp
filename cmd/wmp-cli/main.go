@@ -75,10 +75,30 @@ func main() {
 	defer cancel()
 
 	var endpointURL string
+	var invitationNonce string
 
 	switch cmd {
 	case "connect":
 		endpointURL = target
+	case "create-invite":
+		// Generate an invitation URI for the given provider
+		provider := target
+		inv, err := wmp.NewInvitation(provider, sender, 5*time.Minute)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating invitation: %v\n", err)
+			os.Exit(1)
+		}
+		// Set relay from extra arg if provided
+		if len(args) > 2 {
+			inv.Relay = args[2]
+		}
+		uri, err := inv.URI()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating URI: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(uri)
+		return
 	case "invite":
 		inv, err := wmp.ParseInvitationURI(target)
 		if err != nil {
@@ -88,6 +108,7 @@ func main() {
 		if inv.IsExpired() {
 			fmt.Fprintf(os.Stderr, "Warning: invitation has expired\n")
 		}
+		invitationNonce = inv.Nonce
 		fmt.Fprintf(os.Stderr, "Invitation from %s (provider: %s, purpose: %s)\n",
 			inv.Sender, inv.Provider, inv.Purpose)
 
@@ -191,8 +212,9 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Creating session...\n")
 	var result wmp.SessionCreateResult
 	err = peer.Call(ctx, wmp.MethodSessionCreate, &wmp.SessionCreateParams{
-		WMP:      wmp.Metadata{Version: wmp.Version, Sender: sender},
-		Security: wmp.SecurityMode{Mode: "tls"},
+		WMP:             wmp.Metadata{Version: wmp.Version, Sender: sender},
+		Security:        wmp.SecurityMode{Mode: "tls"},
+		InvitationNonce: invitationNonce,
 	}, &result)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating session: %v\n", err)
