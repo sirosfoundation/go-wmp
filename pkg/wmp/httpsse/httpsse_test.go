@@ -11,6 +11,53 @@ import (
 	"time"
 )
 
+func TestNewClientTransport(t *testing.T) {
+	tests := []struct {
+		name    string
+		endpoint string
+		wantErr bool
+	}{
+		{"https endpoint", "https://example.com/wmp", false},
+		{"plain http rejected", "http://example.com/wmp", true},
+		{"ws scheme rejected", "ws://example.com/wmp", true},
+		{"invalid URL", "://bad", true},
+		{"empty scheme", "example.com/wmp", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr, err := NewClientTransport(tt.endpoint)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("NewClientTransport(%q) error = %v, wantErr %v", tt.endpoint, err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if tr.endpoint != tt.endpoint {
+				t.Fatalf("endpoint = %q, want %q", tr.endpoint, tt.endpoint)
+			}
+		})
+	}
+}
+
+func TestClientOptions(t *testing.T) {
+	customClient := &http.Client{Timeout: 5 * time.Second}
+	headers := http.Header{"X-Custom": []string{"value"}}
+
+	tr, err := NewClientTransport("https://example.com/wmp",
+		WithHTTPClient(customClient),
+		WithHeaders(headers),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.httpClient != customClient {
+		t.Fatal("WithHTTPClient not applied")
+	}
+	if got := tr.headers.Get("X-Custom"); got != "value" {
+		t.Fatalf("custom header not applied: %q", got)
+	}
+}
+
 func TestEventBufferAndReplay(t *testing.T) {
 	sess := newServerSession(5)
 

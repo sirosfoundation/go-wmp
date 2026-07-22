@@ -3,6 +3,7 @@ package wmp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -230,6 +231,87 @@ func TestValidateInvitationNonce(t *testing.T) {
 	if code != ErrNotAuthorized {
 		t.Fatal("empty nonce should fail")
 	}
+}
+
+func TestValidateInvitationNonce_Expired(t *testing.T) {
+	// Use a store that returns the expired invitation without deleting it,
+	// so ValidateInvitationNonce reaches the explicit expiry check.
+	store := &staticInvitationStore{
+		inv: &Invitation{
+			Provider:  "x509:san:dns:wallet.example.com",
+			Sender:    "did:key:z6MkTest",
+			Nonce:     "expired-nonce",
+			ExpiresAt: time.Now().Add(-time.Second),
+		},
+	}
+
+	_, code, msg := ValidateInvitationNonce(context.Background(), store, "expired-nonce", nil)
+	if code != ErrNotAuthorized {
+		t.Fatalf("expected ErrNotAuthorized, got %d", code)
+	}
+	if msg != "invitation expired" {
+		t.Fatalf("expected expired message, got %q", msg)
+	}
+}
+
+type staticInvitationStore struct {
+	inv *Invitation
+}
+
+func (s *staticInvitationStore) Put(_ string, _ *Invitation) error { return nil }
+func (s *staticInvitationStore) Consume(_ string) (*Invitation, bool) {
+	return s.inv, s.inv != nil
+}
+func (s *staticInvitationStore) Cleanup() (int, error) { return 0, nil }
+
+func TestValidateInvitationNonce_Verifier(t *testing.T) {
+	store := NewMemoryInvitationStore()
+	inv, _ := NewInvitation("x509:san:dns:wallet.example.com", "did:key:z6MkTest", 5*time.Minute)
+	store.Put(inv.Nonce, inv)
+
+	verifier := &mockVerifier{err: nil}
+	got, code, _ := ValidateInvitationNonce(context.Background(), store, inv.Nonce, verifier)
+	if code != 0 {
+		t.Fatalf("expected success with verifier, got %d", code)
+	}
+	if got.Nonce != inv.Nonce {
+		t.Fatal("wrong invitation returned")
+	}
+
+	// Put a fresh invitation and reject verification.
+	inv2, _ := NewInvitation("x509:san:dns:wallet.example.com", "did:key:z6MkTest", 5*time.Minute)
+	store.Put(inv2.Nonce, inv2)
+	reject := &mockVerifier{err: errors.New("bad sig")}
+	_, code, msg := ValidateInvitationNonce(context.Background(), store, inv2.Nonce, reject)
+	if code != ErrNotAuthorized {
+		t.Fatalf("expected ErrNotAuthorized, got %d", code)
+	}
+	if msg != "invitation signature verification failed" {
+		t.Fatalf("expected verification failure message, got %q", msg)
+	}
+}
+
+func TestInvitation_IsExpired(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(time.Hour)
+
+	if !(&Invitation{ExpiresAt: past}).IsExpired() {
+		t.Fatal("past expiration should be expired")
+	}
+	if (&Invitation{ExpiresAt: future}).IsExpired() {
+		t.Fatal("future expiration should not be expired")
+	}
+	if (&Invitation{}).IsExpired() {
+		t.Fatal("zero expiration should not be expired")
+	}
+}
+
+type mockVerifier struct {
+	err error
+}
+
+func (m *mockVerifier) VerifyInvitation(_ context.Context, _ *Invitation) error {
+	return m.err
 }
 
 func TestInvitationNonceInSessionCreate(t *testing.T) {

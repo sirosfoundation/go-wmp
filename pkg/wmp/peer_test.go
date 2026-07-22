@@ -3,6 +3,8 @@ package wmp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 )
@@ -311,4 +313,131 @@ func TestPeer_CredentialNotification_NotImplemented(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestPeer_Options(t *testing.T) {
+	logger := slog.Default()
+	validator := &testValidator{valid: true}
+	authorizer := &testAuthorizer{allowed: true}
+
+	p := NewPeer(nil, &BaseHandler{},
+		WithLogger(logger),
+		WithMaxMessageSize(2048),
+		WithValidator(validator),
+		WithAuthorizer(authorizer),
+	)
+
+	if p.logger != logger {
+		t.Fatal("WithLogger not applied")
+	}
+	if p.maxMessageSize != 2048 {
+		t.Fatalf("maxMessageSize = %d, want 2048", p.maxMessageSize)
+	}
+	if p.validator != validator {
+		t.Fatal("WithValidator not applied")
+	}
+	if p.authorizer != authorizer {
+		t.Fatal("WithAuthorizer not applied")
+	}
+}
+
+func TestPeer_UseMiddleware(t *testing.T) {
+	p := NewPeer(nil, &BaseHandler{})
+	p.UseMiddleware(func(ctx context.Context, method string, params json.RawMessage, next MiddlewareFunc) (interface{}, error) {
+		return next(ctx, method, params)
+	})
+	if len(p.registry.middleware) != 1 {
+		t.Fatalf("expected 1 middleware, got %d", len(p.registry.middleware))
+	}
+}
+
+func TestPeer_SetSessionStore(t *testing.T) {
+	p := NewPeer(nil, &BaseHandler{})
+	store := NewMemorySessionStore()
+	p.SetSessionStore(store)
+	if p.sessions != store {
+		t.Fatal("SetSessionStore not applied")
+	}
+	if p.Session("missing") != nil {
+		t.Fatal("Session should return nil without store or missing session")
+	}
+}
+
+func TestPeer_Close(t *testing.T) {
+	trans := &chanTransport{out: make(chan []byte, 1)}
+	p := NewPeer(trans, &BaseHandler{})
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !p.closed.Load() {
+		t.Fatal("peer should be closed")
+	}
+	// Second close should be a no-op.
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPeer_HandleRequestSync_Authorizer(t *testing.T) {
+	p := NewPeer(nil, &echoHandler{}, WithAuthorizer(&testAuthorizer{allowed: false}))
+	req, _ := NewRequest("1", MethodSessionCreate, SessionCreateParams{
+		WMP:      Metadata{Version: Version},
+		Security: SecurityMode{Mode: "tls"},
+	})
+	data, _ := json.Marshal(req)
+
+	resp, err := p.HandleRequestSync(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg Message
+	if err := json.Unmarshal(resp, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Error == nil || msg.Error.Code != ErrNotAuthorized {
+		t.Fatalf("expected not authorized, got %v", msg.Error)
+	}
+}
+
+func TestPeer_sendJSON(t *testing.T) {
+	trans := &chanTransport{out: make(chan []byte, 1)}
+	p := NewPeer(trans, &BaseHandler{})
+	if err := p.sendJSON(context.Background(), map[string]string{"jsonrpc": "2.0"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-trans.out:
+	default:
+		t.Fatal("message not sent")
+	}
+}
+
+func TestToRPCError(t *testing.T) {
+	if e := toRPCError(NewRPCError(ErrSessionNotFound, nil)); e.Code != ErrSessionNotFound {
+		t.Fatalf("code = %d", e.Code)
+	}
+	if e := toRPCError(fmt.Errorf("plain error")); e.Code != ErrInternalError {
+		t.Fatalf("expected internal error for plain error, got %d", e.Code)
+	}
+}
+
+type testValidator struct {
+	valid bool
+}
+
+func (v *testValidator) ValidateMethod(method string, data []byte) error {
+	_ = method
+	_ = data
+	if !v.valid {
+		return fmt.Errorf("rejected")
+	}
+	return nil
+}
+
+type testAuthorizer struct {
+	allowed bool
+}
+
+func (a *testAuthorizer) Authorize(_ context.Context, _ string, _ json.RawMessage) bool {
+	return a.allowed
 }
