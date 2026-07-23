@@ -1,23 +1,32 @@
-// Command wmp-cli is a minimal WMP messaging client for debugging and interop testing.
+// Command wmp-cli is an interactive WMP messaging client for debugging and
+// interop testing.
 //
 // Usage:
 //
-//	wmp-cli [--transport=ws|httpsse] connect <url>          Connect to a WMP endpoint
-//	wmp-cli [--transport=ws|httpsse] invite  <invitation>   Accept an invitation URI
+//	wmp-cli [--transport=ws|httpsse]
 //
-// Transport is auto-detected from the URL scheme (ws:// → ws, https:// → httpsse)
+// If stdin is a pipe or file, the CLI executes the supplied commands as
+// startup commands and then exits. If stdin is a terminal, the interactive
+// prompt is shown immediately after any startup commands.
+//
+// Transport is auto-detected from URL schemes (ws:// → ws, https:// → httpsse)
 // or can be forced with --transport or the WMP_TRANSPORT env var.
 //
-// Once connected, the CLI creates a session and enters an interactive loop
-// where incoming messages are printed and the user can send messages by typing.
+// Interactive / startup commands:
 //
-// Commands in interactive mode:
-//
-//	/send <text>      Send a text message to the session
-//	/deliver <json>   Send a raw wmp.message.deliver notification
-//	/status           Print session status
-//	/close            Close session and exit
-//	/quit             Exit without closing
+//	/connect <url>            Open a transport to a WMP endpoint
+//	/invite <invitation-uri>  Accept an invitation and connect to its relay
+//	/join <url>                Connect and create a session
+//	/create                    Create a session on the current transport
+//	/resume <token>            Resume/rejoin a session using a resumption token
+//	/rejoin <session-id> <token>  Alias for /resume with explicit session id
+//	/create-invite <provider> [relay]  Print a new invitation URI
+//	/send <text>               Send a text message to the session
+//	/deliver <json>            Send a raw wmp.message.deliver notification
+//	/status                    Print session/transport status
+//	/close                     Close the session
+//	/disconnect                Close the transport
+//	/quit                      Exit immediately
 //
 // Environment variables:
 //
@@ -44,26 +53,14 @@ import (
 )
 
 func main() {
-	// Parse flags
 	transportFlag := flag.String("transport", "", "Transport type: ws (default) or httpsse")
 	flag.Parse()
 
-	args := flag.Args()
-	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: wmp-cli [--transport=ws|httpsse] <connect|invite> <url|invitation-uri>\n")
-		os.Exit(1)
-	}
-
-	cmd := args[0]
-	target := args[1]
-
-	// Transport selection: flag > env > auto-detect
 	transportType := *transportFlag
 	if transportType == "" {
 		transportType = os.Getenv("WMP_TRANSPORT")
 	}
 
-	// Optional sender identity
 	sender := os.Getenv("WMP_SENDER")
 	if sender == "" {
 		sender = fmt.Sprintf("wmp-cli-%d", os.Getpid())
@@ -74,86 +71,219 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	var endpointURL string
-	var invitationNonce string
+	h := &cliHandler{sender: sender}
+	r := &repl{
+		ctx:           ctx,
+		cancel:        cancel,
+		logger:        logger,
+		handler:       h,
+		sender:        sender,
+		transportType: transportType,
+	}
+
+	// Read startup commands from stdin when stdin is not a terminal.
+	startup := readStartupCommands()
+	for _, line := range startup {
+		if r.ctx.Err() != nil {
+			break
+		}
+		if !r.execute(line) {
+			r.disconnect()
+			return
+		}
+	}
+
+	if isTerminal(os.Stdin) {
+		fmt.Fprint(os.Stderr, "\nInteractive mode. Type /help for commands.\n> ")
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if r.ctx.Err() != nil {
+				break
+			}
+			if !r.execute(line) {
+				break
+			}
+			if r.ctx.Err() == nil {
+				fmt.Fprint(os.Stderr, "> ")
+			}
+		}
+	}
+
+	r.disconnect()
+}
+
+func readStartupCommands() []string {
+	if isTerminal(os.Stdin) {
+		return nil
+	}
+	var lines []string
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "/repl" {
+			break
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+type repl struct {
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	logger              *slog.Logger
+	mu                  sync.Mutex
+	transport           wmp.Transport
+	peer                *wmp.Peer
+	handler             *cliHandler
+	sender              string
+	transportType       string
+	transportTypeActive string
+	endpoint            string
+	sessionID           string
+	resumptionToken     string
+	invitationNonce     string
+	serveCancel         context.CancelFunc
+	serveWg             sync.WaitGroup
+}
+
+func (r *repl) execute(line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return true
+	}
+
+	parts := strings.Fields(line)
+	cmd := parts[0]
+	args := parts[1:]
 
 	switch cmd {
-	case "connect":
-		endpointURL = target
-	case "create-invite":
-		// Generate an invitation URI for the given provider
-		provider := target
-		inv, err := wmp.NewInvitation(provider, sender, 5*time.Minute)
+	case "/help":
+		r.printHelp()
+	case "/connect":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: /connect <url>")
+			return true
+		}
+		r.connect(args[0])
+	case "/disconnect":
+		r.disconnect()
+	case "/invite":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: /invite <invitation-uri>")
+			return true
+		}
+		r.invite(args[0])
+	case "/join":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: /join <url>")
+			return true
+		}
+		if r.connect(args[0]) {
+			r.createSession()
+		}
+	case "/create":
+		r.createSession()
+	case "/resume":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: /resume <resumption-token>")
+			return true
+		}
+		r.resumeSession("", args[0])
+	case "/rejoin":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: /rejoin <resumption-token> or /rejoin <session-id> <resumption-token>")
+			return true
+		}
+		if len(args) == 1 {
+			r.resumeSession("", args[0])
+		} else {
+			r.resumeSession(args[0], args[1])
+		}
+	case "/create-invite":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: /create-invite <provider> [relay]")
+			return true
+		}
+		provider := args[0]
+		relay := ""
+		if len(args) > 1 {
+			relay = args[1]
+		}
+		inv, err := wmp.NewInvitation(provider, r.sender, 5*time.Minute)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating invitation: %v\n", err)
-			os.Exit(1)
+			return true
 		}
-		// Set relay from extra arg if provided
-		if len(args) > 2 {
-			inv.Relay = args[2]
+		if relay != "" {
+			inv.Relay = relay
 		}
 		uri, err := inv.URI()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating URI: %v\n", err)
-			os.Exit(1)
+			return true
 		}
 		fmt.Println(uri)
-		return
-	case "invite":
-		inv, err := wmp.ParseInvitationURI(target)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing invitation: %v\n", err)
-			os.Exit(1)
-		}
-		if inv.IsExpired() {
-			fmt.Fprintf(os.Stderr, "Warning: invitation has expired\n")
-		}
-		invitationNonce = inv.Nonce
-		fmt.Fprintf(os.Stderr, "Invitation from %s (provider: %s, purpose: %s)\n",
-			inv.Sender, inv.Provider, inv.Purpose)
-
-		if inv.Relay != "" {
-			endpointURL = inv.Relay
-		} else {
-			config, err := wmp.DiscoverConfigForIdentifier(ctx, inv.Provider, nil)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error discovering endpoint: %v\n", err)
-				os.Exit(1)
-			}
-			if transportType == "httpsse" {
-				endpointURL = config.Endpoints["https"]
-				if endpointURL == "" {
-					endpointURL = config.Endpoints["rpc"]
-				}
-			}
-			if endpointURL == "" {
-				endpointURL = config.Endpoints["websocket"]
-			}
-			if endpointURL == "" {
-				endpointURL = config.Endpoints["relay"]
-			}
-		}
-		if endpointURL == "" {
-			fmt.Fprintf(os.Stderr, "Error: no endpoint found\n")
-			os.Exit(1)
-		}
+	case "/send":
+		text := strings.TrimPrefix(line, cmd+" ")
+		r.send(text)
+	case "/deliver":
+		raw := strings.TrimPrefix(line, cmd+" ")
+		r.deliver(raw)
+	case "/status":
+		r.status()
+	case "/close":
+		r.closeSession()
+	case "/quit":
+		return false
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
-		os.Exit(1)
+		// Bare text = send a message if a session exists.
+		r.send(line)
 	}
+	return true
+}
 
-	// Auto-detect transport from URL scheme if not specified
+func (r *repl) printHelp() {
+	fmt.Fprintln(os.Stderr, "Commands:")
+	fmt.Fprintln(os.Stderr, "  /connect <url>            Open transport to a WMP endpoint")
+	fmt.Fprintln(os.Stderr, "  /invite <invitation-uri>  Accept invitation and connect")
+	fmt.Fprintln(os.Stderr, "  /join <url>               Connect and create a session")
+	fmt.Fprintln(os.Stderr, "  /create                   Create a session on current transport")
+	fmt.Fprintln(os.Stderr, "  /resume <token>           Resume/rejoin a session")
+	fmt.Fprintln(os.Stderr, "  /rejoin <sid> <token>     Resume/rejoin with explicit session id")
+	fmt.Fprintln(os.Stderr, "  /create-invite <p> [relay]  Print a new invitation URI")
+	fmt.Fprintln(os.Stderr, "  /send <text>              Send a text message")
+	fmt.Fprintln(os.Stderr, "  /deliver <json>           Send raw message.deliver params")
+	fmt.Fprintln(os.Stderr, "  /status                   Print session/transport status")
+	fmt.Fprintln(os.Stderr, "  /close                    Close the session")
+	fmt.Fprintln(os.Stderr, "  /disconnect               Close the transport")
+	fmt.Fprintln(os.Stderr, "  /quit                     Exit")
+	fmt.Fprintln(os.Stderr, "  <text>                    Send a text message (if in session)")
+}
+
+func (r *repl) connect(endpointURL string) bool {
+	r.disconnect()
+
+	transportType := r.transportType
 	if transportType == "" {
-		if strings.HasPrefix(endpointURL, "wss://") || strings.HasPrefix(endpointURL, "ws://") {
+		switch {
+		case strings.HasPrefix(endpointURL, "wss://"), strings.HasPrefix(endpointURL, "ws://"):
 			transportType = "ws"
-		} else if strings.HasPrefix(endpointURL, "https://") || strings.HasPrefix(endpointURL, "http://") {
+		case strings.HasPrefix(endpointURL, "https://"), strings.HasPrefix(endpointURL, "http://"):
 			transportType = "httpsse"
-		} else {
+		default:
 			transportType = "ws"
 		}
 	}
-
-	h := &cliHandler{sender: sender}
 
 	var transport wmp.Transport
 	var err error
@@ -168,12 +298,7 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "Connecting via WebSocket to %s ...\n", wsURL)
 		allowInsecure := strings.HasPrefix(wsURL, "ws://")
-		transport, _, err = ws.Dial(ctx, wsURL, nil, allowInsecure)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error connecting: %v\n", err)
-			os.Exit(1)
-		}
-
+		transport, _, err = ws.Dial(r.ctx, wsURL, nil, allowInsecure)
 	case "httpsse":
 		httpURL := endpointURL
 		if strings.HasPrefix(httpURL, "wss://") {
@@ -183,156 +308,246 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "Connecting via HTTP+SSE to %s ...\n", httpURL)
 		transport, err = httpsse.NewClientTransport(httpURL)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating HTTPS+SSE transport: %v\n", err)
-			os.Exit(1)
-		}
-
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown transport: %s (use 'ws' or 'httpsse')\n", transportType)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Unknown transport: %s\n", transportType)
+		return false
 	}
 
-	defer transport.Close()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error connecting: %v\n", err)
+		return false
+	}
 
-	peer := wmp.NewPeer(transport, h, wmp.WithLogger(logger))
+	peer := wmp.NewPeer(transport, r.handler, wmp.WithLogger(r.logger))
 
-	// Start serving incoming messages in background
-	var wg sync.WaitGroup
-	serveCtx, serveCancel := context.WithCancel(ctx)
-	defer serveCancel()
-
-	wg.Add(1)
+	serveCtx, serveCancel := context.WithCancel(r.ctx)
+	r.serveWg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer r.serveWg.Done()
 		if err := peer.Serve(serveCtx); err != nil {
 			if serveCtx.Err() == nil {
 				fmt.Fprintf(os.Stderr, "\nConnection closed: %v\n", err)
 			}
 		}
-		cancel() // stop the main loop too
 	}()
 
-	// Create session
+	r.mu.Lock()
+	r.transport = transport
+	r.peer = peer
+	r.endpoint = endpointURL
+	r.transportTypeActive = transportType
+	r.serveCancel = serveCancel
+	r.invitationNonce = ""
+	r.mu.Unlock()
+
+	fmt.Fprintf(os.Stderr, "Connected.\n")
+	return true
+}
+
+func (r *repl) disconnect() {
+	r.mu.Lock()
+	transport := r.transport
+	serveCancel := r.serveCancel
+	r.transport = nil
+	r.peer = nil
+	r.sessionID = ""
+	r.resumptionToken = ""
+	r.invitationNonce = ""
+	r.endpoint = ""
+	r.transportTypeActive = ""
+	r.serveCancel = nil
+	r.mu.Unlock()
+
+	if serveCancel != nil {
+		serveCancel()
+	}
+	if transport != nil {
+		_ = transport.Close()
+	}
+	r.serveWg.Wait()
+}
+
+func (r *repl) invite(uri string) {
+	inv, err := wmp.ParseInvitationURI(uri)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing invitation: %v\n", err)
+		return
+	}
+	if inv.IsExpired() {
+		fmt.Fprintf(os.Stderr, "Warning: invitation has expired\n")
+	}
+	fmt.Fprintf(os.Stderr, "Invitation from %s (provider: %s, purpose: %s)\n",
+		inv.Sender, inv.Provider, inv.Purpose)
+
+	var endpointURL string
+	if inv.Relay != "" {
+		endpointURL = inv.Relay
+	} else {
+		transportType := r.transportType
+		config, err := wmp.DiscoverConfigForIdentifier(r.ctx, inv.Provider, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error discovering endpoint: %v\n", err)
+			return
+		}
+		if transportType == "httpsse" {
+			endpointURL = config.Endpoints["https"]
+			if endpointURL == "" {
+				endpointURL = config.Endpoints["rpc"]
+			}
+		}
+		if endpointURL == "" {
+			endpointURL = config.Endpoints["websocket"]
+		}
+		if endpointURL == "" {
+			endpointURL = config.Endpoints["relay"]
+		}
+	}
+	if endpointURL == "" {
+		fmt.Fprintf(os.Stderr, "Error: no endpoint found\n")
+		return
+	}
+
+	r.mu.Lock()
+	r.invitationNonce = inv.Nonce
+	r.mu.Unlock()
+
+	if r.connect(endpointURL) {
+		r.createSession()
+	}
+}
+
+func (r *repl) createSession() {
+	peer := r.currentPeer()
+	if peer == nil {
+		fmt.Fprintf(os.Stderr, "Not connected. Use /connect or /invite first.\n")
+		return
+	}
+
 	fmt.Fprintf(os.Stderr, "Creating session...\n")
+	var nonce string
+	r.mu.Lock()
+	nonce = r.invitationNonce
+	r.mu.Unlock()
+
 	var result wmp.SessionCreateResult
-	err = peer.Call(ctx, wmp.MethodSessionCreate, &wmp.SessionCreateParams{
-		WMP:             wmp.Metadata{Version: wmp.Version, Sender: sender},
+	err := peer.Call(r.ctx, wmp.MethodSessionCreate, &wmp.SessionCreateParams{
+		WMP:             wmp.Metadata{Version: wmp.Version, Sender: r.sender},
 		Security:        wmp.SecurityMode{Mode: "tls"},
-		InvitationNonce: invitationNonce,
+		InvitationNonce: nonce,
 	}, &result)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating session: %v\n", err)
-		os.Exit(1)
+		return
 	}
 
-	sessionID := result.WMP.SessionID
-	h.sessionID = sessionID
-	fmt.Fprintf(os.Stderr, "Session created: %s\n", sessionID)
-	fmt.Fprintf(os.Stderr, "Transport: %s\n", transportType)
-	fmt.Fprintf(os.Stderr, "Type /help for commands, or just type a message to send.\n\n")
+	r.mu.Lock()
+	r.sessionID = result.WMP.SessionID
+	r.resumptionToken = result.ResumptionToken
+	r.handler.sessionID = result.WMP.SessionID
+	r.mu.Unlock()
 
-	// If HTTP+SSE, connect SSE stream now that we have a session ID
-	if transportType == "httpsse" {
-		if t, ok := transport.(*httpsse.Transport); ok {
-			if err := t.ConnectSSE(ctx, sessionID); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: SSE connection failed: %v\n", err)
-			} else {
-				fmt.Fprintf(os.Stderr, "SSE event stream connected.\n")
-			}
-		}
+	fmt.Fprintf(os.Stderr, "Session created: %s\n", result.WMP.SessionID)
+	if result.ResumptionToken != "" {
+		fmt.Fprintf(os.Stderr, "Resumption token: %s\n", result.ResumptionToken)
 	}
 
-	// Interactive loop
-	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Fprint(os.Stderr, "> ")
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if ctx.Err() != nil {
-			break
-		}
-
-		switch {
-		case line == "/help":
-			fmt.Fprintln(os.Stderr, "Commands:")
-			fmt.Fprintln(os.Stderr, "  /send <text>       Send a text message")
-			fmt.Fprintln(os.Stderr, "  /deliver <json>    Send raw message.deliver params")
-			fmt.Fprintln(os.Stderr, "  /status            Print session info")
-			fmt.Fprintln(os.Stderr, "  /close             Close session and exit")
-			fmt.Fprintln(os.Stderr, "  /quit              Exit immediately")
-			fmt.Fprintln(os.Stderr, "  <text>             Send a text message (shortcut)")
-
-		case line == "/status":
-			fmt.Fprintf(os.Stderr, "Session:   %s\n", sessionID)
-			fmt.Fprintf(os.Stderr, "Sender:    %s\n", sender)
-			fmt.Fprintf(os.Stderr, "Transport: %s\n", transportType)
-			fmt.Fprintf(os.Stderr, "Endpoint:  %s\n", endpointURL)
-
-		case line == "/close":
-			fmt.Fprintf(os.Stderr, "Closing session...\n")
-			_ = peer.Notify(ctx, wmp.MethodSessionClose, &wmp.SessionCloseParams{
-				WMP:    wmp.Metadata{Version: wmp.Version, SessionID: sessionID, Sender: sender},
-				Reason: wmp.ReasonComplete,
-			})
-			serveCancel()
-			wg.Wait()
-			return
-
-		case line == "/quit":
-			serveCancel()
-			wg.Wait()
-			return
-
-		case strings.HasPrefix(line, "/send "):
-			text := strings.TrimPrefix(line, "/send ")
-			sendMessage(ctx, peer, sessionID, sender, text)
-
-		case strings.HasPrefix(line, "/deliver "):
-			raw := strings.TrimPrefix(line, "/deliver ")
-			var params wmp.MessageDeliverParams
-			if err := json.Unmarshal([]byte(raw), &params); err != nil {
-				fmt.Fprintf(os.Stderr, "Invalid JSON: %v\n", err)
-			} else {
-				if params.WMP.SessionID == "" {
-					params.WMP.SessionID = sessionID
-				}
-				if params.WMP.Sender == "" {
-					params.WMP.Sender = sender
-				}
-				params.WMP.Version = wmp.Version
-				if err := peer.Notify(ctx, wmp.MethodMessageDeliver, &params); err != nil {
-					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				} else {
-					fmt.Fprintf(os.Stderr, "Sent raw deliver\n")
-				}
-			}
-
-		case line == "":
-			// ignore empty lines
-
-		default:
-			// Bare text = send as message
-			sendMessage(ctx, peer, sessionID, sender, line)
-		}
-
-		if ctx.Err() != nil {
-			break
-		}
-		fmt.Fprint(os.Stderr, "> ")
-	}
-
-	serveCancel()
-	wg.Wait()
+	r.connectSSE()
 }
 
-func sendMessage(ctx context.Context, peer *wmp.Peer, sessionID, sender, text string) {
+func (r *repl) resumeSession(sessionID, token string) {
+	peer := r.currentPeer()
+	if peer == nil {
+		fmt.Fprintf(os.Stderr, "Not connected. Use /connect first.\n")
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "Resuming session...\n")
+	var result wmp.SessionResumeResult
+	err := peer.Call(r.ctx, wmp.MethodSessionResume, &wmp.SessionResumeParams{
+		WMP:             wmp.Metadata{Version: wmp.Version, Sender: r.sender},
+		SessionID:       sessionID,
+		ResumptionToken: token,
+	}, &result)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resuming session: %v\n", err)
+		return
+	}
+
+	newSessionID := result.WMP.SessionID
+	if newSessionID == "" {
+		newSessionID = sessionID
+	}
+
+	r.mu.Lock()
+	r.sessionID = newSessionID
+	r.resumptionToken = result.ResumptionToken
+	r.handler.sessionID = newSessionID
+	r.mu.Unlock()
+
+	fmt.Fprintf(os.Stderr, "Session resumed: %s\n", newSessionID)
+	r.connectSSE()
+}
+
+func (r *repl) connectSSE() {
+	r.mu.Lock()
+	transport := r.transport
+	sessionID := r.sessionID
+	transportType := r.transportTypeActive
+	r.mu.Unlock()
+
+	if transportType != "httpsse" {
+		return
+	}
+	if t, ok := transport.(*httpsse.Transport); ok && sessionID != "" {
+		if err := t.ConnectSSE(r.ctx, sessionID); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: SSE connection failed: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "SSE event stream connected.\n")
+		}
+	}
+}
+
+func (r *repl) closeSession() {
+	peer, sessionID := r.currentPeerAndSession()
+	if peer == nil {
+		fmt.Fprintf(os.Stderr, "Not connected.\n")
+		return
+	}
+	if sessionID == "" {
+		fmt.Fprintf(os.Stderr, "No active session.\n")
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "Closing session...\n")
+	_ = peer.Notify(r.ctx, wmp.MethodSessionClose, &wmp.SessionCloseParams{
+		WMP:    wmp.Metadata{Version: wmp.Version, SessionID: sessionID, Sender: r.sender},
+		Reason: wmp.ReasonComplete,
+	})
+
+	r.mu.Lock()
+	r.sessionID = ""
+	r.resumptionToken = ""
+	r.handler.sessionID = ""
+	r.mu.Unlock()
+}
+
+func (r *repl) send(text string) {
+	peer, sessionID := r.currentPeerAndSession()
+	if peer == nil {
+		fmt.Fprintf(os.Stderr, "Not connected.\n")
+		return
+	}
+	if sessionID == "" {
+		fmt.Fprintf(os.Stderr, "No active session. Use /create or /resume.\n")
+		return
+	}
+
 	now := time.Now()
-	err := peer.Notify(ctx, wmp.MethodMessageDeliver, &wmp.MessageDeliverParams{
+	err := peer.Notify(r.ctx, wmp.MethodMessageDeliver, &wmp.MessageDeliverParams{
 		WMP: wmp.Metadata{
 			Version:   wmp.Version,
 			SessionID: sessionID,
-			Sender:    sender,
+			Sender:    r.sender,
 			Timestamp: &now,
 		},
 		ContentType: "text/plain",
@@ -343,6 +558,69 @@ func sendMessage(ctx context.Context, peer *wmp.Peer, sessionID, sender, text st
 	} else {
 		fmt.Fprintf(os.Stderr, "Sent: %s\n", text)
 	}
+}
+
+func (r *repl) deliver(raw string) {
+	peer, sessionID := r.currentPeerAndSession()
+	if peer == nil {
+		fmt.Fprintf(os.Stderr, "Not connected.\n")
+		return
+	}
+	if sessionID == "" {
+		fmt.Fprintf(os.Stderr, "No active session.\n")
+		return
+	}
+
+	var params wmp.MessageDeliverParams
+	if err := json.Unmarshal([]byte(raw), &params); err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid JSON: %v\n", err)
+		return
+	}
+	if params.WMP.SessionID == "" {
+		params.WMP.SessionID = sessionID
+	}
+	if params.WMP.Sender == "" {
+		params.WMP.Sender = r.sender
+	}
+	params.WMP.Version = wmp.Version
+	if err := peer.Notify(r.ctx, wmp.MethodMessageDeliver, &params); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "Sent raw deliver\n")
+	}
+}
+
+func (r *repl) status() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.peer == nil {
+		fmt.Fprintf(os.Stderr, "Not connected.\n")
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Connected:  yes\n")
+	fmt.Fprintf(os.Stderr, "Endpoint:   %s\n", r.endpoint)
+	fmt.Fprintf(os.Stderr, "Transport:  %s\n", r.transportTypeActive)
+	fmt.Fprintf(os.Stderr, "Sender:     %s\n", r.sender)
+	if r.sessionID == "" {
+		fmt.Fprintf(os.Stderr, "Session:    none\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "Session:    %s\n", r.sessionID)
+	}
+	if r.resumptionToken != "" {
+		fmt.Fprintf(os.Stderr, "Resume:     %s\n", r.resumptionToken)
+	}
+}
+
+func (r *repl) currentPeer() *wmp.Peer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.peer
+}
+
+func (r *repl) currentPeerAndSession() (*wmp.Peer, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.peer, r.sessionID
 }
 
 // cliHandler logs all incoming WMP messages to stdout as JSON.
