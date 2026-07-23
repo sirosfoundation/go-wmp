@@ -59,7 +59,7 @@ func TestClientOptions(t *testing.T) {
 }
 
 func TestEventBufferAndReplay(t *testing.T) {
-	sess := newServerSession(5)
+	sess := newServerSession(nil, nil, 5)
 
 	// Buffer some events.
 	id1 := sess.bufferEvent([]byte(`{"msg":1}`))
@@ -93,7 +93,7 @@ func TestEventBufferAndReplay(t *testing.T) {
 }
 
 func TestEventBufferEviction(t *testing.T) {
-	sess := newServerSession(3)
+	sess := newServerSession(nil, nil, 3)
 
 	sess.bufferEvent([]byte(`1`))
 	sess.bufferEvent([]byte(`2`))
@@ -114,7 +114,7 @@ func TestEventBufferEviction(t *testing.T) {
 }
 
 func TestSSEStreamIncludesEventIDs(t *testing.T) {
-	handler := NewServerHandler()
+	handler := NewServerHandler(nil)
 	ts := httptest.NewServer(handler)
 	defer ts.Close()
 
@@ -176,10 +176,10 @@ func TestSSEStreamIncludesEventIDs(t *testing.T) {
 }
 
 func TestSSELastEventIDReplay(t *testing.T) {
-	handler := NewServerHandler()
+	handler := NewServerHandler(nil)
 
 	// Pre-populate some buffered events.
-	sess := newServerSession(200)
+	sess := newServerSession(nil, nil, 200)
 	sess.bufferEvent([]byte(`{"n":1}`))
 	sess.bufferEvent([]byte(`{"n":2}`))
 	sess.bufferEvent([]byte(`{"n":3}`))
@@ -235,7 +235,7 @@ func TestClientTransportSSE(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	server := NewServerHandler()
+	server := NewServerHandler(nil)
 	serverTransport := server.Transport("session-1")
 
 	ts := httptest.NewTLSServer(server)
