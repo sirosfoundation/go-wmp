@@ -220,6 +220,44 @@ func TestCapabilityUpdateParams(t *testing.T) {
 	}
 }
 
+func TestValidateCredentialNotification(t *testing.T) {
+	valid := &CredentialNotificationParams{
+		FlowID:         "f1",
+		NotificationID: "n1",
+		Event:          CredentialEventAccepted,
+	}
+	if err := ValidateCredentialNotification(valid); err != nil {
+		t.Errorf("valid notification failed: %v", err)
+	}
+
+	missingFlow := &CredentialNotificationParams{NotificationID: "n1", Event: CredentialEventAccepted}
+	if err := ValidateCredentialNotification(missingFlow); err == nil {
+		t.Error("expected error for missing flow_id")
+	}
+
+	missingID := &CredentialNotificationParams{FlowID: "f1", Event: CredentialEventAccepted}
+	if err := ValidateCredentialNotification(missingID); err == nil {
+		t.Error("expected error for missing notification_id")
+	}
+
+	invalidEvent := &CredentialNotificationParams{FlowID: "f1", NotificationID: "n1", Event: "unknown"}
+	if err := ValidateCredentialNotification(invalidEvent); err == nil {
+		t.Error("expected error for invalid event")
+	}
+}
+
+func TestIsValidCredentialEvent(t *testing.T) {
+	if !IsValidCredentialEvent(CredentialEventAccepted) {
+		t.Error("credential_accepted should be valid")
+	}
+	if !IsValidCredentialEvent(CredentialEventFailure) {
+		t.Error("credential_failure should be valid")
+	}
+	if IsValidCredentialEvent("bogus") {
+		t.Error("bogus event should be invalid")
+	}
+}
+
 func mustMarshal(v interface{}) json.RawMessage {
 	data, err := json.Marshal(v)
 	if err != nil {

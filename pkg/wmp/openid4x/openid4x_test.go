@@ -205,3 +205,125 @@ func TestCredentialResultOmitsEmptyNotificationID(t *testing.T) {
 		t.Error("expected notification_id key to be absent")
 	}
 }
+
+func TestProfileInterface(t *testing.T) {
+	p := New(Config{
+		OID4VCI: &OID4VCICapability{},
+		OID4VP:  &OID4VPCapability{},
+	})
+	if got := p.Name(); got != "openid4x" {
+		t.Errorf("Name() = %q, want openid4x", got)
+	}
+	caps := p.Capabilities()
+	if len(caps) != 2 {
+		t.Errorf("Capabilities() = %v, want 2 entries", caps)
+	}
+	types := p.FlowTypes()
+	if len(types) != 2 {
+		t.Errorf("FlowTypes() = %v, want 2 entries", types)
+	}
+	resTypes := p.ResolveTypes()
+	if len(resTypes) != 2 {
+		t.Errorf("ResolveTypes() = %v, want 2 entries", resTypes)
+	}
+
+	if err := p.Init(nil); err != nil {
+		t.Errorf("Init error: %v", err)
+	}
+
+	_, err := p.HandleResolve(context.Background(), &wmp.ResolveParams{})
+	if err == nil {
+		t.Error("expected HandleResolve error")
+	}
+
+	p.HandleProgress(context.Background(), &wmp.FlowProgressParams{})
+	p.HandleError(context.Background(), &wmp.FlowErrorParams{FlowID: "f1"})
+	p.HandleComplete(context.Background(), &wmp.FlowCompleteParams{FlowID: "f1"})
+}
+
+func TestStartFlowUnsupported(t *testing.T) {
+	p := New(Config{})
+	_, err := p.StartFlow(context.Background(), &wmp.FlowStartParams{
+		FlowType: "unknown",
+		FlowID:   "f1",
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported flow type")
+	}
+}
+
+func TestHandleActionDispatches(t *testing.T) {
+	p := New(Config{
+		OID4VCI: &OID4VCICapability{},
+		OnVCIAction: func(ctx context.Context, peer wmp.PeerContext, params *wmp.FlowActionParams) (*wmp.FlowActionResult, error) {
+			return &wmp.FlowActionResult{FlowID: params.FlowID, Action: params.Action, Status: "custom"}, nil
+		},
+	})
+
+	// Seed flow type.
+	_, _ = p.StartFlow(context.Background(), &wmp.FlowStartParams{
+		FlowType: FlowTypeOID4VCI,
+		FlowID:   "f1",
+		Params:   json.RawMessage(`{"credential_offer":"offer"}`),
+	})
+
+	result, err := p.HandleAction(context.Background(), &wmp.FlowActionParams{
+		FlowID: "f1",
+		Action: ActionAcceptOffer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "custom" {
+		t.Errorf("status = %q, want custom", result.Status)
+	}
+
+	// Default path when no handler configured.
+	p2 := New(Config{OID4VP: &OID4VPCapability{}})
+	_, _ = p2.StartFlow(context.Background(), &wmp.FlowStartParams{
+		FlowType: FlowTypeOID4VP,
+		FlowID:   "f2",
+		Params:   json.RawMessage(`{"request_uri":"https://example.com/req"}`),
+	})
+	result, err = p2.HandleAction(context.Background(), &wmp.FlowActionParams{
+		FlowID: "f2",
+		Action: ActionSelectCredentials,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "accepted" {
+		t.Errorf("status = %q, want accepted", result.Status)
+	}
+}
+
+func TestStartFlowWithHandlers(t *testing.T) {
+	p := New(Config{
+		OID4VCI: &OID4VCICapability{},
+		OnVCIStart: func(ctx context.Context, peer wmp.PeerContext, params *wmp.FlowStartParams) (*wmp.FlowStartResult, error) {
+			return &wmp.FlowStartResult{FlowID: params.FlowID, FlowType: params.FlowType, WMP: params.WMP}, nil
+		},
+		OID4VP: &OID4VPCapability{},
+		OnVPStart: func(ctx context.Context, peer wmp.PeerContext, params *wmp.FlowStartParams) (*wmp.FlowStartResult, error) {
+			return &wmp.FlowStartResult{FlowID: params.FlowID, FlowType: params.FlowType, WMP: params.WMP}, nil
+		},
+	})
+
+	_, err := p.StartFlow(context.Background(), &wmp.FlowStartParams{
+		FlowType: FlowTypeOID4VCI,
+		FlowID:   "f1",
+		Params:   json.RawMessage(`{"credential_offer":"offer"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = p.StartFlow(context.Background(), &wmp.FlowStartParams{
+		FlowType: FlowTypeOID4VP,
+		FlowID:   "f2",
+		Params:   json.RawMessage(`{"request_uri":"https://example.com/req"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
+	"time"
 )
 
 // chanTransport is a simple in-memory transport for testing.
@@ -419,6 +420,208 @@ func TestToRPCError(t *testing.T) {
 	if e := toRPCError(fmt.Errorf("plain error")); e.Code != ErrInternalError {
 		t.Fatalf("expected internal error for plain error, got %d", e.Code)
 	}
+}
+
+func TestPeer_ValidatorRejects(t *testing.T) {
+	clientT, serverT := newChanTransportPair()
+	server := NewPeer(serverT, &echoHandler{}, WithValidator(&testValidator{valid: false}))
+	client := NewPeer(clientT, &BaseHandler{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go server.Serve(ctx)
+	go client.Serve(ctx)
+
+	var result SessionCreateResult
+	err := client.Call(ctx, MethodSessionCreate, SessionCreateParams{WMP: Metadata{Version: Version}, Security: SecurityMode{Mode: "tls"}}, &result)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if rpcErr, ok := err.(*RPCError); !ok || rpcErr.Code != ErrInvalidParams {
+		t.Fatalf("expected invalid params, got %v", err)
+	}
+}
+
+func TestPeer_SessionContextEnrichment(t *testing.T) {
+	clientT, serverT := newChanTransportPair()
+	store := NewMemorySessionStore()
+	_ = store.Create(&Session{ID: "ses-ctx"})
+
+	captured := make(chan struct{})
+	var sender string
+	var sessionID string
+	handler := &contextCaptureHandler{
+		done:      captured,
+		sender:    &sender,
+		sessionID: &sessionID,
+	}
+
+	server := NewPeer(serverT, handler)
+	server.SetSessionStore(store)
+	client := NewPeer(clientT, &BaseHandler{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go server.Serve(ctx)
+	go client.Serve(ctx)
+
+	err := client.Notify(ctx, MethodMessageDeliver, MessageDeliverParams{
+		WMP: Metadata{Version: Version, SessionID: "ses-ctx", Sender: "x509:san:dns:alice.example.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-captured:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for handler")
+	}
+
+	if sender != "x509:san:dns:alice.example.com" {
+		t.Fatalf("sender context = %q", sender)
+	}
+	if sessionID != "ses-ctx" {
+		t.Fatalf("session context = %q", sessionID)
+	}
+}
+
+func TestPeer_CallContextCancellation(t *testing.T) {
+	clientT, serverT := newChanTransportPair()
+	server := NewPeer(serverT, &echoHandler{})
+	client := NewPeer(clientT, &BaseHandler{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go server.Serve(ctx)
+	go client.Serve(ctx)
+
+	cctx, ccancel := context.WithCancel(context.Background())
+	ccancel()
+	var result SessionCreateResult
+	err := client.Call(cctx, MethodSessionCreate, SessionCreateParams{WMP: Metadata{Version: Version}, Security: SecurityMode{Mode: "tls"}}, &result)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestPeer_ServeBatch(t *testing.T) {
+	clientT, serverT := newChanTransportPair()
+	server := NewPeer(serverT, &echoHandler{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go server.Serve(ctx)
+
+	// Give the server goroutine a moment to start reading.
+	time.Sleep(10 * time.Millisecond)
+
+	// Send two session.create requests as a batch.
+	req1, _ := NewRequest("1", MethodSessionCreate, SessionCreateParams{WMP: Metadata{Version: Version}, Security: SecurityMode{Mode: "tls"}})
+	req2, _ := NewRequest("2", MethodSessionCreate, SessionCreateParams{WMP: Metadata{Version: Version}, Security: SecurityMode{Mode: "tls"}})
+	batch := []*Request{req1, req2}
+	data, _ := json.Marshal(batch)
+
+	if err := clientT.WriteMessage(ctx, data); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for two responses.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-clientT.in:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for batch response")
+		}
+	}
+}
+
+func TestPeer_HandleRequestSync_Validator(t *testing.T) {
+	p := NewPeer(nil, &echoHandler{}, WithValidator(&testValidator{valid: false}))
+	req, _ := NewRequest("1", MethodSessionCreate, SessionCreateParams{WMP: Metadata{Version: Version}, Security: SecurityMode{Mode: "tls"}})
+	data, _ := json.Marshal(req)
+
+	resp, err := p.HandleRequestSync(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg Message
+	if err := json.Unmarshal(resp, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Error == nil || msg.Error.Code != ErrInvalidParams {
+		t.Fatalf("expected invalid params, got %v", msg.Error)
+	}
+}
+
+func TestPeer_HandleRequestSync_Oversized(t *testing.T) {
+	p := NewPeer(nil, &echoHandler{}, WithMaxMessageSize(10))
+	resp, err := p.HandleRequestSync(context.Background(), []byte(`{"jsonrpc":"2.0","id":"1","method":"wmp.session.create"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg Message
+	if err := json.Unmarshal(resp, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Error == nil || msg.Error.Code != ErrInvalidRequest {
+		t.Fatalf("expected invalid request, got %v", msg.Error)
+	}
+}
+
+func TestPeer_VersionNotSupported(t *testing.T) {
+	p := NewPeer(nil, &echoHandler{})
+	req, _ := NewRequest("1", MethodSessionCreate, SessionCreateParams{WMP: Metadata{Version: "99.99"}, Security: SecurityMode{Mode: "tls"}})
+	data, _ := json.Marshal(req)
+	resp, err := p.HandleRequestSync(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg Message
+	if err := json.Unmarshal(resp, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Error == nil || msg.Error.Code != ErrVersionNotSupported {
+		t.Fatalf("expected version not supported, got %v", msg.Error)
+	}
+}
+
+func TestPeer_UseInitProfile(t *testing.T) {
+	p := NewPeer(nil, &BaseHandler{})
+	profile := &initTestProfile{}
+	if err := p.Use(profile); err != nil {
+		t.Fatal(err)
+	}
+	if !profile.initialized {
+		t.Fatal("profile not initialized")
+	}
+}
+
+type contextCaptureHandler struct {
+	BaseHandler
+	done      chan struct{}
+	sender    *string
+	sessionID *string
+}
+
+func (h *contextCaptureHandler) MessageDeliver(ctx context.Context, params *MessageDeliverParams) {
+	*h.sender = SenderFromContext(ctx)
+	if sess := SessionFromContext(ctx); sess != nil {
+		*h.sessionID = sess.ID
+	}
+	close(h.done)
+}
+
+type initTestProfile struct {
+	BaseHandler
+	initialized bool
+}
+
+func (p *initTestProfile) Name() string           { return "test" }
+func (p *initTestProfile) Capabilities() []string { return nil }
+func (p *initTestProfile) Init(ctx PeerContext) error {
+	p.initialized = true
+	return nil
 }
 
 type testValidator struct {

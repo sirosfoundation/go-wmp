@@ -141,6 +141,50 @@ func TestNewNotification(t *testing.T) {
 	}
 }
 
+func TestDecodeMessageOptions(t *testing.T) {
+	base := []byte(`{"jsonrpc":"2.0","id":"1","method":"wmp.session.create","params":{"wmp":{"version":"0.1"}}}`)
+
+	// MaxSize enforcement.
+	_, err := DecodeMessage(base, &DecodeOptions{MaxSize: 10})
+	if err == nil {
+		t.Error("expected error for message exceeding max size")
+	}
+
+	// MaxDepth enforcement.
+	deep := []byte(`{"jsonrpc":"2.0","id":"1","method":"wmp.session.create","params":{"a":{"b":{"c":{"d":1}}}}}`)
+	_, err = DecodeMessage(deep, &DecodeOptions{MaxDepth: 3})
+	if err == nil {
+		t.Error("expected error for message exceeding max depth")
+	}
+
+	// Trailing data rejection.
+	trailing := []byte(`{"jsonrpc":"2.0","id":"1","method":"wmp.session.create","params":{}} extra`)
+	_, err = DecodeMessage(trailing)
+	if err == nil {
+		t.Error("expected error for trailing data")
+	}
+}
+
+func TestDecodeBatchOptions(t *testing.T) {
+	data := []byte(`[{"jsonrpc":"2.0","id":"1","method":"wmp.message.ack","params":{}}]`)
+	_, err := DecodeBatch(data, &DecodeOptions{MaxSize: 10})
+	if err == nil {
+		t.Error("expected error for batch exceeding max size")
+	}
+
+	deep := []byte(`[{"jsonrpc":"2.0","id":"1","method":"wmp.session.create","params":{"a":{"b":{"c":{"d":1}}}}}]`)
+	_, err = DecodeBatch(deep, &DecodeOptions{MaxDepth: 3})
+	if err == nil {
+		t.Error("expected error for batch exceeding max depth")
+	}
+
+	trailing := []byte(`[{}] extra`)
+	_, err = DecodeBatch(trailing)
+	if err == nil {
+		t.Error("expected error for trailing data in batch")
+	}
+}
+
 func TestRPCError(t *testing.T) {
 	e := NewRPCError(ErrSessionNotFound, map[string]string{"session_id": "ses-abc"})
 	if e.Code != ErrSessionNotFound {
