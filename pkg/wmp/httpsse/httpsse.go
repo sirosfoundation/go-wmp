@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 )
 
 // Transport implements wmp.Transport over HTTPS POST (client→server)
@@ -230,12 +232,14 @@ func (t *Transport) Close() error {
 // ServerHandler returns an http.Handler that bridges HTTP requests to a
 // wmp.Transport. Use this on the server side to accept HTTPS WMP connections.
 //
-// For each POST, the handler reads the JSON-RPC request, pushes it to the
-// incoming channel, and writes the response. SSE is handled via GET with
-// event ID tracking and Last-Event-ID replay.
+// For each POST, the handler reads the JSON-RPC request, dispatches it
+// synchronously via a wmp.Peer, and writes the JSON-RPC response body.
+// SSE is handled via GET with event ID tracking and Last-Event-ID replay.
 type ServerHandler struct {
 	mu       sync.RWMutex
 	sessions map[string]*serverSession
+	handler  wmp.Handler
+	peerOptions []wmp.PeerOption
 }
 
 type serverEvent struct {
@@ -244,8 +248,8 @@ type serverEvent struct {
 }
 
 type serverSession struct {
-	incoming chan []byte // client → server
 	outgoing chan []byte // server → client (SSE)
+	peer     *wmp.Peer
 
 	// Event buffer for Last-Event-ID replay.
 	bufMu     sync.Mutex
@@ -254,16 +258,38 @@ type serverSession struct {
 	maxEvents int
 }
 
-func newServerSession(maxEvents int) *serverSession {
+func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int) *serverSession {
 	if maxEvents <= 0 {
 		maxEvents = 200
 	}
 	return &serverSession{
-		incoming:  make(chan []byte, 64),
 		outgoing:  make(chan []byte, 64),
 		maxEvents: maxEvents,
+		peer:      wmp.NewPeer(&serverTransport{outgoing: make(chan []byte)}, handler, opts...),
 	}
 }
+
+// serverTransport is a no-op transport used only so the per-session Peer can
+// send outbound notifications/messages via WriteMessage.
+type serverTransport struct {
+	outgoing chan []byte
+}
+
+func (t *serverTransport) ReadMessage(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (t *serverTransport) WriteMessage(ctx context.Context, data []byte) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case t.outgoing <- data:
+		return nil
+	}
+}
+
+func (t *serverTransport) Close() error { return nil }
 
 // bufferEvent stores an event with a monotonic ID for replay.
 func (s *serverSession) bufferEvent(data []byte) string {
@@ -297,26 +323,34 @@ func (s *serverSession) replayAfter(lastEventID string) []serverEvent {
 }
 
 // NewServerHandler creates a server-side HTTPS handler.
-func NewServerHandler() *ServerHandler {
+func NewServerHandler(handler wmp.Handler, opts ...wmp.PeerOption) *ServerHandler {
 	return &ServerHandler{
-		sessions: make(map[string]*serverSession),
+		sessions:    make(map[string]*serverSession),
+		handler:     handler,
+		peerOptions: opts,
 	}
 }
 
 // ServerOption configures the server handler.
 type ServerOption func(*ServerHandler)
 
-// Transport returns a wmp.Transport for the given session ID.
-// Call this after session creation to get a transport for the Peer.
-func (h *ServerHandler) Transport(sessionID string) *ServerTransport {
+// session returns or creates the serverSession for the given session ID.
+func (h *ServerHandler) session(sessionID string) *serverSession {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	sess, ok := h.sessions[sessionID]
 	if !ok {
-		sess = newServerSession(200)
+		sess = newServerSession(h.handler, h.peerOptions, 200)
 		h.sessions[sessionID] = sess
 	}
-	return &ServerTransport{sess: sess}
+	return sess
+}
+
+// Transport returns a wmp.Transport for the given session ID.
+// It is retained for backwards compatibility; ServerHandler now uses a
+// per-session Peer internally.
+func (h *ServerHandler) Transport(sessionID string) wmp.Transport {
+	return &ServerTransport{sess: h.session(sessionID)}
 }
 
 // ServeHTTP handles both POST (JSON-RPC) and GET (SSE) requests.
@@ -357,29 +391,22 @@ func (h *ServerHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 		sessionID = envelope.Params.WMP.SessionID
 	}
 
-	h.mu.RLock()
-	sess, ok := h.sessions[sessionID]
-	h.mu.RUnlock()
+	sess := h.session(sessionID)
 
-	if !ok {
-		// For session creation, create a placeholder.
-		sess = newServerSession(200)
-		h.mu.Lock()
-		h.sessions[sessionID] = sess
-		h.mu.Unlock()
+	// Dispatch synchronously. The HTTP+SSE transport maps one POST to one
+	// JSON-RPC response, so we use HandleRequestSync rather than a Serve loop.
+	respBytes, err := sess.peer.HandleRequestSync(r.Context(), body)
+	if err != nil {
+		http.Error(w, "dispatch error", http.StatusInternalServerError)
+		return
 	}
 
-	// Push to incoming so the Peer can read it.
-	sess.incoming <- body
-
-	// Wait for a response from the Peer.
-	select {
-	case resp := <-sess.outgoing:
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(resp)
-	case <-r.Context().Done():
-		http.Error(w, "timeout", http.StatusGatewayTimeout)
+	w.Header().Set("Content-Type", "application/json")
+	if len(respBytes) == 0 {
+		w.WriteHeader(http.StatusAccepted)
+		return
 	}
+	w.Write(respBytes)
 }
 
 func (h *ServerHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -389,13 +416,7 @@ func (h *ServerHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.mu.RLock()
-	sess, ok := h.sessions[sessionID]
-	h.mu.RUnlock()
-	if !ok {
-		http.Error(w, "session not found", http.StatusNotFound)
-		return
-	}
+	sess := h.session(sessionID)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -458,7 +479,7 @@ func (t *ServerTransport) ReadMessage(ctx context.Context) ([]byte, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case data, ok := <-t.sess.incoming:
+	case data, ok := <-t.sess.outgoing:
 		if !ok {
 			return nil, io.EOF
 		}
