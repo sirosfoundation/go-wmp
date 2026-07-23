@@ -43,9 +43,9 @@ var methodSchemaMap = map[string]string{
 
 // responseSchemaMap maps WMP method names to their response schema file paths.
 var responseSchemaMap = map[string]string{
-	"wmp.session.create":    "methods/session-create-response.json",
-	"wmp.resolve":           "methods/resolve-response.json",
-	"wmp.capability.list":   "methods/capability-list-response.json",
+	"wmp.session.create":  "methods/session-create-response.json",
+	"wmp.resolve":         "methods/resolve-response.json",
+	"wmp.capability.list": "methods/capability-list-response.json",
 }
 
 // Validator validates WMP messages against embedded JSON Schemas.
@@ -53,10 +53,20 @@ type Validator struct {
 	compiler *jsonschema.Compiler
 	mu       sync.RWMutex
 	compiled map[string]*jsonschema.Schema
+	strict   bool
+}
+
+// ValidatorOption configures a Validator.
+type ValidatorOption func(*Validator)
+
+// WithStrict enables strict mode: unknown methods/responses are reported as
+// validation errors instead of being silently accepted.
+func WithStrict(strict bool) ValidatorOption {
+	return func(v *Validator) { v.strict = strict }
 }
 
 // NewValidator creates a new schema validator with all embedded schemas loaded.
-func NewValidator() (*Validator, error) {
+func NewValidator(opts ...ValidatorOption) (*Validator, error) {
 	c := jsonschema.NewCompiler()
 
 	// Load all embedded schema files into the compiler.
@@ -100,19 +110,26 @@ func NewValidator() (*Validator, error) {
 		return nil, fmt.Errorf("loading embedded schemas: %w", err)
 	}
 
-	return &Validator{
+	v := &Validator{
 		compiler: c,
 		compiled: make(map[string]*jsonschema.Schema),
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(v)
+	}
+	return v, nil
 }
 
 // ValidateMethod validates a JSON-RPC request message against the schema
-// for the given WMP method. Returns nil if valid or if no schema exists
-// for the method.
+// for the given WMP method. Returns nil if valid. In strict mode, unknown
+// methods return an error; otherwise they are silently accepted.
 func (v *Validator) ValidateMethod(method string, data []byte) error {
 	schemaPath, ok := methodSchemaMap[method]
 	if !ok {
-		return nil // No schema for this method — skip validation.
+		if v.strict {
+			return fmt.Errorf("no schema defined for method %q", method)
+		}
+		return nil
 	}
 	return v.validate(schemaPath, data)
 }
@@ -122,6 +139,9 @@ func (v *Validator) ValidateMethod(method string, data []byte) error {
 func (v *Validator) ValidateResponse(method string, data []byte) error {
 	schemaPath, ok := responseSchemaMap[method]
 	if !ok {
+		if v.strict {
+			return fmt.Errorf("no response schema defined for method %q", method)
+		}
 		return nil
 	}
 	return v.validate(schemaPath, data)

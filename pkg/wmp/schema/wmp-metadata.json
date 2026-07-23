@@ -54,6 +54,20 @@
     "trace_id": {
       "type": "string",
       "description": "Distributed tracing identifier."
+    },
+    "sender_delegate": {
+      "$ref": "wmp-sender-delegate.json",
+      "description": "Delegated sender acting on behalf of the original sender."
+    },
+    "deliver_after": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Earliest delivery time for delayed messages."
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Expiration time after which the message should not be processed."
     }
   },
   "additionalProperties": false

@@ -20,6 +20,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Checkout WMP spec (test vectors)
+        uses: actions/checkout@v7
+        with:
+          repository: leifj/wmp
+          path: wmp-spec
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Generate coverage report
+        run: GOWORK=off go test ./... -coverprofile=coverage.out
+
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@v8
         env:
@@ -28,3 +42,4 @@ jobs:
           args: >
             -Dsonar.organization=${{ github.repository_owner }}
             -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
+            -Dsonar.go.coverage.reportPaths=coverage.out

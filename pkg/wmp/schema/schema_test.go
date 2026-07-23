@@ -189,3 +189,49 @@ func TestValidateSessionCreateResponse(t *testing.T) {
 		t.Errorf("valid response failed: %v", err)
 	}
 }
+
+func TestWithStrict(t *testing.T) {
+	v, err := NewValidator(WithStrict(true))
+	if err != nil {
+		t.Fatalf("NewValidator error: %v", err)
+	}
+
+	if err := v.ValidateMethod("unknown.method", []byte(`{}`)); err == nil {
+		t.Error("expected error for unknown method in strict mode")
+	}
+	if err := v.ValidateResponse("unknown.method", []byte(`{}`)); err == nil {
+		t.Error("expected error for unknown response in strict mode")
+	}
+}
+
+func TestValidateMetadata(t *testing.T) {
+	v, err := NewValidator()
+	if err != nil {
+		t.Fatalf("NewValidator error: %v", err)
+	}
+	valid := map[string]interface{}{
+		"version": "0.1",
+	}
+	data, _ := json.Marshal(valid)
+	if err := v.ValidateMetadata(data); err != nil {
+		t.Errorf("valid metadata failed: %v", err)
+	}
+
+	if err := v.ValidateMetadata([]byte(`{`)); err == nil {
+		t.Error("expected error for invalid JSON")
+	}
+}
+
+func TestSchemaCaching(t *testing.T) {
+	v, err := NewValidator()
+	if err != nil {
+		t.Fatalf("NewValidator error: %v", err)
+	}
+	data := []byte(`{"jsonrpc":"2.0","id":1,"method":"wmp.session.create","params":{"wmp":{"version":"0.1"}}}`)
+	if err := v.ValidateMethod("wmp.session.create", data); err != nil {
+		t.Fatalf("first validation failed: %v", err)
+	}
+	if err := v.ValidateMethod("wmp.session.create", data); err != nil {
+		t.Fatalf("second validation (cached) failed: %v", err)
+	}
+}

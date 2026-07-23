@@ -97,7 +97,7 @@ func TestNoopMLSHandler_MessageFetch(t *testing.T) {
 }
 
 func TestNoopMLSProvider_EncryptDecrypt(t *testing.T) {
-	p := NewNoopMLSProvider()
+	p := NewNoopMLSProvider(WithAllowInsecure(true))
 	plaintext := []byte("hello world")
 	ct, epoch, err := p.Encrypt("g1", plaintext)
 	if err != nil {
@@ -147,4 +147,56 @@ func TestNoopMLSProvider_GroupLifecycle(t *testing.T) {
 	if epoch != 0 {
 		t.Errorf("epoch = %d, want 0", epoch)
 	}
+}
+
+func TestNoopMLSProvider_ProcessCommit(t *testing.T) {
+	p := NewNoopMLSProvider()
+	epoch, err := p.ProcessCommit("g1", "commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch != 1 {
+		t.Errorf("epoch = %d, want 1", epoch)
+	}
+}
+
+func TestNoopMLSProvider_SelfUpdate(t *testing.T) {
+	p := NewNoopMLSProvider()
+	commit, err := p.SelfUpdate("g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit != "" {
+		t.Errorf("commit = %q, want empty", commit)
+	}
+}
+
+func TestNoopMLSProvider_EncryptRequiresOptIn(t *testing.T) {
+	p := NewNoopMLSProvider()
+	_, _, err := p.Encrypt("g1", []byte("secret"))
+	if err == nil {
+		t.Fatal("expected error without allowInsecure")
+	}
+	_, _, err = p.Decrypt("g1", "ct")
+	if err == nil {
+		t.Fatal("expected error without allowInsecure")
+	}
+}
+
+func TestNoopMLSProvider_MemberOps(t *testing.T) {
+	p := NewNoopMLSProvider(WithAllowInsecure(true))
+	_, _, err := p.AddMember("g1", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.RemoveMember("g1", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNoopMLSHandler_GroupUpdate(t *testing.T) {
+	h := NewNoopMLSHandler()
+	// GroupUpdate is a no-op and should not panic.
+	h.GroupUpdate(context.Background(), &GroupUpdateParams{Commit: "c1"})
 }

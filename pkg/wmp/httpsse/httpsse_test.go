@@ -11,6 +11,53 @@ import (
 	"time"
 )
 
+func TestNewClientTransport(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		wantErr  bool
+	}{
+		{"https endpoint", "https://example.com/wmp", false},
+		{"plain http rejected", "http://example.com/wmp", true},
+		{"ws scheme rejected", "ws://example.com/wmp", true},
+		{"invalid URL", "://bad", true},
+		{"empty scheme", "example.com/wmp", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr, err := NewClientTransport(tt.endpoint)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("NewClientTransport(%q) error = %v, wantErr %v", tt.endpoint, err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if tr.endpoint != tt.endpoint {
+				t.Fatalf("endpoint = %q, want %q", tr.endpoint, tt.endpoint)
+			}
+		})
+	}
+}
+
+func TestClientOptions(t *testing.T) {
+	customClient := &http.Client{Timeout: 5 * time.Second}
+	headers := http.Header{"X-Custom": []string{"value"}}
+
+	tr, err := NewClientTransport("https://example.com/wmp",
+		WithHTTPClient(customClient),
+		WithHeaders(headers),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.httpClient != customClient {
+		t.Fatal("WithHTTPClient not applied")
+	}
+	if got := tr.headers.Get("X-Custom"); got != "value" {
+		t.Fatalf("custom header not applied: %q", got)
+	}
+}
+
 func TestEventBufferAndReplay(t *testing.T) {
 	sess := newServerSession(5)
 
@@ -181,5 +228,135 @@ done:
 	}
 	if replayedIDs[0] != "evt-2" || replayedIDs[1] != "evt-3" {
 		t.Fatalf("unexpected replayed IDs: %v", replayedIDs)
+	}
+}
+
+func TestClientTransportSSE(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := NewServerHandler()
+	serverTransport := server.Transport("session-1")
+
+	ts := httptest.NewTLSServer(server)
+	defer ts.Close()
+
+	tr, err := NewClientTransport(ts.URL, WithHTTPClient(ts.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	if err := tr.ConnectSSE(ctx, "session-1"); err != nil {
+		t.Fatalf("ConnectSSE error: %v", err)
+	}
+
+	// Send a message server→client via SSE.
+	go func() {
+		_ = serverTransport.WriteMessage(ctx, []byte(`{"jsonrpc":"2.0","method":"notify"}`))
+	}()
+
+	msg, err := tr.ReadMessage(ctx)
+	if err != nil {
+		t.Fatalf("ReadMessage error: %v", err)
+	}
+	if string(msg) != `{"jsonrpc":"2.0","method":"notify"}` {
+		t.Fatalf("unexpected message: %s", string(msg))
+	}
+
+	// LastEventID should be set after receiving an event with an ID.
+	id := tr.LastEventID()
+	if !strings.HasPrefix(id, "evt-") {
+		t.Fatalf("unexpected last event id: %q", id)
+	}
+
+	// Close should be idempotent.
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close idempotent error: %v", err)
+	}
+}
+
+func TestClientTransportWriteMessageSuccess(t *testing.T) {
+	var gotBody []byte
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer ts.Close()
+
+	tr, err := NewClientTransport(ts.URL, WithHTTPClient(ts.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	req := []byte(`{"jsonrpc":"2.0","id":1,"method":"test"}`)
+	if err := tr.WriteMessage(context.Background(), req); err != nil {
+		t.Fatalf("WriteMessage error: %v", err)
+	}
+	if string(gotBody) != string(req) {
+		t.Fatalf("server got %s, want %s", string(gotBody), string(req))
+	}
+
+	// The JSON-RPC response should be queued for ReadMessage.
+	resp, err := tr.ReadMessage(context.Background())
+	if err != nil {
+		t.Fatalf("ReadMessage error: %v", err)
+	}
+	if string(resp) != `{"jsonrpc":"2.0","id":1,"result":{}}` {
+		t.Fatalf("unexpected response: %s", string(resp))
+	}
+}
+
+func TestClientTransportWriteMessageErrors(t *testing.T) {
+	tr, err := NewClientTransport("https://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Body too large.
+	ctx := context.Background()
+	huge := make([]byte, maxPostBody+1)
+	if err := tr.WriteMessage(ctx, huge); err == nil {
+		t.Error("expected error for oversized body")
+	}
+
+	// Non-OK status.
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer ts.Close()
+	tr2, err := NewClientTransport(ts.URL, WithHTTPClient(ts.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr2.Close()
+	if err := tr2.WriteMessage(ctx, []byte(`{}`)); err == nil {
+		t.Error("expected error for non-OK status")
+	}
+
+	// Request canceled.
+	cancelTs := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer cancelTs.Close()
+	tr3, err := NewClientTransport(cancelTs.URL, WithHTTPClient(cancelTs.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr3.Close()
+	cctx, ccancel := context.WithCancel(context.Background())
+	ccancel()
+	if err := tr3.WriteMessage(cctx, []byte(`{}`)); err == nil {
+		t.Error("expected error for canceled context")
 	}
 }

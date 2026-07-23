@@ -2,12 +2,23 @@ package wmp
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 )
+
+// generateRequestID creates a cryptographically random JSON-RPC request ID.
+func generateRequestID() (string, error) {
+	b := make([]byte, 16) // 128 bits
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate request id: %w", err)
+	}
+	return "req-" + base64.RawURLEncoding.EncodeToString(b), nil
+}
 
 // SupportedVersions is the list of protocol versions this implementation supports.
 var SupportedVersions = []string{Version}
@@ -26,6 +37,16 @@ func WithMaxMessageSize(size int) PeerOption {
 	return func(p *Peer) { p.maxMessageSize = size }
 }
 
+// WithValidator sets a validator for incoming JSON-RPC request parameters.
+func WithValidator(v Validator) PeerOption {
+	return func(p *Peer) { p.validator = v }
+}
+
+// WithAuthorizer sets an authorization hook for incoming requests.
+func WithAuthorizer(a Authorizer) PeerOption {
+	return func(p *Peer) { p.authorizer = a }
+}
+
 // Peer represents one side of a WMP connection. It handles incoming messages
 // by dispatching to a Handler, and provides methods to send outgoing messages.
 type Peer struct {
@@ -35,11 +56,24 @@ type Peer struct {
 	sessions       SessionStore
 	logger         *slog.Logger
 	maxMessageSize int
+	validator      Validator
+	authorizer     Authorizer
 
 	mu      sync.Mutex
 	pending map[string]chan *Response // keyed by request ID
-	nextID  atomic.Int64
 	closed  atomic.Bool
+}
+
+// Validator is an optional hook that validates incoming JSON-RPC params
+// before dispatch. The schema.Validator satisfies this interface.
+type Validator interface {
+	ValidateMethod(method string, data []byte) error
+}
+
+// Authorizer is an optional hook that decides whether an incoming request
+// or notification is allowed to proceed.
+type Authorizer interface {
+	Authorize(ctx context.Context, method string, params json.RawMessage) bool
 }
 
 // NewPeer creates a new Peer over the given transport, dispatching to handler.
@@ -119,14 +153,15 @@ func (p *Peer) Serve(ctx context.Context) error {
 		}
 
 		// Try batch first.
-		if msgs, err := DecodeBatch(data); err == nil && msgs != nil {
+		decOpts := &DecodeOptions{MaxSize: p.maxMessageSize, MaxDepth: defaultMaxDepth}
+		if msgs, err := DecodeBatch(data, decOpts); err == nil && msgs != nil {
 			for _, msg := range msgs {
 				p.dispatch(ctx, msg)
 			}
 			continue
 		}
 
-		msg, err := DecodeMessage(data)
+		msg, err := DecodeMessage(data, decOpts)
 		if err != nil {
 			// Send parse error for requests; ignore malformed messages.
 			resp := NewErrorResponse(nil, NewRPCError(ErrParseError, nil))
@@ -169,7 +204,31 @@ func (p *Peer) handleResponse(resp *Response) {
 }
 
 func (p *Peer) handleRequest(ctx context.Context, req *Request) {
+	// Run optional authorization hook before any context enrichment or dispatch.
+	if p.authorizer != nil && !p.authorizer.Authorize(ctx, req.Method, req.Params) {
+		if !req.IsNotification() {
+			resp := NewErrorResponse(req.ID, NewRPCError(ErrNotAuthorized, nil))
+			p.sendJSON(ctx, resp)
+		}
+		return
+	}
+
+	// Run optional parameter validation.
+	if p.validator != nil {
+		if err := p.validator.ValidateMethod(req.Method, req.Params); err != nil {
+			if !req.IsNotification() {
+				resp := NewErrorResponse(req.ID, NewRPCError(ErrInvalidParams, map[string]string{
+					"reason": err.Error(),
+				}))
+				p.sendJSON(ctx, resp)
+			}
+			return
+		}
+	}
+
 	// Extract WMP metadata for context enrichment.
+	// IMPORTANT: These values are unauthenticated claims. Callers must verify
+	// identity assertions and session ownership separately.
 	var meta struct {
 		WMP Metadata `json:"wmp"`
 	}
@@ -410,6 +469,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			if err := json.Unmarshal(params, &ps); err != nil {
 				return nil, NewRPCError(ErrInvalidParams, nil)
 			}
+			if err := ValidateCredentialNotification(&ps); err != nil {
+				return nil, err
+			}
 			cnh.CredentialNotification(ctx, &ps)
 			return nil, nil
 		}
@@ -436,7 +498,10 @@ func (p *Peer) Notify(ctx context.Context, method string, params interface{}) er
 // Call sends a JSON-RPC 2.0 request and waits for the response.
 // The result is unmarshalled into the provided result pointer.
 func (p *Peer) Call(ctx context.Context, method string, params interface{}, result interface{}) error {
-	id := fmt.Sprintf("req-%d", p.nextID.Add(1))
+	id, err := generateRequestID()
+	if err != nil {
+		return err
+	}
 	req, err := NewRequest(id, method, params)
 	if err != nil {
 		return err
@@ -476,7 +541,15 @@ func (p *Peer) Call(ctx context.Context, method string, params interface{}, resu
 // handlers where each POST carries one request and expects a response.
 // Notifications (no ID) are processed but return nil bytes.
 func (p *Peer) HandleRequestSync(ctx context.Context, data []byte) ([]byte, error) {
-	msg, err := DecodeMessage(data)
+	if len(data) > p.maxMessageSize {
+		p.logger.Warn("message exceeds size limit", "size", len(data), "max", p.maxMessageSize)
+		resp := NewErrorResponse(nil, NewRPCError(ErrInvalidRequest, map[string]string{
+			"reason": "message too large",
+		}))
+		return json.Marshal(resp)
+	}
+
+	msg, err := DecodeMessage(data, &DecodeOptions{MaxSize: p.maxMessageSize, MaxDepth: defaultMaxDepth})
 	if err != nil {
 		resp := NewErrorResponse(nil, NewRPCError(ErrParseError, nil))
 		return json.Marshal(resp)
@@ -490,7 +563,23 @@ func (p *Peer) HandleRequestSync(ctx context.Context, data []byte) ([]byte, erro
 
 	req := msg.AsRequest()
 
+	if p.authorizer != nil && !p.authorizer.Authorize(ctx, req.Method, req.Params) {
+		resp := NewErrorResponse(req.ID, NewRPCError(ErrNotAuthorized, nil))
+		return json.Marshal(resp)
+	}
+
+	if p.validator != nil {
+		if err := p.validator.ValidateMethod(req.Method, req.Params); err != nil {
+			resp := NewErrorResponse(req.ID, NewRPCError(ErrInvalidParams, map[string]string{
+				"reason": err.Error(),
+			}))
+			return json.Marshal(resp)
+		}
+	}
+
 	// Extract WMP metadata for context enrichment.
+	// IMPORTANT: These values are unauthenticated claims. Callers must verify
+	// identity assertions and session ownership separately.
 	var meta struct {
 		WMP Metadata `json:"wmp"`
 	}

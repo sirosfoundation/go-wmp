@@ -1,2 +1,6 @@
 echo
 wmp-cli
+# Go test coverage artifacts
+coverage.out
+*.cover
+*.cov

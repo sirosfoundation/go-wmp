@@ -16,6 +16,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 )
@@ -25,19 +26,34 @@ import (
 type Transport struct {
 	scanner *bufio.Scanner
 	writer  io.Writer
+	maxLine int
 	mu      sync.Mutex // protects writer
 	closed  bool
 }
 
+const defaultMaxLine = 1 << 20 // 1 MiB
+
 // New creates a stdio transport reading from r and writing to w.
 // Typically called with os.Stdin and os.Stdout.
+// Messages are limited to 1 MiB per line by default.
 func New(r io.Reader, w io.Writer) *Transport {
+	return NewWithMaxLine(r, w, defaultMaxLine)
+}
+
+// NewWithMaxLine creates a stdio transport with a configurable per-line size
+// limit. Messages larger than maxLine are rejected to prevent DoS via
+// unbounded buffering.
+func NewWithMaxLine(r io.Reader, w io.Writer, maxLine int) *Transport {
+	if maxLine <= 0 {
+		maxLine = defaultMaxLine
+	}
 	scanner := bufio.NewScanner(r)
-	// Allow messages up to 10 MB (well beyond typical WMP messages)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	// bufio.Scanner max token size is maxLine; initial buffer is 64 KiB.
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLine)
 	return &Transport{
 		scanner: scanner,
 		writer:  w,
+		maxLine: maxLine,
 	}
 }
 
@@ -72,6 +88,9 @@ func (t *Transport) ReadMessage(ctx context.Context) ([]byte, error) {
 	}
 
 	if err := t.scanner.Err(); err != nil {
+		if err == bufio.ErrTooLong {
+			return nil, fmt.Errorf("message exceeds maximum line length of %d bytes", t.maxLine)
+		}
 		return nil, err
 	}
 	return nil, io.EOF

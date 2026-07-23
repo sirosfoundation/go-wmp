@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -49,9 +50,17 @@ func WithHeaders(h http.Header) ClientOption {
 
 // NewClientTransport creates a client-side HTTPS+SSE transport.
 // endpoint is the WMP HTTPS endpoint URL (e.g., "https://example.com/wmp").
-func NewClientTransport(endpoint string, opts ...ClientOption) *Transport {
+// Only https:// endpoints are accepted; plain http:// is rejected.
+func NewClientTransport(endpoint string, opts ...ClientOption) (*Transport, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("invalid endpoint: %w", err)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return nil, fmt.Errorf("unsupported endpoint scheme %q: only https is allowed", u.Scheme)
+	}
 	t := &Transport{
-		endpoint:   endpoint,
+		endpoint:   u.String(),
 		httpClient: http.DefaultClient,
 		headers:    make(http.Header),
 		incoming:   make(chan []byte, 64),
@@ -59,7 +68,7 @@ func NewClientTransport(endpoint string, opts ...ClientOption) *Transport {
 	for _, opt := range opts {
 		opt(t)
 	}
-	return t
+	return t, nil
 }
 
 // ConnectSSE establishes an SSE connection for server-initiated messages.
@@ -67,8 +76,15 @@ func NewClientTransport(endpoint string, opts ...ClientOption) *Transport {
 // On reconnection, it sends the Last-Event-ID header so the server can
 // replay missed events.
 func (t *Transport) ConnectSSE(ctx context.Context, sessionID string) error {
-	url := t.endpoint + "/events?session_id=" + sessionID
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	u, err := url.Parse(t.endpoint + "/events")
+	if err != nil {
+		return fmt.Errorf("sse request: %w", err)
+	}
+	q := u.Query()
+	q.Set("session_id", sessionID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return fmt.Errorf("sse request: %w", err)
 	}
@@ -149,10 +165,16 @@ func (t *Transport) ReadMessage(ctx context.Context) ([]byte, error) {
 	}
 }
 
+// maxPostBody is the largest JSON-RPC POST body accepted by WriteMessage.
+const maxPostBody = 1 << 20 // 1 MiB
+
 // WriteMessage sends a JSON-RPC message via HTTP POST and returns the
 // response body. If the server returns a JSON-RPC response, it is
 // pushed onto the incoming channel so ReadMessage can retrieve it.
 func (t *Transport) WriteMessage(ctx context.Context, data []byte) error {
+	if int64(len(data)) > maxPostBody {
+		return fmt.Errorf("request body exceeds %d bytes", maxPostBody)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("http request: %w", err)
@@ -174,9 +196,12 @@ func (t *Transport) WriteMessage(ctx context.Context, data []byte) error {
 		return fmt.Errorf("http: status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPostBody+1))
 	if err != nil {
 		return fmt.Errorf("read body: %w", err)
+	}
+	if int64(len(body)) > maxPostBody {
+		return fmt.Errorf("response body exceeds %d bytes", maxPostBody)
 	}
 
 	// If server returned a JSON-RPC response, queue it.
@@ -307,9 +332,13 @@ func (h *ServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ServerHandler) handlePost(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxPostBody+1))
 	if err != nil {
 		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	if int64(len(body)) > maxPostBody {
+		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -395,7 +424,7 @@ func (h *ServerHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			id := sess.bufferEvent(data)
-			fmt.Fprintf(w, "id: %s\nevent: wmp\ndata: %s\n\n", id, data)
+			fmt.Fprintf(w, "id: %s\nevent: wmp\ndata: %s\n\n", id, sseEscape(data))
 			flusher.Flush()
 		case <-r.Context().Done():
 			return
@@ -406,6 +435,23 @@ func (h *ServerHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 // ServerTransport implements wmp.Transport for the server side of HTTPS.
 type ServerTransport struct {
 	sess *serverSession
+}
+
+// sseEscape escapes data so it cannot inject new SSE fields. It replaces
+// line terminators (LF and CR) with spaces, preventing attackers from
+// terminating the data field early.
+func sseEscape(data []byte) []byte {
+	var b strings.Builder
+	b.Grow(len(data))
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if c == '\n' || c == '\r' {
+			b.WriteByte(' ')
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return []byte(b.String())
 }
 
 func (t *ServerTransport) ReadMessage(ctx context.Context) ([]byte, error) {

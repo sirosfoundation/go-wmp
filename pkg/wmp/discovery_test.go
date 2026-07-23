@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -105,5 +106,97 @@ func TestDiscoverConfigForIdentifier_BadScheme(t *testing.T) {
 	_, err := DiscoverConfigForIdentifier(ctx, "did:key:z6Mkf5rGMoatrSj1f3JWKc", nil)
 	if err == nil {
 		t.Fatal("expected error for did:key identifier")
+	}
+}
+
+func TestDiscoverConfigForIdentifier_WithClient(t *testing.T) {
+	config := WellKnownConfig{
+		SupportedVersions: []string{"0.1"},
+		Endpoints:         map[string]string{"websocket": "wss://example.com/wmp"},
+	}
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/wmp-configuration" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(config)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	got, err := DiscoverConfigForIdentifier(ctx, srv.URL, srv.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Endpoints["websocket"] != config.Endpoints["websocket"] {
+		t.Fatalf("endpoint mismatch: %v", got.Endpoints)
+	}
+}
+
+func TestDiscoverConfigForDID(t *testing.T) {
+	config := WellKnownConfig{
+		SupportedVersions: []string{"0.1"},
+	}
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/wmp-configuration" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(config)
+	}))
+	defer srv.Close()
+
+	// Encode the port using %3A so parseDIDWeb preserves it.
+	host := srv.URL[len("https://"):]
+	didHost := strings.ReplaceAll(host, ":", "%3A")
+	ctx := context.Background()
+	got, err := DiscoverConfigForDID(ctx, "did:web:"+didHost, srv.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.SupportedVersions) != 1 {
+		t.Fatalf("versions: %v", got.SupportedVersions)
+	}
+}
+
+func TestBuildWellKnownURL(t *testing.T) {
+	tests := []struct {
+		domain string
+		want   string
+		err    bool
+	}{
+		{"example.com", "https://example.com/.well-known/wmp-configuration", false},
+		{"", "", true},
+		{"example.com/path", "", true},
+		{"example.com?query", "", true},
+		{"user@example.com", "", true},
+	}
+	for _, tt := range tests {
+		got, err := buildWellKnownURL(tt.domain)
+		if (err != nil) != tt.err {
+			t.Errorf("buildWellKnownURL(%q) err=%v, wantErr=%v", tt.domain, err, tt.err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("buildWellKnownURL(%q) = %q, want %q", tt.domain, got, tt.want)
+		}
+	}
+}
+
+func TestExtractDomain_InvalidDIDWeb(t *testing.T) {
+	cases := []string{
+		"did:web:",
+		"did:web:.",
+		"did:web:/path",
+		"did:web:user@example.com",
+	}
+	for _, c := range cases {
+		if got := ExtractDomain(c); got != "" {
+			t.Errorf("ExtractDomain(%q) = %q, want empty", c, got)
+		}
 	}
 }

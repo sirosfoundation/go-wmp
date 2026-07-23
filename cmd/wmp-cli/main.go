@@ -167,7 +167,8 @@ func main() {
 			wsURL = "ws://" + wsURL[len("http://"):]
 		}
 		fmt.Fprintf(os.Stderr, "Connecting via WebSocket to %s ...\n", wsURL)
-		transport, _, err = ws.Dial(ctx, wsURL, nil)
+		allowInsecure := strings.HasPrefix(wsURL, "ws://")
+		transport, _, err = ws.Dial(ctx, wsURL, nil, allowInsecure)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error connecting: %v\n", err)
 			os.Exit(1)
@@ -181,7 +182,11 @@ func main() {
 			httpURL = "http://" + httpURL[len("ws://"):]
 		}
 		fmt.Fprintf(os.Stderr, "Connecting via HTTP+SSE to %s ...\n", httpURL)
-		transport = httpsse.NewClientTransport(httpURL)
+		transport, err = httpsse.NewClientTransport(httpURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating HTTPS+SSE transport: %v\n", err)
+			os.Exit(1)
+		}
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown transport: %s (use 'ws' or 'httpsse')\n", transportType)
