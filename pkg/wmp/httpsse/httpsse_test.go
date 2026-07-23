@@ -2,13 +2,17 @@ package httpsse
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 )
 
 func TestNewClientTransport(t *testing.T) {
@@ -358,5 +362,88 @@ func TestClientTransportWriteMessageErrors(t *testing.T) {
 	ccancel()
 	if err := tr3.WriteMessage(cctx, []byte(`{}`)); err == nil {
 		t.Error("expected error for canceled context")
+	}
+}
+
+type testHandler struct {
+	wmp.BaseHandler
+}
+
+func (testHandler) SessionCreate(_ context.Context, params *wmp.SessionCreateParams) (*wmp.SessionCreateResult, error) {
+	return &wmp.SessionCreateResult{
+		WMP:      wmp.Metadata{Version: wmp.Version, SessionID: "sess-" + params.WMP.Sender},
+	}, nil
+}
+
+func (testHandler) MessageDeliver(_ context.Context, params *wmp.MessageDeliverParams) {
+	_ = params
+}
+
+func TestServerHandlerHandlePost(t *testing.T) {
+	handler := NewServerHandler(testHandler{})
+	ts := httptest.NewTLSServer(handler)
+	defer ts.Close()
+
+	client := ts.Client()
+
+	// 1. Successful session.create request → JSON-RPC response.
+	reqBody := []byte(`{"jsonrpc":"2.0","id":"1","method":"wmp.session.create","params":{"wmp":{"version":"0.1","sender":"alice"},"security":{"mode":"tls"}}}`)
+	resp, err := client.Post(ts.URL, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("post error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var rpcResp struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      string `json:"id"`
+		Result  struct {
+			WMP struct {
+				SessionID string `json:"session_id"`
+			} `json:"wmp"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &rpcResp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if rpcResp.ID != "1" {
+		t.Fatalf("expected id 1, got %q", rpcResp.ID)
+	}
+	if rpcResp.Result.WMP.SessionID != "sess-alice" {
+		t.Fatalf("unexpected session id: %q", rpcResp.Result.WMP.SessionID)
+	}
+
+	// 2. Notification → 202 Accepted with empty body.
+	notifyBody := []byte(`{"jsonrpc":"2.0","method":"wmp.message.deliver","params":{"wmp":{"version":"0.1","session_id":"sess-alice","sender":"alice"},"content_type":"text/plain","body":"\"hi\""}}`)
+	resp2, err := client.Post(ts.URL, "application/json", bytes.NewReader(notifyBody))
+	if err != nil {
+		t.Fatalf("notify post error: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected status 202 for notification, got %d", resp2.StatusCode)
+	}
+}
+
+func TestServerHandlerHandlePostRequestTooLarge(t *testing.T) {
+	handler := NewServerHandler(testHandler{})
+	ts := httptest.NewTLSServer(handler)
+	defer ts.Close()
+
+	huge := make([]byte, maxPostBody+1)
+	resp, err := ts.Client().Post(ts.URL, "application/json", bytes.NewReader(huge))
+	if err != nil {
+		t.Fatalf("post error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", resp.StatusCode)
 	}
 }
