@@ -296,3 +296,19 @@ func TestProfileIsWMPProfile(t *testing.T) {
 		t.Fatalf("Init error: %v", err)
 	}
 }
+
+// TestProfileIsWMPMethodHandler verifies that mls.Profile satisfies the
+// wmp.MethodHandler interface so its MLS methods are registered with a peer.
+func TestProfileIsWMPMethodHandler(t *testing.T) {
+	profile := NewProfile(BaseMLSHandler{})
+
+	mh, ok := interface{}(profile).(wmp.MethodHandler)
+	if !ok {
+		t.Fatalf("mls.Profile does not implement wmp.MethodHandler")
+	}
+
+	methods := mh.Methods()
+	if len(methods) != len(Methods()) {
+		t.Errorf("methods = %v, want %v", methods, Methods())
+	}
+}
