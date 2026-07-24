@@ -3,6 +3,7 @@
 // It hosts authoritative session state and exposes:
 //   - POST /      JSON-RPC request/response for WMP methods
 //   - GET  /events SSE stream for server-initiated messages
+//   - GET  /.well-known/wmp-configuration WMP endpoint discovery
 //   - GET  /.well-known/mls-key-packages published MLS KeyPackages
 //   - GET  /health health check
 //
@@ -23,6 +24,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -63,6 +65,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", server)
 	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/.well-known/wmp-configuration", wellKnownHandler(logger))
 	mux.HandleFunc("/.well-known/mls-key-packages", keyPackagesHandler(logger, mlsProvider))
 
 	httpServer := &http.Server{
@@ -220,6 +223,39 @@ func (h *relayHandler) MessageDeliver(ctx context.Context, params *wmp.MessageDe
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func wellKnownHandler(logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		scheme := "https"
+		if r.TLS == nil {
+			if r.Header.Get("X-Forwarded-Proto") == "https" {
+				scheme = "https"
+			} else {
+				scheme = "http"
+			}
+		}
+		host := r.Host
+		if host == "" {
+			host = r.URL.Host
+		}
+		base := fmt.Sprintf("%s://%s", scheme, host)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"supported_versions": []string{wmp.Version},
+			"endpoints": map[string]string{
+				"rpc":    base + "/",
+				"events": base + "/events",
+			},
+			"security_modes": []string{"tls"},
+			"capabilities": map[string]bool{
+				"messaging": true,
+				"mls":       true,
+			},
+		})
+		logger.Debug("served well-known configuration", "base", base)
+	}
 }
 
 func keyPackagesHandler(logger *slog.Logger, provider mls.MLSProvider) http.HandlerFunc {

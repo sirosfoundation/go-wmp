@@ -4,7 +4,7 @@ primary_region = 'arn'
 # This config is intended to be deployed from the repository root:
 #   fly deploy --config examples/httpsse-relay/fly.toml
 [build]
-  dockerfile = 'examples/httpsse-relay/Dockerfile'
+  dockerfile = 'Dockerfile'
 
 [http_service]
   internal_port = 8080
