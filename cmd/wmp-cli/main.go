@@ -21,8 +21,12 @@
 //	/resume <token>            Resume/rejoin a session using a resumption token
 //	/rejoin <session-id> <token>  Alias for /resume with explicit session id
 //	/create-invite <provider> [relay]  Print a new invitation URI
+//	/setup-mls                 Create an MLS group and add current session members
+//	/invite-endpoints <uri>...  Invite one or more endpoints to the current session
 //	/send <text>               Send a text message to the session
+//	/send-mls <text>           Send an MLS-encrypted text message to the group
 //	/deliver <json>            Send a raw wmp.message.deliver notification
+//	/raw                       Toggle display of all raw incoming JSON
 //	/status                    Print session/transport status
 //	/close                     Close the session
 //	/disconnect                Close the transport
@@ -50,6 +54,7 @@ import (
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp/httpsse"
+	"github.com/sirosfoundation/go-wmp/pkg/wmp/mls"
 	ws "github.com/sirosfoundation/go-wmp/pkg/wmp/ws"
 )
 
@@ -89,7 +94,11 @@ func main() {
 		sender:        sender,
 		transportType: transportType,
 		insecure:      insecure,
+		mlsProvider:   mls.NewNoopMLSProvider(mls.WithAllowInsecure(true)),
+		rawIncoming:   true,
 	}
+	h.mlsProvider = r.mlsProvider
+	h.mlsGroupID = r.currentMLSGroupID
 
 	// Read startup commands from stdin when stdin is not a terminal.
 	startup := readStartupCommands()
@@ -165,6 +174,9 @@ type repl struct {
 	invitationNonce     string
 	serveCancel         context.CancelFunc
 	serveWg             sync.WaitGroup
+	mlsProvider         *mls.NoopMLSProvider
+	mlsGroupID          string
+	rawIncoming         bool
 }
 
 func (r *repl) execute(line string) bool {
@@ -244,12 +256,25 @@ func (r *repl) execute(line string) bool {
 			return true
 		}
 		fmt.Println(uri)
+	case "/setup-mls":
+		r.setupMLS()
+	case "/invite-endpoints":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: /invite-endpoints <provider|uri>...")
+			return true
+		}
+		r.inviteEndpoints(args)
 	case "/send":
 		text := strings.TrimPrefix(line, cmd+" ")
 		r.send(text)
+	case "/send-mls":
+		text := strings.TrimPrefix(line, cmd+" ")
+		r.sendMLS(text)
 	case "/deliver":
 		raw := strings.TrimPrefix(line, cmd+" ")
 		r.deliver(raw)
+	case "/raw":
+		r.toggleRaw()
 	case "/status":
 		r.status()
 	case "/close":
@@ -272,8 +297,12 @@ func (r *repl) printHelp() {
 	fmt.Fprintln(os.Stderr, "  /resume <token>           Resume/rejoin a session")
 	fmt.Fprintln(os.Stderr, "  /rejoin <sid> <token>     Resume/rejoin with explicit session id")
 	fmt.Fprintln(os.Stderr, "  /create-invite <p> [relay]  Print a new invitation URI")
+	fmt.Fprintln(os.Stderr, "  /setup-mls                Create local MLS group (noop/insecure)")
+	fmt.Fprintln(os.Stderr, "  /invite-endpoints <p>...  Invite one or more endpoints (provider or URI)")
 	fmt.Fprintln(os.Stderr, "  /send <text>              Send a text message")
+	fmt.Fprintln(os.Stderr, "  /send-mls <text>          Send an MLS-encrypted text message")
 	fmt.Fprintln(os.Stderr, "  /deliver <json>           Send raw message.deliver params")
+	fmt.Fprintln(os.Stderr, "  /raw                      Toggle printing of incoming raw JSON")
 	fmt.Fprintln(os.Stderr, "  /status                   Print session/transport status")
 	fmt.Fprintln(os.Stderr, "  /close                    Close the session")
 	fmt.Fprintln(os.Stderr, "  /disconnect               Close the transport")
@@ -628,6 +657,133 @@ func (r *repl) status() {
 	if r.resumptionToken != "" {
 		fmt.Fprintf(os.Stderr, "Resume:     %s\n", r.resumptionToken)
 	}
+	if r.mlsGroupID != "" {
+		fmt.Fprintf(os.Stderr, "MLS group:  %s\n", r.mlsGroupID)
+	}
+	fmt.Fprintf(os.Stderr, "Raw JSON:   %v\n", r.rawIncoming)
+}
+
+func (r *repl) setupMLS() {
+	peer, sessionID := r.currentPeerAndSession()
+	if peer == nil {
+		fmt.Fprintf(os.Stderr, "Not connected.\n")
+		return
+	}
+	if sessionID == "" {
+		fmt.Fprintf(os.Stderr, "No active session. Use /create or /resume.\n")
+		return
+	}
+
+	mlsHandler := mls.NewNoopMLSHandler()
+	if err := peer.Use(mls.NewProfile(mlsHandler)); err != nil {
+		fmt.Fprintf(os.Stderr, "MLS profile registration failed: %v\n", err)
+		return
+	}
+
+	groupID := fmt.Sprintf("%s-mls-%d", r.sender, time.Now().UnixMilli())
+	var result mls.GroupCreateResult
+	err := peer.Call(r.ctx, mls.MethodGroupCreate, &mls.GroupCreateParams{
+		WMP:         wmp.Metadata{Version: wmp.Version, SessionID: sessionID, Sender: r.sender},
+		GroupID:     groupID,
+		CipherSuite: mls.CipherSuiteX25519AES128GCM,
+		GroupInfo:   "",
+		Welcomes:    map[string]string{r.sender: ""},
+	}, &result)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "MLS setup failed: %v\n", err)
+		return
+	}
+
+	r.mu.Lock()
+	r.mlsGroupID = result.GroupID
+	r.mu.Unlock()
+
+	fmt.Fprintf(os.Stderr, "MLS group created: %s (epoch %d)\n", result.GroupID, result.Epoch)
+}
+
+func (r *repl) inviteEndpoints(args []string) {
+	peer, sessionID := r.currentPeerAndSession()
+	if peer == nil {
+		fmt.Fprintf(os.Stderr, "Not connected.\n")
+		return
+	}
+	if sessionID == "" {
+		fmt.Fprintf(os.Stderr, "No active session. Use /create or /resume.\n")
+		return
+	}
+
+	for _, arg := range args {
+		// If the argument looks like an invitation URI, print it; otherwise build one.
+		invURI := arg
+		if !strings.HasPrefix(arg, "wmp://") && !strings.HasPrefix(arg, "wmp+https://") {
+			inv, err := wmp.NewInvitation(arg, r.sender, 5*time.Minute)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating invitation for %s: %v\n", arg, err)
+				continue
+			}
+			uri, err := inv.URI()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating URI for %s: %v\n", arg, err)
+				continue
+			}
+			invURI = uri
+		}
+		fmt.Fprintf(os.Stderr, "Inviting endpoint %s with %s\n", arg, invURI)
+		// Deliver the invitation as a message so the CLI/inspector receives it.
+		r.send(invURI)
+	}
+}
+
+func (r *repl) sendMLS(text string) {
+	peer, sessionID := r.currentPeerAndSession()
+	if peer == nil {
+		fmt.Fprintf(os.Stderr, "Not connected.\n")
+		return
+	}
+	if sessionID == "" {
+		fmt.Fprintf(os.Stderr, "No active session. Use /create or /resume.\n")
+		return
+	}
+	if r.mlsGroupID == "" {
+		fmt.Fprintf(os.Stderr, "No MLS group. Use /setup-mls first.\n")
+		return
+	}
+
+	r.mu.Lock()
+	groupID := r.mlsGroupID
+	r.mu.Unlock()
+
+	ciphertext, epoch, err := r.mlsProvider.Encrypt(groupID, []byte(text))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "MLS encrypt failed: %v\n", err)
+		return
+	}
+
+	now := time.Now()
+	err = peer.Notify(r.ctx, wmp.MethodMessageDeliver, &wmp.MessageDeliverParams{
+		WMP: wmp.Metadata{
+			Version:   wmp.Version,
+			SessionID: sessionID,
+			Sender:    r.sender,
+			Timestamp: &now,
+		},
+		ContentType: "application/mls-ciphertext",
+		Body:        json.RawMessage(`"` + ciphertext + `"`),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error sending MLS message: %v\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Sent MLS message (epoch %d): %s\n", epoch, text)
+}
+
+func (r *repl) toggleRaw() {
+	r.mu.Lock()
+	r.rawIncoming = !r.rawIncoming
+	r.handler.showRaw = r.rawIncoming
+	val := r.rawIncoming
+	r.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "Raw incoming JSON display: %v\n", val)
 }
 
 func (r *repl) currentPeer() *wmp.Peer {
@@ -642,11 +798,20 @@ func (r *repl) currentPeerAndSession() (*wmp.Peer, string) {
 	return r.peer, r.sessionID
 }
 
+func (r *repl) currentMLSGroupID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mlsGroupID
+}
+
 // cliHandler logs all incoming WMP messages to stdout as JSON.
 type cliHandler struct {
 	wmp.BaseHandler
-	sender    string
-	sessionID string
+	sender      string
+	sessionID   string
+	showRaw     bool
+	mlsProvider *mls.NoopMLSProvider
+	mlsGroupID  func() string
 }
 
 func (h *cliHandler) SessionCreate(_ context.Context, params *wmp.SessionCreateParams) (*wmp.SessionCreateResult, error) {
@@ -667,6 +832,15 @@ func (h *cliHandler) SessionClose(_ context.Context, params *wmp.SessionClosePar
 
 func (h *cliHandler) MessageDeliver(_ context.Context, params *wmp.MessageDeliverParams) {
 	h.printEvent("message.deliver", params)
+
+	if h.mlsProvider != nil && h.mlsGroupID != nil && params.ContentType == "application/mls-ciphertext" {
+		var ciphertext string
+		if err := json.Unmarshal(params.Body, &ciphertext); err == nil && ciphertext != "" {
+			if plaintext, epoch, err := h.mlsProvider.Decrypt(h.mlsGroupID(), ciphertext); err == nil {
+				fmt.Fprintf(os.Stderr, "[MLS decrypted epoch %d] %s\n", epoch, string(plaintext))
+			}
+		}
+	}
 }
 
 func (h *cliHandler) MessageAck(_ context.Context, params *wmp.MessageAckParams) {
@@ -702,3 +876,5 @@ func (h *cliHandler) printEvent(method string, params interface{}) {
 	})
 	fmt.Println(string(data))
 }
+
+

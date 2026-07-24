@@ -320,3 +320,7 @@ func Methods() []string {
 		MethodMessageFetch,
 	}
 }
+
+// Methods returns the method names registered by this profile.
+// It implements wmp.MethodHandler.
+func (p *Profile) Methods() []string { return Methods() }
