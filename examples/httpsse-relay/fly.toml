@@ -1,0 +1,19 @@
+app = 'httpsse-relay'
+primary_region = 'arn'
+
+# This config is intended to be deployed from the repository root:
+#   fly deploy --config examples/httpsse-relay/fly.toml
+[build]
+  dockerfile = 'examples/httpsse-relay/Dockerfile'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1

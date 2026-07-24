@@ -32,6 +32,7 @@
 //
 //	WMP_SENDER        Override the sender identity (default: wmp-cli-<pid>)
 //	WMP_TRANSPORT     Transport type: "ws" (default) or "httpsse"
+//	WMP_INSECURE      Set to "1" or "true" to allow insecure ws:// / http:// and skip TLS verification
 package main
 
 import (
@@ -54,11 +55,19 @@ import (
 
 func main() {
 	transportFlag := flag.String("transport", "", "Transport type: ws (default) or httpsse")
+	insecureFlag := flag.Bool("insecure", false, "Allow insecure ws:// / http:// connections and skip TLS verification")
 	flag.Parse()
 
 	transportType := *transportFlag
 	if transportType == "" {
 		transportType = os.Getenv("WMP_TRANSPORT")
+	}
+
+	insecure := *insecureFlag
+	if !insecure {
+		if v := os.Getenv("WMP_INSECURE"); v == "1" || v == "true" {
+			insecure = true
+		}
 	}
 
 	sender := os.Getenv("WMP_SENDER")
@@ -79,6 +88,7 @@ func main() {
 		handler:       h,
 		sender:        sender,
 		transportType: transportType,
+		insecure:      insecure,
 	}
 
 	// Read startup commands from stdin when stdin is not a terminal.
@@ -148,6 +158,7 @@ type repl struct {
 	sender              string
 	transportType       string
 	transportTypeActive string
+	insecure            bool
 	endpoint            string
 	sessionID           string
 	resumptionToken     string
@@ -301,13 +312,21 @@ func (r *repl) connect(endpointURL string) bool {
 		transport, _, err = ws.Dial(r.ctx, wsURL, nil, allowInsecure)
 	case "httpsse":
 		httpURL := endpointURL
+		allowInsecure := r.insecure
 		if strings.HasPrefix(httpURL, "wss://") {
 			httpURL = "https://" + httpURL[len("wss://"):]
 		} else if strings.HasPrefix(httpURL, "ws://") {
 			httpURL = "http://" + httpURL[len("ws://"):]
+			allowInsecure = true
+		} else if strings.HasPrefix(httpURL, "http://") {
+			allowInsecure = true
 		}
 		fmt.Fprintf(os.Stderr, "Connecting via HTTP+SSE to %s ...\n", httpURL)
-		transport, err = httpsse.NewClientTransport(httpURL)
+		opts := []httpsse.ClientOption{}
+		if allowInsecure {
+			opts = append(opts, httpsse.WithInsecure(true))
+		}
+		transport, err = httpsse.NewClientTransport(httpURL, opts...)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown transport: %s\n", transportType)
 		return false

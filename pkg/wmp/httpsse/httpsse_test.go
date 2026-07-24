@@ -371,7 +371,7 @@ type testHandler struct {
 
 func (testHandler) SessionCreate(_ context.Context, params *wmp.SessionCreateParams) (*wmp.SessionCreateResult, error) {
 	return &wmp.SessionCreateResult{
-		WMP:      wmp.Metadata{Version: wmp.Version, SessionID: "sess-" + params.WMP.Sender},
+		WMP: wmp.Metadata{Version: wmp.Version, SessionID: "sess-" + params.WMP.Sender},
 	}, nil
 }
 
@@ -445,5 +445,127 @@ func TestServerHandlerHandlePostRequestTooLarge(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d", resp.StatusCode)
+	}
+}
+
+func TestWithInsecureAllowsHTTP(t *testing.T) {
+	tr, err := NewClientTransport("http://example.com/wmp", WithInsecure(true))
+	if err != nil {
+		t.Fatalf("expected http to be allowed with WithInsecure: %v", err)
+	}
+	if tr.endpoint != "http://example.com/wmp" {
+		t.Fatalf("endpoint = %q", tr.endpoint)
+	}
+	if !tr.insecure {
+		t.Fatal("insecure flag not set")
+	}
+}
+
+func TestWithInsecureRejectsHTTPWhenFalse(t *testing.T) {
+	_, err := NewClientTransport("http://example.com/wmp")
+	if err == nil {
+		t.Fatal("expected http to be rejected without WithInsecure")
+	}
+}
+
+// notifyProfile is a profile that forwards message.deliver notifications back
+// to the session via SSE. It verifies that the server-side peer can send
+// outbound messages without hanging.
+type notifyProfile struct {
+	wmp.BaseHandler
+	pc wmp.PeerContext
+}
+
+func (p *notifyProfile) Name() string           { return "notify-test" }
+func (p *notifyProfile) Capabilities() []string { return nil }
+func (p *notifyProfile) Init(ctx wmp.PeerContext) error {
+	p.pc = ctx
+	return nil
+}
+
+func (p *notifyProfile) MessageDeliver(ctx context.Context, params *wmp.MessageDeliverParams) {
+	if p.pc != nil {
+		_ = p.pc.Notify(ctx, wmp.MethodMessageDeliver, params)
+	}
+}
+
+func TestServerInitiatedMessageDoesNotHang(t *testing.T) {
+	profile := &notifyProfile{}
+	server := NewServerHandler(profile, wmp.WithProfile(profile))
+	ts := httptest.NewTLSServer(server)
+	defer ts.Close()
+
+	client := ts.Client()
+
+	// Create a session.
+	reqBody := []byte(`{"jsonrpc":"2.0","id":"1","method":"wmp.session.create","params":{"wmp":{"version":"0.1","sender":"alice"},"security":{"mode":"tls"}}}`)
+	resp, err := client.Post(ts.URL, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("post error: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	// Start SSE reader for the session.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	sseReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events?session_id=sess-alice", nil)
+	sseReq.Header.Set("Accept", "text/event-stream")
+	sseResp, err := client.Do(sseReq)
+	if err != nil {
+		t.Fatalf("SSE connect: %v", err)
+	}
+	defer sseResp.Body.Close()
+
+	// Send a notification. The profile will echo it via SSE.
+	notifyBody := []byte(`{"jsonrpc":"2.0","method":"wmp.message.deliver","params":{"wmp":{"version":"0.1","session_id":"sess-alice","sender":"alice"},"content_type":"text/plain","body":"\"hello\""}}`)
+	done := make(chan struct{})
+	go func() {
+		resp2, err := client.Post(ts.URL, "application/json", bytes.NewReader(notifyBody))
+		if err != nil {
+			t.Errorf("notify post error: %v", err)
+			return
+		}
+		defer resp2.Body.Close()
+		if resp2.StatusCode != http.StatusAccepted {
+			t.Errorf("expected 202, got %d", resp2.StatusCode)
+		}
+		close(done)
+	}()
+
+	// The POST should return within the timeout even though the profile sends
+	// a server-initiated message.
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for notification POST to return")
+	}
+
+	// The echoed message should arrive on SSE.
+	reader := bufio.NewReader(sseResp.Body)
+	var gotData bool
+	deadline := time.After(2 * time.Second)
+readLoop:
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for SSE echo")
+		default:
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "data: ") {
+			gotData = true
+			break readLoop
+		}
+	}
+	if !gotData {
+		t.Fatal("SSE echo not received")
 	}
 }

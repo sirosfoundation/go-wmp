@@ -279,3 +279,20 @@ func TestEncryptedEnvelopeJSON(t *testing.T) {
 		t.Errorf("ciphertext mismatch: %s", decoded.Ciphertext)
 	}
 }
+
+// TestProfileIsWMPProfile verifies that mls.Profile satisfies the wmp.Profile
+// interface so it can be registered with a peer via Peer.Use or WithProfile.
+func TestProfileIsWMPProfile(t *testing.T) {
+	profile := NewProfile(BaseMLSHandler{})
+
+	if profile.Name() != "mls" {
+		t.Errorf("name = %q, want %q", profile.Name(), "mls")
+	}
+	caps := profile.Capabilities()
+	if len(caps) != 1 || caps[0] != "mls" {
+		t.Errorf("capabilities = %v, want [mls]", caps)
+	}
+	if err := profile.Init(nil); err != nil {
+		t.Fatalf("Init error: %v", err)
+	}
+}
