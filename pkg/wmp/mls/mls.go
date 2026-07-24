@@ -248,6 +248,16 @@ func NewProfile(handler MLSHandler) *Profile {
 	return &Profile{handler: handler}
 }
 
+// Name returns the profile identifier for the MLS profile.
+func (p *Profile) Name() string { return "mls" }
+
+// Capabilities returns the capability names this profile provides.
+func (p *Profile) Capabilities() []string { return []string{"mls"} }
+
+// Init is called when the profile is registered with a Peer. The MLS profile
+// does not require initialization beyond registration.
+func (p *Profile) Init(_ wmp.PeerContext) error { return nil }
+
 // HandleMethod dispatches MLS method calls to the appropriate handler method.
 func (p *Profile) HandleMethod(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
 	switch method {

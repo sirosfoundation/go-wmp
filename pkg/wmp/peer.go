@@ -47,6 +47,25 @@ func WithAuthorizer(a Authorizer) PeerOption {
 	return func(p *Peer) { p.authorizer = a }
 }
 
+// WithSessionStore sets the session store used for session context
+// enrichment and peer.Session(). Prefer this option over SetSessionStore
+// when the peer is created by another package (e.g., httpsse.NewServerHandler).
+func WithSessionStore(store SessionStore) PeerOption {
+	return func(p *Peer) { p.sessions = store }
+}
+
+// WithProfile registers a profile with the peer. This is the recommended way
+// to add profiles when the peer is created by another package (e.g.,
+// httpsse.NewServerHandler). Errors during registration are logged and do
+// not prevent peer creation.
+func WithProfile(profile Profile) PeerOption {
+	return func(p *Peer) {
+		if err := p.Use(profile); err != nil {
+			p.logger.Error("failed to register profile", "name", profile.Name(), "error", err)
+		}
+	}
+}
+
 // Peer represents one side of a WMP connection. It handles incoming messages
 // by dispatching to a Handler, and provides methods to send outgoing messages.
 type Peer struct {
@@ -294,10 +313,11 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		// Run session create hooks if we have a session store.
 		if result != nil && p.sessions != nil && result.WMP.SessionID != "" {
 			sess := &Session{
-				ID:           result.WMP.SessionID,
-				Participants: ps.Participants,
-				Capabilities: result.Capabilities,
-				Security:     result.Security,
+				ID:              result.WMP.SessionID,
+				Participants:    ps.Participants,
+				Capabilities:    result.Capabilities,
+				Security:        result.Security,
+				ResumptionToken: result.ResumptionToken,
 			}
 			if hookErr := p.registry.runSessionCreateHooks(ctx, sess, &ps); hookErr != nil {
 				return nil, toRPCError(hookErr)

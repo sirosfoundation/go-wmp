@@ -371,7 +371,7 @@ type testHandler struct {
 
 func (testHandler) SessionCreate(_ context.Context, params *wmp.SessionCreateParams) (*wmp.SessionCreateResult, error) {
 	return &wmp.SessionCreateResult{
-		WMP:      wmp.Metadata{Version: wmp.Version, SessionID: "sess-" + params.WMP.Sender},
+		WMP: wmp.Metadata{Version: wmp.Version, SessionID: "sess-" + params.WMP.Sender},
 	}, nil
 }
 
@@ -445,5 +445,243 @@ func TestServerHandlerHandlePostRequestTooLarge(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d", resp.StatusCode)
+	}
+}
+
+func TestWithInsecureAllowsHTTP(t *testing.T) {
+	tr, err := NewClientTransport("http://example.com/wmp", WithInsecure(true))
+	if err != nil {
+		t.Fatalf("expected http to be allowed with WithInsecure: %v", err)
+	}
+	if tr.endpoint != "http://example.com/wmp" {
+		t.Fatalf("endpoint = %q", tr.endpoint)
+	}
+	if !tr.insecure {
+		t.Fatal("insecure flag not set")
+	}
+}
+
+func TestWithInsecureRejectsHTTPWhenFalse(t *testing.T) {
+	_, err := NewClientTransport("http://example.com/wmp")
+	if err == nil {
+		t.Fatal("expected http to be rejected without WithInsecure")
+	}
+}
+
+func TestWithInsecureSkipsTLSVerification(t *testing.T) {
+	var gotRequest bool
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequest = true
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+
+	tr, err := NewClientTransport(ts.URL, WithInsecure(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	if err := tr.WriteMessage(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("expected TLS skip to allow connection: %v", err)
+	}
+	if !gotRequest {
+		t.Fatal("server did not receive request")
+	}
+}
+
+func TestConnectSSEWithLastEventID(t *testing.T) {
+	var lastEventID string
+	server := NewServerHandler(nil)
+	ts := httptest.NewTLSServer(server)
+	defer ts.Close()
+
+	_ = server.Transport("sess-lei")
+
+	tr, err := NewClientTransport(ts.URL, WithHTTPClient(ts.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	// Simulate a previous event ID.
+	tr.mu.Lock()
+	tr.lastEventID = "evt-5"
+	tr.mu.Unlock()
+
+	// Wrap the server's ServeHTTP to capture the incoming request header.
+	captured := make(chan *http.Request, 1)
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/events" {
+			captured <- r.Clone(context.Background())
+		}
+		ts.Config.Handler.ServeHTTP(w, r)
+	})
+
+	// Use the wrapped handler via a new httptest server so we can capture headers.
+	captureTs := httptest.NewTLSServer(wrapped)
+	defer captureTs.Close()
+
+	tr2, err := NewClientTransport(captureTs.URL, WithHTTPClient(captureTs.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr2.Close()
+	tr2.mu.Lock()
+	tr2.lastEventID = "evt-5"
+	tr2.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = tr2.ConnectSSE(ctx, "sess-lei")
+	}()
+
+	select {
+	case req := <-captured:
+		lastEventID = req.Header.Get("Last-Event-ID")
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for SSE request")
+	}
+
+	if lastEventID != "evt-5" {
+		t.Fatalf("Last-Event-ID = %q, want evt-5", lastEventID)
+	}
+}
+
+func TestTransportCloseDuringReadSSE(t *testing.T) {
+	server := NewServerHandler(nil)
+	_ = server.Transport("sess-close")
+	ts := httptest.NewTLSServer(server)
+	defer ts.Close()
+
+	tr, err := NewClientTransport(ts.URL, WithHTTPClient(ts.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := tr.ConnectSSE(ctx, "sess-close"); err != nil {
+		t.Fatalf("ConnectSSE error: %v", err)
+	}
+
+	// Closing the transport should stop the SSE reader without panicking.
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	// Give the goroutine a moment to shut down.
+	time.Sleep(50 * time.Millisecond)
+
+	// After close, ReadMessage should return EOF.
+	_, err = tr.ReadMessage(ctx)
+	if err != io.EOF {
+		t.Fatalf("expected EOF after close, got %v", err)
+	}
+}
+
+// notifyProfile is a profile that forwards message.deliver notifications back
+// to the session via SSE. It verifies that the server-side peer can send
+// outbound messages without hanging.
+type notifyProfile struct {
+	wmp.BaseHandler
+	pc wmp.PeerContext
+}
+
+func (p *notifyProfile) Name() string           { return "notify-test" }
+func (p *notifyProfile) Capabilities() []string { return nil }
+func (p *notifyProfile) Init(ctx wmp.PeerContext) error {
+	p.pc = ctx
+	return nil
+}
+
+func (p *notifyProfile) MessageDeliver(ctx context.Context, params *wmp.MessageDeliverParams) {
+	if p.pc != nil {
+		_ = p.pc.Notify(ctx, wmp.MethodMessageDeliver, params)
+	}
+}
+
+func TestServerInitiatedMessageDoesNotHang(t *testing.T) {
+	profile := &notifyProfile{}
+	server := NewServerHandler(profile, wmp.WithProfile(profile))
+	ts := httptest.NewTLSServer(server)
+	defer ts.Close()
+
+	client := ts.Client()
+
+	// Create a session.
+	reqBody := []byte(`{"jsonrpc":"2.0","id":"1","method":"wmp.session.create","params":{"wmp":{"version":"0.1","sender":"alice"},"security":{"mode":"tls"}}}`)
+	resp, err := client.Post(ts.URL, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("post error: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	// Start SSE reader for the session.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	sseReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events?session_id=sess-alice", nil)
+	sseReq.Header.Set("Accept", "text/event-stream")
+	sseResp, err := client.Do(sseReq)
+	if err != nil {
+		t.Fatalf("SSE connect: %v", err)
+	}
+	defer sseResp.Body.Close()
+
+	// Send a notification. The profile will echo it via SSE.
+	notifyBody := []byte(`{"jsonrpc":"2.0","method":"wmp.message.deliver","params":{"wmp":{"version":"0.1","session_id":"sess-alice","sender":"alice"},"content_type":"text/plain","body":"\"hello\""}}`)
+	done := make(chan struct{})
+	go func() {
+		resp2, err := client.Post(ts.URL, "application/json", bytes.NewReader(notifyBody))
+		if err != nil {
+			t.Errorf("notify post error: %v", err)
+			return
+		}
+		defer resp2.Body.Close()
+		if resp2.StatusCode != http.StatusAccepted {
+			t.Errorf("expected 202, got %d", resp2.StatusCode)
+		}
+		close(done)
+	}()
+
+	// The POST should return within the timeout even though the profile sends
+	// a server-initiated message.
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for notification POST to return")
+	}
+
+	// The echoed message should arrive on SSE.
+	reader := bufio.NewReader(sseResp.Body)
+	var gotData bool
+	deadline := time.After(2 * time.Second)
+readLoop:
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for SSE echo")
+		default:
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "data: ") {
+			gotData = true
+			break readLoop
+		}
+	}
+	if !gotData {
+		t.Fatal("SSE echo not received")
 	}
 }

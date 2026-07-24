@@ -644,3 +644,151 @@ type testAuthorizer struct {
 func (a *testAuthorizer) Authorize(_ context.Context, _ string, _ json.RawMessage) bool {
 	return a.allowed
 }
+
+// optionTestProfile is a minimal profile that registers a custom method.
+type optionTestProfile struct {
+	NameValue        string
+	CapabilitiesList []string
+	InitCalled       bool
+	MethodName       string
+}
+
+func (p *optionTestProfile) Name() string           { return p.NameValue }
+func (p *optionTestProfile) Capabilities() []string { return p.CapabilitiesList }
+func (p *optionTestProfile) Init(_ PeerContext) error {
+	p.InitCalled = true
+	return nil
+}
+func (p *optionTestProfile) Methods() []string { return []string{p.MethodName} }
+func (p *optionTestProfile) HandleMethod(_ context.Context, method string, params json.RawMessage) (interface{}, error) {
+	if method != p.MethodName {
+		return nil, NewRPCError(ErrMethodNotFound, nil)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(params, &m); err != nil {
+		return nil, NewRPCError(ErrInvalidParams, nil)
+	}
+	return map[string]interface{}{"echo": m}, nil
+}
+
+func TestPeer_WithSessionStore(t *testing.T) {
+	store := NewMemorySessionStore()
+	p := NewPeer(nil, &echoHandler{}, WithSessionStore(store))
+	if p.sessions != store {
+		t.Fatal("WithSessionStore not applied")
+	}
+
+	req, _ := NewRequest("1", MethodSessionCreate, SessionCreateParams{
+		WMP:      Metadata{Version: Version},
+		Security: SecurityMode{Mode: "tls"},
+	})
+	data, _ := json.Marshal(req)
+	_, err := p.HandleRequestSync(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, ok := store.Get("ses-test123")
+	if !ok {
+		t.Fatal("session not stored")
+	}
+	if sess.Security.Mode != "tls" {
+		t.Fatalf("session security mode = %q", sess.Security.Mode)
+	}
+}
+
+func TestPeer_WithProfile(t *testing.T) {
+	profile := &optionTestProfile{
+		NameValue:        "test-profile",
+		CapabilitiesList: []string{"test"},
+		MethodName:       "wmp.test.echo",
+	}
+
+	p := NewPeer(nil, &BaseHandler{}, WithProfile(profile))
+	if !profile.InitCalled {
+		t.Fatal("profile not initialized via WithProfile")
+	}
+
+	req, _ := NewRequest("1", profile.MethodName, map[string]interface{}{"hello": "world"})
+	data, _ := json.Marshal(req)
+	resp, err := p.HandleRequestSync(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var msg Message
+	if err := json.Unmarshal(resp, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Error != nil {
+		t.Fatalf("unexpected error: %v", msg.Error)
+	}
+}
+
+func TestPeer_WithProfileRegistrationError(t *testing.T) {
+	first := &optionTestProfile{
+		NameValue:  "first",
+		MethodName: "wmp.test.echo",
+	}
+	// Second profile registers the same method, so it should fail and log.
+	second := &optionTestProfile{
+		NameValue:  "second",
+		MethodName: "wmp.test.echo",
+	}
+
+	p := NewPeer(nil, &BaseHandler{}, WithProfile(first), WithProfile(second))
+	if !first.InitCalled {
+		t.Fatal("first profile not initialized")
+	}
+	if second.InitCalled {
+		t.Fatal("conflicting profile should not have been initialized")
+	}
+
+	// The first profile should still be usable.
+	req, _ := NewRequest("1", first.MethodName, map[string]interface{}{"hello": "world"})
+	data, _ := json.Marshal(req)
+	resp, err := p.HandleRequestSync(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg Message
+	if err := json.Unmarshal(resp, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Error != nil {
+		t.Fatalf("unexpected error: %v", msg.Error)
+	}
+}
+
+func TestPeer_SessionCreateStoresResumptionToken(t *testing.T) {
+	store := NewMemorySessionStore()
+	handler := &tokenHandler{}
+	p := NewPeer(nil, handler, WithSessionStore(store))
+
+	req, _ := NewRequest("1", MethodSessionCreate, SessionCreateParams{
+		WMP:      Metadata{Version: Version},
+		Security: SecurityMode{Mode: "tls"},
+	})
+	data, _ := json.Marshal(req)
+	if _, err := p.HandleRequestSync(context.Background(), data); err != nil {
+		t.Fatal(err)
+	}
+
+	sess, ok := store.Get("ses-token")
+	if !ok {
+		t.Fatal("session not stored")
+	}
+	if sess.ResumptionToken != "secret-token" {
+		t.Fatalf("resumption token = %q, want %q", sess.ResumptionToken, "secret-token")
+	}
+}
+
+type tokenHandler struct{ BaseHandler }
+
+func (h *tokenHandler) SessionCreate(_ context.Context, _ *SessionCreateParams) (*SessionCreateResult, error) {
+	return &SessionCreateResult{
+		WMP:             Metadata{Version: Version, SessionID: "ses-token"},
+		Security:        SecurityMode{Mode: "tls"},
+		ResumptionToken: "secret-token",
+	}, nil
+}

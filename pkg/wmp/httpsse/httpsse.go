@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ type Transport struct {
 	endpoint   string
 	httpClient *http.Client
 	headers    http.Header
+	insecure   bool
 
 	// SSE reader
 	sseReader *bufio.Reader
@@ -50,16 +52,20 @@ func WithHeaders(h http.Header) ClientOption {
 	return func(t *Transport) { t.headers = h }
 }
 
+// WithInsecure allows plain http:// endpoints and disables TLS certificate
+// verification for https:// endpoints. Intended for local development only.
+func WithInsecure(insecure bool) ClientOption {
+	return func(t *Transport) { t.insecure = insecure }
+}
+
 // NewClientTransport creates a client-side HTTPS+SSE transport.
 // endpoint is the WMP HTTPS endpoint URL (e.g., "https://example.com/wmp").
-// Only https:// endpoints are accepted; plain http:// is rejected.
+// By default only https:// endpoints are accepted; use WithInsecure(true) to
+// allow plain http:// endpoints or to skip TLS certificate verification.
 func NewClientTransport(endpoint string, opts ...ClientOption) (*Transport, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("invalid endpoint: %w", err)
-	}
-	if !strings.EqualFold(u.Scheme, "https") {
-		return nil, fmt.Errorf("unsupported endpoint scheme %q: only https is allowed", u.Scheme)
 	}
 	t := &Transport{
 		endpoint:   u.String(),
@@ -69,6 +75,25 @@ func NewClientTransport(endpoint string, opts ...ClientOption) (*Transport, erro
 	}
 	for _, opt := range opts {
 		opt(t)
+	}
+	if !strings.EqualFold(u.Scheme, "https") && !t.insecure {
+		return nil, fmt.Errorf("unsupported endpoint scheme %q: only https is allowed (use WithInsecure for http)", u.Scheme)
+	}
+	if strings.EqualFold(u.Scheme, "https") && t.insecure {
+		// Replace the default client with one that skips TLS verification.
+		// This branch is intentionally insecure and only enabled via the
+		// WithInsecure option for local development and testing. NOSONAR
+		if t.httpClient == http.DefaultClient {
+			t.httpClient = &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // NOSONAR
+				},
+			}
+		} else if t.httpClient.Transport == nil {
+			t.httpClient.Transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // NOSONAR
+			}
+		}
 	}
 	return t, nil
 }
@@ -132,6 +157,14 @@ func (t *Transport) LastEventID() string {
 
 func (t *Transport) readSSE() {
 	defer t.sseResp.Body.Close()
+	// Recover from sending on a closed incoming channel. Close() may be called
+	// while this goroutine is mid-read, closing incoming before we can send.
+	defer func() {
+		if recover() != nil {
+			// Channel closed by Close(); clean exit.
+		}
+	}()
+
 	var currentID string
 	for {
 		line, err := t.sseReader.ReadString('\n')
@@ -143,6 +176,12 @@ func (t *Transport) readSSE() {
 			currentID = strings.TrimPrefix(line, "id: ")
 		} else if strings.HasPrefix(line, "data: ") {
 			data := strings.TrimPrefix(line, "data: ")
+			t.mu.Lock()
+			closed := t.closed
+			t.mu.Unlock()
+			if closed {
+				return
+			}
 			t.incoming <- []byte(data)
 			if currentID != "" {
 				t.mu.Lock()
@@ -236,9 +275,9 @@ func (t *Transport) Close() error {
 // synchronously via a wmp.Peer, and writes the JSON-RPC response body.
 // SSE is handled via GET with event ID tracking and Last-Event-ID replay.
 type ServerHandler struct {
-	mu       sync.RWMutex
-	sessions map[string]*serverSession
-	handler  wmp.Handler
+	mu          sync.RWMutex
+	sessions    map[string]*serverSession
+	handler     wmp.Handler
 	peerOptions []wmp.PeerOption
 }
 
@@ -262,11 +301,14 @@ func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int)
 	if maxEvents <= 0 {
 		maxEvents = 200
 	}
-	return &serverSession{
+	sess := &serverSession{
 		outgoing:  make(chan []byte, 64),
 		maxEvents: maxEvents,
-		peer:      wmp.NewPeer(&serverTransport{outgoing: make(chan []byte)}, handler, opts...),
 	}
+	// The peer writes outbound messages to the session's outgoing channel so
+	// that handleSSE can fan them out to every attached SSE client.
+	sess.peer = wmp.NewPeer(&serverTransport{outgoing: sess.outgoing}, handler, opts...)
+	return sess
 }
 
 // serverTransport is a no-op transport used only so the per-session Peer can
