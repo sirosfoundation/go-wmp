@@ -468,6 +468,122 @@ func TestWithInsecureRejectsHTTPWhenFalse(t *testing.T) {
 	}
 }
 
+func TestWithInsecureSkipsTLSVerification(t *testing.T) {
+	var gotRequest bool
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequest = true
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+
+	tr, err := NewClientTransport(ts.URL, WithInsecure(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	if err := tr.WriteMessage(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("expected TLS skip to allow connection: %v", err)
+	}
+	if !gotRequest {
+		t.Fatal("server did not receive request")
+	}
+}
+
+func TestConnectSSEWithLastEventID(t *testing.T) {
+	var lastEventID string
+	server := NewServerHandler(nil)
+	ts := httptest.NewTLSServer(server)
+	defer ts.Close()
+
+	_ = server.Transport("sess-lei")
+
+	tr, err := NewClientTransport(ts.URL, WithHTTPClient(ts.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	// Simulate a previous event ID.
+	tr.mu.Lock()
+	tr.lastEventID = "evt-5"
+	tr.mu.Unlock()
+
+	// Wrap the server's ServeHTTP to capture the incoming request header.
+	captured := make(chan *http.Request, 1)
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/events" {
+			captured <- r.Clone(context.Background())
+		}
+		ts.Config.Handler.ServeHTTP(w, r)
+	})
+
+	// Use the wrapped handler via a new httptest server so we can capture headers.
+	captureTs := httptest.NewTLSServer(wrapped)
+	defer captureTs.Close()
+
+	tr2, err := NewClientTransport(captureTs.URL, WithHTTPClient(captureTs.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr2.Close()
+	tr2.mu.Lock()
+	tr2.lastEventID = "evt-5"
+	tr2.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = tr2.ConnectSSE(ctx, "sess-lei")
+	}()
+
+	select {
+	case req := <-captured:
+		lastEventID = req.Header.Get("Last-Event-ID")
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for SSE request")
+	}
+
+	if lastEventID != "evt-5" {
+		t.Fatalf("Last-Event-ID = %q, want evt-5", lastEventID)
+	}
+}
+
+func TestTransportCloseDuringReadSSE(t *testing.T) {
+	server := NewServerHandler(nil)
+	_ = server.Transport("sess-close")
+	ts := httptest.NewTLSServer(server)
+	defer ts.Close()
+
+	tr, err := NewClientTransport(ts.URL, WithHTTPClient(ts.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := tr.ConnectSSE(ctx, "sess-close"); err != nil {
+		t.Fatalf("ConnectSSE error: %v", err)
+	}
+
+	// Closing the transport should stop the SSE reader without panicking.
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	// Give the goroutine a moment to shut down.
+	time.Sleep(50 * time.Millisecond)
+
+	// After close, ReadMessage should return EOF.
+	_, err = tr.ReadMessage(ctx)
+	if err != io.EOF {
+		t.Fatalf("expected EOF after close, got %v", err)
+	}
+}
+
 // notifyProfile is a profile that forwards message.deliver notifications back
 // to the session via SSE. It verifies that the server-side peer can send
 // outbound messages without hanging.

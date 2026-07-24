@@ -725,6 +725,41 @@ func TestPeer_WithProfile(t *testing.T) {
 	}
 }
 
+func TestPeer_WithProfileRegistrationError(t *testing.T) {
+	first := &optionTestProfile{
+		NameValue:  "first",
+		MethodName: "wmp.test.echo",
+	}
+	// Second profile registers the same method, so it should fail and log.
+	second := &optionTestProfile{
+		NameValue:  "second",
+		MethodName: "wmp.test.echo",
+	}
+
+	p := NewPeer(nil, &BaseHandler{}, WithProfile(first), WithProfile(second))
+	if !first.InitCalled {
+		t.Fatal("first profile not initialized")
+	}
+	if second.InitCalled {
+		t.Fatal("conflicting profile should not have been initialized")
+	}
+
+	// The first profile should still be usable.
+	req, _ := NewRequest("1", first.MethodName, map[string]interface{}{"hello": "world"})
+	data, _ := json.Marshal(req)
+	resp, err := p.HandleRequestSync(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg Message
+	if err := json.Unmarshal(resp, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Error != nil {
+		t.Fatalf("unexpected error: %v", msg.Error)
+	}
+}
+
 func TestPeer_SessionCreateStoresResumptionToken(t *testing.T) {
 	store := NewMemorySessionStore()
 	handler := &tokenHandler{}
