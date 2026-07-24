@@ -81,15 +81,17 @@ func NewClientTransport(endpoint string, opts ...ClientOption) (*Transport, erro
 	}
 	if strings.EqualFold(u.Scheme, "https") && t.insecure {
 		// Replace the default client with one that skips TLS verification.
+		// This branch is intentionally insecure and only enabled via the
+		// WithInsecure option for local development and testing. NOSONAR
 		if t.httpClient == http.DefaultClient {
 			t.httpClient = &http.Client{
 				Transport: &http.Transport{
-					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // NOSONAR
 				},
 			}
 		} else if t.httpClient.Transport == nil {
 			t.httpClient.Transport = &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // NOSONAR
 			}
 		}
 	}
