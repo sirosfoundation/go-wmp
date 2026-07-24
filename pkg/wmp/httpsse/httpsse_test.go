@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -683,5 +684,95 @@ readLoop:
 	}
 	if !gotData {
 		t.Fatal("SSE echo not received")
+	}
+}
+
+// TestSSEMultipleClientsReceiveBroadcast verifies that multiple SSE clients
+// connected to the same session each receive all server-initiated messages.
+// This is a regression test for the fan-out bug where a single channel was
+// shared between clients, causing each message to be delivered to only one
+// observer.
+func TestSSEMultipleClientsReceiveBroadcast(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := NewServerHandler(nil)
+	serverTransport := server.Transport("session-broadcast")
+
+	ts := httptest.NewTLSServer(server)
+	defer ts.Close()
+
+	req1, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/sse?session_id=session-broadcast", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req1.Header.Set("Accept", "text/event-stream")
+
+	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/sse?session_id=session-broadcast", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req2.Header.Set("Accept", "text/event-stream")
+
+	resp1, err := ts.Client().Do(req1)
+	if err != nil {
+		t.Fatalf("client 1 SSE request failed: %v", err)
+	}
+	defer resp1.Body.Close()
+
+	resp2, err := ts.Client().Do(req2)
+	if err != nil {
+		t.Fatalf("client 2 SSE request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	// Allow SSE handlers to register as clients.
+	time.Sleep(100 * time.Millisecond)
+
+	const payload = `{"jsonrpc":"2.0","method":"broadcast"}`
+	if err := serverTransport.WriteMessage(ctx, []byte(payload)); err != nil {
+		t.Fatalf("WriteMessage error: %v", err)
+	}
+
+	readDataLine := func(resp *http.Response) (string, error) {
+		reader := bufio.NewReader(resp.Body)
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case <-deadline:
+				return "", io.EOF
+			default:
+			}
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return "", err
+			}
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "data: ") {
+				return strings.TrimPrefix(line, "data: "), nil
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+	results := make([]string, 2)
+	errs := make([]error, 2)
+
+	for i, resp := range []*http.Response{resp1, resp2} {
+		wg.Add(1)
+		go func(idx int, r *http.Response) {
+			defer wg.Done()
+			results[idx], errs[idx] = readDataLine(r)
+		}(i, resp)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("client %d failed to read broadcast: %v", i+1, err)
+		}
+		if results[i] != payload {
+			t.Fatalf("client %d received %q, want %q", i+1, results[i], payload)
+		}
 	}
 }

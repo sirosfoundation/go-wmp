@@ -287,8 +287,13 @@ type serverEvent struct {
 }
 
 type serverSession struct {
-	outgoing chan []byte // server → client (SSE)
+	outgoing chan []byte // server → broadcast loop
 	peer     *wmp.Peer
+
+	// Active SSE clients for this session. Each channel carries the event
+	// ID assigned by the broadcast loop and the raw data.
+	clientsMu sync.Mutex
+	clients   map[chan serverEvent]struct{}
 
 	// Event buffer for Last-Event-ID replay.
 	bufMu     sync.Mutex
@@ -303,12 +308,63 @@ func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int)
 	}
 	sess := &serverSession{
 		outgoing:  make(chan []byte, 64),
+		clients:   make(map[chan serverEvent]struct{}),
 		maxEvents: maxEvents,
 	}
-	// The peer writes outbound messages to the session's outgoing channel so
-	// that handleSSE can fan them out to every attached SSE client.
+	// The peer writes outbound messages to the session's outgoing channel.
+	// A dedicated goroutine fans each message out to every attached SSE client
+	// so that multiple listeners on the same session each receive every event.
 	sess.peer = wmp.NewPeer(&serverTransport{outgoing: sess.outgoing}, handler, opts...)
+	go sess.broadcastLoop()
 	return sess
+}
+
+// registerClient adds a new SSE client and returns its dedicated channel.
+// The caller must call unregisterClient when the client disconnects.
+func (s *serverSession) registerClient() chan serverEvent {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	ch := make(chan serverEvent, 64)
+	s.clients[ch] = struct{}{}
+	return ch
+}
+
+// unregisterClient removes an SSE client and closes its channel.
+func (s *serverSession) unregisterClient(ch chan serverEvent) {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	if _, ok := s.clients[ch]; ok {
+		delete(s.clients, ch)
+		close(ch)
+	}
+}
+
+// broadcastLoop reads messages from the outgoing channel and fans them out to
+// every registered SSE client, buffering each event for Last-Event-ID replay.
+func (s *serverSession) broadcastLoop() {
+	for data := range s.outgoing {
+		s.bufMu.Lock()
+		id := s.bufferEventLocked(data)
+		s.bufMu.Unlock()
+
+		ev := serverEvent{ID: id, Data: data}
+
+		s.clientsMu.Lock()
+		clients := make([]chan serverEvent, 0, len(s.clients))
+		for ch := range s.clients {
+			clients = append(clients, ch)
+		}
+		s.clientsMu.Unlock()
+
+		for _, ch := range clients {
+			select {
+			case ch <- ev:
+			default:
+				// Client is too slow; drop for this client. It can reconnect
+				// with Last-Event-ID to replay missed events.
+			}
+		}
+	}
 }
 
 // serverTransport is a no-op transport used only so the per-session Peer can
@@ -337,6 +393,10 @@ func (t *serverTransport) Close() error { return nil }
 func (s *serverSession) bufferEvent(data []byte) string {
 	s.bufMu.Lock()
 	defer s.bufMu.Unlock()
+	return s.bufferEventLocked(data)
+}
+
+func (s *serverSession) bufferEventLocked(data []byte) string {
 	s.nextID++
 	id := fmt.Sprintf("evt-%d", s.nextID)
 	s.events = append(s.events, serverEvent{ID: id, Data: data})
@@ -392,7 +452,7 @@ func (h *ServerHandler) session(sessionID string) *serverSession {
 // It is retained for backwards compatibility; ServerHandler now uses a
 // per-session Peer internally.
 func (h *ServerHandler) Transport(sessionID string) wmp.Transport {
-	return &ServerTransport{sess: h.session(sessionID)}
+	return newServerTransport(h.session(sessionID))
 }
 
 // ServeHTTP handles both POST (JSON-RPC) and GET (SSE) requests.
@@ -480,14 +540,16 @@ func (h *ServerHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
+	clientCh := sess.registerClient()
+	defer sess.unregisterClient(clientCh)
+
 	for {
 		select {
-		case data, open := <-sess.outgoing:
+		case ev, open := <-clientCh:
 			if !open {
 				return
 			}
-			id := sess.bufferEvent(data)
-			fmt.Fprintf(w, "id: %s\nevent: wmp\ndata: %s\n\n", id, sseEscape(data))
+			fmt.Fprintf(w, "id: %s\nevent: wmp\ndata: %s\n\n", ev.ID, sseEscape(ev.Data))
 			flusher.Flush()
 		case <-r.Context().Done():
 			return
@@ -497,7 +559,15 @@ func (h *ServerHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 // ServerTransport implements wmp.Transport for the server side of HTTPS.
 type ServerTransport struct {
-	sess *serverSession
+	sess   *serverSession
+	client chan serverEvent
+}
+
+func newServerTransport(sess *serverSession) *ServerTransport {
+	return &ServerTransport{
+		sess:   sess,
+		client: sess.registerClient(),
+	}
 }
 
 // sseEscape escapes data so it cannot inject new SSE fields. It replaces
@@ -521,11 +591,11 @@ func (t *ServerTransport) ReadMessage(ctx context.Context) ([]byte, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case data, ok := <-t.sess.outgoing:
+	case ev, ok := <-t.client:
 		if !ok {
 			return nil, io.EOF
 		}
-		return data, nil
+		return ev.Data, nil
 	}
 }
 
@@ -535,5 +605,9 @@ func (t *ServerTransport) WriteMessage(_ context.Context, data []byte) error {
 }
 
 func (t *ServerTransport) Close() error {
+	if t.client != nil {
+		t.sess.unregisterClient(t.client)
+		t.client = nil
+	}
 	return nil
 }
