@@ -191,10 +191,10 @@ type SignSubFlowParams struct {
 	// ResponseURI is the verifier's response endpoint, needed for mdoc
 	// session transcript (OID4VP sign_presentation only).
 	ResponseURI string `json:"response_uri,omitempty"`
-	// VerifierJwkThumbprint is the base64url-encoded JWK SHA-256 thumbprint
+	// VerifierJWKThumbprint is the base64url-encoded JWK SHA-256 thumbprint
 	// of the verifier's encryption key (for direct_post.jwt). Empty for
 	// other response modes.
-	VerifierJwkThumbprint string `json:"verifier_jwk_thumbprint,omitempty"`
+	VerifierJWKThumbprint string `json:"verifier_jwk_thumbprint,omitempty"`
 	// ReissuanceKid, when set (a credential renewal request), asks the
 	// client to sign this proof with the EXISTING keypair identified by
 	// this kid rather than generating a fresh one, so the issuer can match
