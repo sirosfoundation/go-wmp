@@ -179,6 +179,28 @@ type SignSubFlowParams struct {
 	ProofType       string            `json:"proof_type,omitempty"`
 	ParentFlowID    string            `json:"parent_flow_id"`
 	TransactionData []TransactionData `json:"transaction_data,omitempty"`
+	// Issuer is the JWT `iss` value to use when generating proof JWTs
+	// (typically the OAuth client identifier / client_id).
+	Issuer string `json:"issuer,omitempty"`
+	// ProofTypesSupported contains the issuer's proof_types_supported map so
+	// the client has full context to decide which proof type(s) to generate.
+	ProofTypesSupported map[string]interface{} `json:"proof_types_supported,omitempty"`
+	// Count is the number of proofs the client should generate (batch_size).
+	// Defaults to 1 when absent.
+	Count int `json:"count,omitempty"`
+	// ResponseURI is the verifier's response endpoint, needed for mdoc
+	// session transcript (OID4VP sign_presentation only).
+	ResponseURI string `json:"response_uri,omitempty"`
+	// VerifierJwkThumbprint is the base64url-encoded JWK SHA-256 thumbprint
+	// of the verifier's encryption key (for direct_post.jwt). Empty for
+	// other response modes.
+	VerifierJwkThumbprint string `json:"verifier_jwk_thumbprint,omitempty"`
+	// ReissuanceKid, when set (a credential renewal request), asks the
+	// client to sign this proof with the EXISTING keypair identified by
+	// this kid rather than generating a fresh one, so the issuer can match
+	// the proof's public key against the original credential's cnf.jwk as
+	// same-wallet-unit evidence (ARF ISSU_65). Empty for ordinary issuance.
+	ReissuanceKid string `json:"reissuance_kid,omitempty"`
 }
 
 // SelectionAction is the action params for accept_offer.
