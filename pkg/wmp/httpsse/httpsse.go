@@ -529,19 +529,33 @@ func (h *ServerHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	// Compute the Last-Event-ID replay set before registering as a live
+	// client, so events already buffered at this point aren't also
+	// delivered a second time via clientCh below.
+	lastEventID := r.Header.Get("Last-Event-ID")
+	var replay []serverEvent
+	if lastEventID != "" {
+		replay = sess.replayAfter(lastEventID)
+	}
+
+	// Register as a live client BEFORE flushing the response headers.
+	// flusher.Flush() is what allows the remote client's http.Client.Do()
+	// call to return (ConnectSSE), after which it may immediately expect to
+	// receive server-sent events. Registering first closes a race where an
+	// event written right after ConnectSSE returns could otherwise be
+	// dropped because the server hadn't finished subscribing this client.
+	clientCh := sess.registerClient()
+	defer sess.unregisterClient(clientCh)
+
 	flusher.Flush()
 
-	// Replay missed events if Last-Event-ID is set.
-	lastEventID := r.Header.Get("Last-Event-ID")
-	if lastEventID != "" {
-		for _, ev := range sess.replayAfter(lastEventID) {
+	if len(replay) > 0 {
+		for _, ev := range replay {
 			fmt.Fprintf(w, "id: %s\nevent: wmp\ndata: %s\n\n", ev.ID, ev.Data)
 		}
 		flusher.Flush()
 	}
-
-	clientCh := sess.registerClient()
-	defer sess.unregisterClient(clientCh)
 
 	for {
 		select {
