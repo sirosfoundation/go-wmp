@@ -201,6 +201,25 @@ type SignSubFlowParams struct {
 	// the proof's public key against the original credential's cnf.jwk as
 	// same-wallet-unit evidence (ARF ISSU_65). Empty for ordinary issuance.
 	ReissuanceKid string `json:"reissuance_kid,omitempty"`
+
+	// Parameters of the `sign_client_auth` action (go-wallet-backend#317):
+	// the engine asks the client to authenticate one outbound request with
+	// the client-held key that is both its Wallet Instance Attestation cnf
+	// key and its DPoP key. HTM and HTU, when set, ask for an RFC 9449 DPoP
+	// proof over that HTTP method and URL; DPoPNonce is the server-provided
+	// DPoP nonce to include, and ATH the base64url(SHA-256(access_token))
+	// claim for resource requests (empty at the token endpoint). KeyID, when
+	// set (a credential renewal), names the key the client reported as
+	// dpop_key_id at the original issuance and must sign with again. Audience
+	// and Issuer double as the attestation PoP aud/iss when the same request
+	// also needs client attestation. The client answers in the sign result
+	// with dpop_key_id, dpop_proof, client_attestation and
+	// client_attestation_pop, which pass through as-is.
+	HTM       string `json:"htm,omitempty"`
+	HTU       string `json:"htu,omitempty"`
+	DPoPNonce string `json:"dpop_nonce,omitempty"`
+	ATH       string `json:"ath,omitempty"`
+	KeyID     string `json:"key_id,omitempty"`
 }
 
 // SelectionAction is the action params for accept_offer.
