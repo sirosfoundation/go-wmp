@@ -48,7 +48,10 @@ func TestSignSubFlowParams_ClientAuthWireNames(t *testing.T) {
 
 	// Absent parameters stay off the wire: a generate_proof request must
 	// not grow DPoP members.
-	data, _ = json.Marshal(SignSubFlowParams{Action: "generate_proof", Nonce: "c", Audience: "a"})
+	data, err = json.Marshal(SignSubFlowParams{Action: "generate_proof", Nonce: "c", Audience: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	wire = map[string]any{}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		t.Fatal(err)
