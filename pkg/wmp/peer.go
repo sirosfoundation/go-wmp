@@ -223,6 +223,8 @@ func (p *Peer) handleResponse(resp *Response) {
 }
 
 func (p *Peer) handleRequest(ctx context.Context, req *Request) {
+	ctx = ContextWithIsNotification(ctx, req.IsNotification())
+
 	// Run optional authorization hook before any context enrichment or dispatch.
 	if p.authorizer != nil && !p.authorizer.Authorize(ctx, req.Method, req.Params) {
 		if !req.IsNotification() {
@@ -490,7 +492,16 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 				return nil, NewRPCError(ErrInvalidParams, nil)
 			}
 			if err := ValidateCredentialNotification(&ps); err != nil {
-				return nil, err
+				// A real Request gets the fast, synchronous rejection this
+				// validation exists for. A Notification (no "id") can never
+				// receive it back - handleRequest/HandleRequestSync both
+				// discard any dispatch error once IsNotification() is true -
+				// so returning here would silently drop the message instead
+				// of giving the handler, which may have its own async way to
+				// report the problem, any chance to see it at all.
+				if !IsNotificationFromContext(ctx) {
+					return nil, err
+				}
 			}
 			cnh.CredentialNotification(ctx, &ps)
 			return nil, nil
@@ -582,6 +593,7 @@ func (p *Peer) HandleRequestSync(ctx context.Context, data []byte) ([]byte, erro
 	}
 
 	req := msg.AsRequest()
+	ctx = ContextWithIsNotification(ctx, req.IsNotification())
 
 	if p.authorizer != nil && !p.authorizer.Authorize(ctx, req.Method, req.Params) {
 		resp := NewErrorResponse(req.ID, NewRPCError(ErrNotAuthorized, nil))
