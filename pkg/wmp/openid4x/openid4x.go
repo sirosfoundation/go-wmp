@@ -195,6 +195,19 @@ type SignSubFlowParams struct {
 	// of the verifier's encryption key (for direct_post.jwt). Empty for
 	// other response modes.
 	VerifierJWKThumbprint string `json:"verifier_jwk_thumbprint,omitempty"`
+	// VerifierSessionID is the verifier-assigned session id for this
+	// specific presentation. A ZK/PPID pseudonym's verifier_context binds
+	// to the session rather than the verifier's static identity, so it
+	// needs this rather than (or in addition to) Audience. Empty for
+	// non-ZK presentations and for OID4VCI sign_proof.
+	VerifierSessionID string `json:"verifier_session_id,omitempty"`
+	// CredentialsToInclude selects which of the client's credentials (and
+	// which claims from each) go into an OID4VP presentation, when the
+	// server already resolved the selection - e.g. a single-match query
+	// that skipped the interactive selection sub-flow. Empty when the
+	// client made its own selection (accept_offer/select_credentials) or
+	// for OID4VCI sign_proof, where it doesn't apply.
+	CredentialsToInclude []CredentialSelection `json:"credentials_to_include,omitempty"`
 	// ReissuanceKid, when set (a credential renewal request), asks the
 	// client to sign this proof with the EXISTING keypair identified by
 	// this kid rather than generating a fresh one, so the issuer can match
