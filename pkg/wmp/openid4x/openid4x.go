@@ -251,7 +251,7 @@ type ConsentAction struct {
 type CredentialSelection struct {
 	CredentialID      string   `json:"credential_id"`
 	CredentialQueryID string   `json:"credential_query_id,omitempty"`
-	DisclosedClaims   []string `json:"disclosed_claims"`
+	DisclosedClaims   []string `json:"disclosed_claims,omitempty"`
 }
 
 // FlowStartHandler is called when an OID4VCI or OID4VP flow is started.

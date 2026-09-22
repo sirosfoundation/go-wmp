@@ -106,7 +106,7 @@ func TestSignSubFlowParams_VerifierSessionAndCredentials(t *testing.T) {
 		t.Errorf("CredentialsToInclude round trip mismatch: %+v != %+v", out.CredentialsToInclude, in.CredentialsToInclude)
 	}
 
-	// Absent for a plain sign_proof (OID4VCI) request.
+	// Absent for a plain generate_proof (OID4VCI) request.
 	data, err = json.Marshal(SignSubFlowParams{Action: "generate_proof", Nonce: "c", Audience: "a"})
 	if err != nil {
 		t.Fatal(err)
