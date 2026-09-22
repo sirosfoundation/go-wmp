@@ -316,6 +316,101 @@ func TestPeer_CredentialNotification_NotImplemented(t *testing.T) {
 	}
 }
 
+// TestPeer_CredentialNotification_InvalidParams_NotificationReachesHandler is
+// a regression test: a Notification (no "id") can never receive a
+// synchronous JSON-RPC error back - handleRequest/HandleRequestSync both
+// discard any dispatch error once the message is a Notification. Before this
+// fix, MethodCredentialNotification's own ValidateCredentialNotification
+// call returned early on invalid params regardless of that, so the
+// notification was silently dropped: no RPC error (correct), but the
+// registered handler was never invoked either, denying the application any
+// chance to report the problem through its own side channel. A Notification
+// with invalid params must still reach the handler.
+func TestPeer_CredentialNotification_InvalidParams_NotificationReachesHandler(t *testing.T) {
+	clientT, serverT := newChanTransportPair()
+
+	received := make(chan *CredentialNotificationParams, 1)
+	handler := &notificationHandler{received: received}
+
+	server := NewPeer(serverT, handler)
+	client := NewPeer(clientT, &BaseHandler{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go server.Serve(ctx)
+	go client.Serve(ctx)
+
+	params := CredentialNotificationParams{
+		WMP:    Metadata{Version: Version, SessionID: "ses-1"},
+		FlowID: "flow-42",
+		Event:  "credential_accepted",
+		// NotificationID intentionally omitted - invalid per
+		// ValidateCredentialNotification, but that must not stop this from
+		// reaching the handler.
+	}
+
+	if err := client.Notify(ctx, MethodCredentialNotification, params); err != nil {
+		t.Fatalf("Notify returned an error, but a Notification must never produce one: %v", err)
+	}
+
+	select {
+	case got := <-received:
+		if got.FlowID != "flow-42" {
+			t.Fatalf("flow_id: got %q, want %q", got.FlowID, "flow-42")
+		}
+		if got.NotificationID != "" {
+			t.Fatalf("expected empty notification_id to reach the handler as-is, got %q", got.NotificationID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: handler never received the notification despite invalid params")
+	}
+}
+
+// TestPeer_CredentialNotification_InvalidParams_RequestRejected is the
+// companion case: a genuine Request (has an "id") still gets the fast,
+// synchronous ErrInvalidParams rejection ValidateCredentialNotification
+// exists for, and the handler is not invoked. Only Notification semantics
+// change with this fix.
+func TestPeer_CredentialNotification_InvalidParams_RequestRejected(t *testing.T) {
+	clientT, serverT := newChanTransportPair()
+
+	received := make(chan *CredentialNotificationParams, 1)
+	handler := &notificationHandler{received: received}
+
+	server := NewPeer(serverT, handler)
+	client := NewPeer(clientT, &BaseHandler{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go server.Serve(ctx)
+	go client.Serve(ctx)
+
+	var result json.RawMessage
+	err := client.Call(ctx, MethodCredentialNotification, CredentialNotificationParams{
+		WMP:    Metadata{Version: Version, SessionID: "ses-1"},
+		FlowID: "flow-42",
+		Event:  "credential_accepted",
+		// NotificationID intentionally omitted.
+	}, &result)
+
+	rpcErr, ok := err.(*RPCError)
+	if !ok {
+		t.Fatalf("expected an *RPCError, got %T: %v", err, err)
+	}
+	if rpcErr.Code != ErrInvalidParams {
+		t.Fatalf("error code = %d, want %d (ErrInvalidParams)", rpcErr.Code, ErrInvalidParams)
+	}
+
+	select {
+	case got := <-received:
+		t.Fatalf("handler should not have been called for a rejected Request, got %+v", got)
+	case <-time.After(200 * time.Millisecond):
+		// expected: handler never invoked
+	}
+}
+
 func TestPeer_Options(t *testing.T) {
 	logger := slog.Default()
 	validator := &testValidator{valid: true}
