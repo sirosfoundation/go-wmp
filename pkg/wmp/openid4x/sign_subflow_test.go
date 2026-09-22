@@ -2,6 +2,7 @@ package openid4x
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -57,6 +58,64 @@ func TestSignSubFlowParams_ClientAuthWireNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, k := range []string{"htm", "htu", "dpop_nonce", "ath", "key_id", "issuer"} {
+		if _, present := wire[k]; present {
+			t.Errorf("unexpected %s on a generate_proof request", k)
+		}
+	}
+}
+
+// TestSignSubFlowParams_VerifierSessionAndCredentials pins the JSON names of
+// VerifierSessionID and CredentialsToInclude the same way, for the same
+// reason: go-wallet-backend's engine already has both (SignRequestParams'
+// VerifierSessionID and CredentialsToInclude, the latter shaped exactly
+// like CredentialSelection), so an adapter copying them through must
+// produce the same wire format the native WebSocket transport already
+// sends.
+func TestSignSubFlowParams_VerifierSessionAndCredentials(t *testing.T) {
+	in := SignSubFlowParams{
+		Action:            "sign_presentation",
+		Audience:          "https://verifier.example.com",
+		VerifierSessionID: "vs-1",
+		CredentialsToInclude: []CredentialSelection{
+			{CredentialID: "cred-1", CredentialQueryID: "q1", DisclosedClaims: []string{"given_name"}},
+		},
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := wire["verifier_session_id"].(string); got != "vs-1" {
+		t.Errorf("verifier_session_id = %q, want %q", got, "vs-1")
+	}
+	if _, present := wire["credentials_to_include"]; !present {
+		t.Fatal("expected credentials_to_include on the wire")
+	}
+
+	var out SignSubFlowParams
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.VerifierSessionID != in.VerifierSessionID {
+		t.Errorf("VerifierSessionID round trip: got %q, want %q", out.VerifierSessionID, in.VerifierSessionID)
+	}
+	if !reflect.DeepEqual(out.CredentialsToInclude, in.CredentialsToInclude) {
+		t.Errorf("CredentialsToInclude round trip mismatch: %+v != %+v", out.CredentialsToInclude, in.CredentialsToInclude)
+	}
+
+	// Absent for a plain generate_proof (OID4VCI) request.
+	data, err = json.Marshal(SignSubFlowParams{Action: "generate_proof", Nonce: "c", Audience: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire = map[string]any{}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"verifier_session_id", "credentials_to_include"} {
 		if _, present := wire[k]; present {
 			t.Errorf("unexpected %s on a generate_proof request", k)
 		}
