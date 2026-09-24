@@ -233,6 +233,13 @@ type SignSubFlowParams struct {
 	DPoPNonce string `json:"dpop_nonce,omitempty"`
 	ATH       string `json:"ath,omitempty"`
 	KeyID     string `json:"key_id,omitempty"`
+
+	// AttestationChallenge, when set, is a server-provided challenge the
+	// client MUST include as the `challenge` claim of the Client
+	// Attestation PoP JWT (draft-ietf-oauth-attestation-based-client-auth
+	// §5.1/§6). Set after an authorization server rejects a PAR or token
+	// request with `use_attestation_challenge` (go-wallet-backend#366).
+	AttestationChallenge string `json:"attestation_challenge,omitempty"`
 }
 
 // SelectionAction is the action params for accept_offer.
