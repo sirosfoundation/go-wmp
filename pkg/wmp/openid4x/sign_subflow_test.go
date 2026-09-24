@@ -121,3 +121,49 @@ func TestSignSubFlowParams_VerifierSessionAndCredentials(t *testing.T) {
 		}
 	}
 }
+
+// TestSignSubFlowParams_AttestationChallenge pins the JSON name of
+// AttestationChallenge the same way: go-wallet-backend's engine already has
+// SignRequestParams.AttestationChallenge (go-wallet-backend#366), so an
+// adapter copying it through must produce the same wire format the native
+// WebSocket transport already sends.
+func TestSignSubFlowParams_AttestationChallenge(t *testing.T) {
+	in := SignSubFlowParams{
+		Action:               "sign_client_auth",
+		Audience:             "https://as.example.com",
+		Issuer:               "https://wallet.example.com/cb",
+		AttestationChallenge: "chal-abc",
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := wire["attestation_challenge"].(string); got != "chal-abc" {
+		t.Errorf("attestation_challenge = %q, want %q", got, "chal-abc")
+	}
+
+	var out SignSubFlowParams
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.AttestationChallenge != in.AttestationChallenge {
+		t.Errorf("AttestationChallenge round trip: got %q, want %q", out.AttestationChallenge, in.AttestationChallenge)
+	}
+
+	// Absent when no challenge was demanded.
+	data, err = json.Marshal(SignSubFlowParams{Action: "sign_client_auth", Audience: "a", Issuer: "i"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire = map[string]any{}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := wire["attestation_challenge"]; present {
+		t.Error("unexpected attestation_challenge when none was demanded")
+	}
+}
