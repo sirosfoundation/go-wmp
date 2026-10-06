@@ -112,6 +112,24 @@
         }
       },
       "additionalProperties": false
+    },
+    "transaction_data": {
+      "type": "object",
+      "properties": {
+        "versions": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 },
+          "minItems": 1,
+          "description": "Versions of the transaction_data capability the wallet implements. Version 1 is defined by the OpenID4x profile, Section 2.3."
+        },
+        "hash_algs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "transaction_data_hashes_alg names the wallet can compute, e.g. sha-256."
+        }
+      },
+      "required": ["versions"],
+      "additionalProperties": false
     }
   },
   "additionalProperties": {
