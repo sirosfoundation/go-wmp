@@ -136,11 +136,11 @@ func (c Capabilities) OffersTransactionData(version int) bool {
 	if !ok {
 		return false
 	}
-	var cap TransactionDataCap
-	if err := json.Unmarshal(raw, &cap); err != nil {
+	var offered TransactionDataCap
+	if err := json.Unmarshal(raw, &offered); err != nil {
 		return false
 	}
-	for _, v := range cap.Versions {
+	for _, v := range offered.Versions {
 		if v == version {
 			return true
 		}
