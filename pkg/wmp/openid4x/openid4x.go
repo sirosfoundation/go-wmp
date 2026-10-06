@@ -10,6 +10,7 @@ package openid4x
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
@@ -156,18 +157,68 @@ type VPTokenResult struct {
 }
 
 // TransactionData represents a single transaction data object from
-// the verifier's OID4VP authorization request (TS12/SCA).
+// the verifier's OID4VP authorization request (EC TS12 payment SCA).
 //
-// Each item carries a type (e.g. "payment", "login_risk", "account_access",
-// "e_mandate") and type-specific fields in the Params map.
+// A verifier sends each entry as a base64url string. A presentation binds to
+// that string, not to the object it decodes to: OID4VP 1.0 (Appendix B) hashes
+// the string as received and does not decode it first, and re-encoding a
+// decoded object does not reproduce it (key order, whitespace, escapes and
+// number formatting all differ). An orchestrator therefore sends the original
+// string in Raw next to the decoded fields, and a wallet hashes Raw.
 type TransactionData struct {
-	Type   string                 `json:"type"`
+	Type string `json:"type"`
+
+	// Raw is the entry exactly as the verifier sent it: the base64url string
+	// from the request's transaction_data array. It is the only input to the
+	// transaction_data_hashes a wallet puts in the key binding JWT. Empty from
+	// an orchestrator that predates it, in which case a wallet cannot bind to
+	// the transaction and MUST refuse (see CapabilityTransactionData).
+	Raw string `json:"raw,omitempty"`
+
+	// Payload is the entry's `payload` object (EC TS12 §4.2), for validation
+	// and display. Never hash it: it is a re-serialization of part of Raw.
+	Payload json.RawMessage `json:"payload,omitempty"`
+
+	// Params carries type-specific members of pre-TS12 transaction data types.
+	//
+	// Deprecated: TS12 types carry their members in Payload.
 	Params map[string]interface{} `json:"params,omitempty"`
 
-	// Credential-binding fields per OID4VP draft §7.4
-	CredentialIDs            []string `json:"credential_ids,omitempty"`
-	HashAlgorithm            string   `json:"hash_alg,omitempty"`
-	TransactionDataHashesAlg string   `json:"transaction_data_hashes_alg,omitempty"`
+	// Credential-binding fields per OID4VP 1.0.
+	CredentialIDs []string `json:"credential_ids,omitempty"`
+
+	// HashAlgorithm is a non-standard member kept for compatibility.
+	//
+	// Deprecated: use TransactionDataHashesAlg.
+	HashAlgorithm string `json:"hash_alg,omitempty"`
+
+	// TransactionDataHashesAlg is the verifier's list of acceptable hash
+	// algorithms for this entry (OID4VP 1.0 Appendix B: an array in the
+	// request). The wallet picks one and puts that single name, as a string,
+	// in the key binding JWT's transaction_data_hashes_alg.
+	TransactionDataHashesAlg HashAlgs `json:"transaction_data_hashes_alg,omitempty"`
+}
+
+// HashAlgs is the request-side transaction_data_hashes_alg member: a non-empty
+// array of hash algorithm names. It also accepts a bare string, which earlier
+// versions of this package and some verifiers use for a single algorithm.
+// Typing the member as a string made every specification-conformant array fail
+// to decode.
+type HashAlgs []string
+
+// UnmarshalJSON accepts either a JSON string or an array of strings.
+func (h *HashAlgs) UnmarshalJSON(b []byte) error {
+	var one string
+	if err := json.Unmarshal(b, &one); err == nil {
+		*h = HashAlgs{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil {
+		return errors.New("transaction_data_hashes_alg must be a string or an array of strings")
+	}
+	*h = HashAlgs(many)
+	return nil
 }
 
 // SignSubFlowParams are flow-type-specific params for the sign sub-flow
@@ -201,6 +252,10 @@ type SignSubFlowParams struct {
 	// needs this rather than (or in addition to) Audience. Empty for
 	// non-ZK presentations and for OID4VCI sign_proof.
 	VerifierSessionID string `json:"verifier_session_id,omitempty"`
+	// ResponseMode is the OID4VP response_mode of the request being answered.
+	// EC TS12 requires the key binding JWT of an SCA presentation to carry it.
+	// Empty for OID4VCI sign_proof.
+	ResponseMode string `json:"response_mode,omitempty"`
 	// CredentialsToInclude selects which of the client's credentials (and
 	// which claims from each) go into an OID4VP presentation, when the
 	// server already resolved the selection - e.g. a single-match query

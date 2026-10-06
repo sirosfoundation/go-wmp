@@ -235,3 +235,53 @@ func TestSchemaCaching(t *testing.T) {
 		t.Fatalf("second validation (cached) failed: %v", err)
 	}
 }
+
+func sessionCreateWithCaps(t *testing.T, caps map[string]interface{}) []byte {
+	t.Helper()
+	b, err := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "wmp.session.create",
+		"params": map[string]interface{}{
+			"wmp":                  map[string]interface{}{"version": "0.1"},
+			"capabilities_offered": caps,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// The transaction_data capability (OpenID4x profile, Section 2.3) is defined,
+// not just tolerated through the generic custom-capability fallback: a typo in
+// a member name or a version of 0 is rejected.
+func TestValidateTransactionDataCapability(t *testing.T) {
+	v, err := NewValidator()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		caps  map[string]interface{}
+		valid bool
+	}{
+		{"version 1", map[string]interface{}{"transaction_data": map[string]interface{}{"versions": []int{1}}}, true},
+		{"with hash algs", map[string]interface{}{"transaction_data": map[string]interface{}{"versions": []int{1}, "hash_algs": []string{"sha-256"}}}, true},
+		{"no versions", map[string]interface{}{"transaction_data": map[string]interface{}{}}, false},
+		{"empty versions", map[string]interface{}{"transaction_data": map[string]interface{}{"versions": []int{}}}, false},
+		{"version zero", map[string]interface{}{"transaction_data": map[string]interface{}{"versions": []int{0}}}, false},
+		{"unknown member", map[string]interface{}{"transaction_data": map[string]interface{}{"versions": []int{1}, "hash_alg": "sha-256"}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := v.ValidateMethod("wmp.session.create", sessionCreateWithCaps(t, c.caps))
+			if c.valid && err != nil {
+				t.Fatalf("want valid, got %v", err)
+			}
+			if !c.valid && err == nil {
+				t.Fatal("want invalid, got nil")
+			}
+		})
+	}
+}

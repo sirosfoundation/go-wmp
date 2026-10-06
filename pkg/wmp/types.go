@@ -103,6 +103,51 @@ type SignCap struct {
 	ProofTypes []string `json:"proof_types,omitempty"`
 }
 
+// CapabilityTransactionData names the capability a wallet offers when it can
+// process OID4VP transaction_data end to end: validate it against the
+// attestation's type metadata, show it to the user, and bind it into the
+// presentation by hashing each entry's original base64url string. A wallet
+// that does not offer it MUST NOT be sent transaction_data, because an
+// implementation that ignores the member signs the presentation without the
+// hashes and without the user seeing the transaction.
+const CapabilityTransactionData = "transaction_data"
+
+// TransactionDataVersion1 is the first version of the transaction_data
+// capability (OpenID4x profile §2.3).
+const TransactionDataVersion1 = 1
+
+// TransactionDataCap holds parameters for the "transaction_data" capability.
+type TransactionDataCap struct {
+	// Versions lists the capability versions the wallet implements.
+	Versions []int `json:"versions"`
+	// HashAlgs lists the transaction_data_hashes_alg names the wallet can
+	// compute, e.g. "sha-256".
+	HashAlgs []string `json:"hash_algs,omitempty"`
+}
+
+// OffersTransactionData reports whether c contains a transaction_data
+// capability that lists version. Absence of the capability, an unparsable
+// value, or a list without version all mean "not offered". Use it on what the
+// peer OFFERED, not on the negotiated result: negotiation may fall back to
+// every server capability when a peer offers none, which would read as support
+// the peer never claimed.
+func (c Capabilities) OffersTransactionData(version int) bool {
+	raw, ok := c[CapabilityTransactionData]
+	if !ok {
+		return false
+	}
+	var offered TransactionDataCap
+	if err := json.Unmarshal(raw, &offered); err != nil {
+		return false
+	}
+	for _, v := range offered.Versions {
+		if v == version {
+			return true
+		}
+	}
+	return false
+}
+
 // MCPCap holds parameters for the "mcp" capability.
 type MCPCap struct {
 	Tools     bool `json:"tools,omitempty"`
