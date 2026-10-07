@@ -151,9 +151,16 @@ func (t *Transport) ConnectSSE(ctx context.Context, sessionID string) error {
 		resp.Body.Close()
 		return errors.New("sse: transport closed")
 	}
+	// A reconnect supersedes the stream it replaces. Close only knows the latest
+	// response, so an earlier one still being read would stay open forever, and
+	// two readers would feed the same channel.
+	prev := t.sseResp
 	t.sseResp = resp
 	t.sseReader = reader
 	t.mu.Unlock()
+	if prev != nil {
+		prev.Body.Close() // ends the earlier readSSE
+	}
 
 	// Start reading SSE events in background. The reader gets its own copies so
 	// it never touches the shared fields, which a later ConnectSSE may replace.

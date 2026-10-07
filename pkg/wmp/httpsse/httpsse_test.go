@@ -886,3 +886,60 @@ func TestConnectSSEAfterCloseClosesTheStream(t *testing.T) {
 		t.Fatal("the stream was left open: nobody closed the response body")
 	}
 }
+
+// A second ConnectSSE (a reconnect) must supersede the first stream. Close only
+// closes the latest response, so a first stream left open would stay blocked in
+// its reader with its connection held for the life of the process, and two
+// readers would feed the same channel.
+func TestConnectSSEReconnectClosesThePreviousStream(t *testing.T) {
+	gone := make(chan int, 4)
+	var n int
+	var mu sync.Mutex
+	release := make(chan struct{})
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		id := n
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done(): // the client closed this stream
+			gone <- id
+		case <-release:
+		}
+	}))
+	t.Cleanup(ts.Close)
+	t.Cleanup(func() { close(release) })
+
+	tr, err := NewClientTransport(ts.URL, WithHTTPClient(ts.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if err := tr.ConnectSSE(ctx, "sess-reconnect"); err != nil {
+		t.Fatalf("first ConnectSSE: %v", err)
+	}
+	if err := tr.ConnectSSE(ctx, "sess-reconnect"); err != nil {
+		t.Fatalf("second ConnectSSE: %v", err)
+	}
+	select {
+	case id := <-gone:
+		if id != 1 {
+			t.Fatalf("stream %d was closed, want the FIRST stream (1) superseded", id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first stream was left open after a reconnect")
+	}
+	_ = tr.Close()
+	select {
+	case id := <-gone:
+		if id != 2 {
+			t.Fatalf("Close closed stream %d, want the latest (2)", id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close left the latest stream open")
+	}
+}
