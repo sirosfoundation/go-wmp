@@ -776,3 +776,113 @@ func TestSSEMultipleClientsReceiveBroadcast(t *testing.T) {
 		}
 	}
 }
+
+// ConnectSSE installs the stream while Close shuts it down. Both touch
+// sseResp, and ConnectSSE used to write it without the lock Close holds, which
+// the race detector reports as a data race (the CI flake in
+// TestConnectSSEWithLastEventID).
+//
+// The ordering matters. If Close ran BEFORE ConnectSSE took the lock, the mutex
+// itself would order the two and the detector would see nothing, so the test
+// would pass on the buggy code. The flake has Close arriving AFTER ConnectSSE
+// wrote the stream but with no synchronisation between them, which is what this
+// reproduces: wait until the server has seen the request (a signal from the
+// server, not from ConnectSSE), give ConnectSSE time to install the stream, then
+// Close. The sleep is deliberately not a synchronisation with ConnectSSE. Run
+// under -race; without the fix it is reported.
+func TestConnectSSEConcurrentWithClose(t *testing.T) {
+	arrived := make(chan struct{}, 64)
+	release := make(chan struct{})
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(ts.Close)
+	t.Cleanup(func() { close(release) })
+
+	for i := 0; i < 15; i++ {
+		tr, err := NewClientTransport(ts.URL, WithHTTPClient(ts.Client()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = tr.ConnectSSE(ctx, "sess-race")
+		}()
+		select {
+		case <-arrived:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the server never saw the SSE request")
+		}
+		time.Sleep(30 * time.Millisecond) // let ConnectSSE install the stream; NOT a synchronisation
+		_ = tr.Close()
+		<-done
+		cancel()
+	}
+}
+
+// If Close runs while ConnectSSE is still waiting for the server, the stream
+// that arrives afterwards has nobody left to close it. ConnectSSE must close it
+// itself and say so, not report success and start a reader on a dead transport.
+func TestConnectSSEAfterCloseClosesTheStream(t *testing.T) {
+	arrived := make(chan struct{})
+	proceed := make(chan struct{})
+	clientGone := make(chan struct{})
+	release := make(chan struct{})
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(arrived)
+		<-proceed
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done(): // the client closed the connection: the behaviour under test
+			close(clientGone)
+		case <-release: // test over: never leave the server waiting on a client that will not close
+		}
+	}))
+	// Cleanups run last-in first-out: release the handler BEFORE the server is
+	// closed, because httptest's Close waits for every handler. Without this a
+	// failing run (a stream nobody closes) would hang here instead of failing.
+	t.Cleanup(ts.Close)
+	t.Cleanup(func() { close(release) })
+
+	tr, err := NewClientTransport(ts.URL, WithHTTPClient(ts.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- tr.ConnectSSE(context.Background(), "sess-late") }()
+
+	select {
+	case <-arrived:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the server never saw the SSE request")
+	}
+	_ = tr.Close() // while ConnectSSE is blocked waiting for the response
+	close(proceed)
+
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "closed") {
+			t.Fatalf("ConnectSSE on a closed transport = %v, want a 'transport closed' error", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ConnectSSE did not return")
+	}
+	select {
+	case <-clientGone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stream was left open: nobody closed the response body")
+	}
+}

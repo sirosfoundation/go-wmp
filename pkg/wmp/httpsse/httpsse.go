@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -138,11 +139,25 @@ func (t *Transport) ConnectSSE(ctx context.Context, sessionID string) error {
 		return fmt.Errorf("sse: status %d", resp.StatusCode)
 	}
 
-	t.sseResp = resp
-	t.sseReader = bufio.NewReader(resp.Body)
+	reader := bufio.NewReader(resp.Body)
 
-	// Start reading SSE events in background.
-	go t.readSSE()
+	// Install the response under the same lock Close takes. Close reads sseResp
+	// to shut the stream down, so writing it without the lock was a data race.
+	// If Close already ran, there is nobody to close this stream later: close it
+	// here and report that, instead of starting a reader on a dead transport.
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		resp.Body.Close()
+		return errors.New("sse: transport closed")
+	}
+	t.sseResp = resp
+	t.sseReader = reader
+	t.mu.Unlock()
+
+	// Start reading SSE events in background. The reader gets its own copies so
+	// it never touches the shared fields, which a later ConnectSSE may replace.
+	go t.readSSE(resp, reader)
 
 	return nil
 }
@@ -155,8 +170,8 @@ func (t *Transport) LastEventID() string {
 	return t.lastEventID
 }
 
-func (t *Transport) readSSE() {
-	defer t.sseResp.Body.Close()
+func (t *Transport) readSSE(resp *http.Response, reader *bufio.Reader) {
+	defer resp.Body.Close()
 	// Recover from sending on a closed incoming channel. Close() may be called
 	// while this goroutine is mid-read, closing incoming before we can send.
 	defer func() {
@@ -167,7 +182,7 @@ func (t *Transport) readSSE() {
 
 	var currentID string
 	for {
-		line, err := t.sseReader.ReadString('\n')
+		line, err := reader.ReadString('\n')
 		if err != nil {
 			return
 		}
