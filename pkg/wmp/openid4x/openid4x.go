@@ -207,17 +207,30 @@ type TransactionData struct {
 type HashAlgs []string
 
 // UnmarshalJSON accepts either a JSON string or an array of strings.
+//
+// The value must be a non-empty string or a non-empty array of non-empty
+// strings: OID4VP defines the member as a non-empty array of algorithm
+// identifiers, one of which the wallet must use, so an empty list leaves it
+// nothing valid to choose. `[]`, `null`, `""` and an empty element are
+// rejected, and `null` is not the same as leaving the member out.
 func (h *HashAlgs) UnmarshalJSON(b []byte) error {
+	errInvalid := errors.New("transaction_data_hashes_alg must be a non-empty string or a non-empty array of non-empty strings")
+	var algs []string
 	var one string
-	if err := json.Unmarshal(b, &one); err == nil {
-		*h = HashAlgs{one}
-		return nil
+	if err := json.Unmarshal(b, &one); err == nil && string(b) != "null" {
+		algs = []string{one}
+	} else if err := json.Unmarshal(b, &algs); err != nil || algs == nil {
+		return errInvalid
 	}
-	var many []string
-	if err := json.Unmarshal(b, &many); err != nil {
-		return errors.New("transaction_data_hashes_alg must be a string or an array of strings")
+	if len(algs) == 0 {
+		return errInvalid
 	}
-	*h = HashAlgs(many)
+	for _, a := range algs {
+		if a == "" {
+			return errInvalid
+		}
+	}
+	*h = HashAlgs(algs)
 	return nil
 }
 
