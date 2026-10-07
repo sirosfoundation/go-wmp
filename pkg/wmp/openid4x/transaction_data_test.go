@@ -15,7 +15,12 @@ func TestHashAlgs_Unmarshal(t *testing.T) {
 	}{
 		{"array (OID4VP 1.0 request form)", `["sha-256","sha-384"]`, HashAlgs{"sha-256", "sha-384"}, false},
 		{"bare string (earlier versions of this package)", `"sha-256"`, HashAlgs{"sha-256"}, false},
-		{"empty array", `[]`, HashAlgs{}, false},
+		// A non-empty array of non-empty names, or a bare non-empty string; an
+		// empty list leaves the wallet nothing valid to choose.
+		{"empty array rejected", `[]`, nil, true},
+		{"null rejected", `null`, nil, true},
+		{"empty string rejected", `""`, nil, true},
+		{"empty name in array rejected", `["sha-256",""]`, nil, true},
 		{"number rejected", `5`, nil, true},
 		{"array of numbers rejected", `[1]`, nil, true},
 	}
