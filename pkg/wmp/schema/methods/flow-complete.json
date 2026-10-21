@@ -16,7 +16,31 @@
         "flow_id": { "type": "string" },
         "result": {
           "type": "object",
-          "description": "Flow-type-specific result data."
+          "description": "Flow-type-specific result data.",
+          "properties": {
+            "credentials": { "type": "array", "items": { "type": "object", "properties": { "format": { "type": "string" }, "credential": { "type": "string" } } }, "description": "OpenID4VCI flows: the issued credentials. When credential_response_encrypted is true the entries carry no credential value." },
+            "credential_response_encrypted": { "type": "boolean", "description": "OpenID4VCI flows: true when the issuer's response was encrypted to a key only the client holds and the server relayed it unread. credentials[] entries then carry no credential value and credential_metadata is absent; the client pairs credentials[i] with the i-th credential it decrypted." },
+            "credential_metadata": { "type": "object", "description": "OpenID4VCI flows: only for a plain (unencrypted) issuer response, the display-only members (display, claims) of its response-level credential_metadata. Never present when credential_response_encrypted is true; never carries org.siros.secret_seed." },
+            "refresh_token": { "type": "string", "description": "OpenID4VCI flows: issuer refresh token. A secret; withheld from replayed completions." },
+            "dpop_jwk": { "type": "string", "description": "OpenID4VCI flows: private JWK of the DPoP key the refresh token is bound to. A secret; withheld from replayed completions." },
+            "dpop_key_id": { "type": "string", "description": "OpenID4VCI flows: identifier of the client-held DPoP key. Withheld from replayed completions." },
+            "credential_response_encryption_jwk": { "type": "object", "description": "Sign flows (generate_proof): the client's fresh ephemeral public response-encryption JWK. Absent or empty means declined." },
+            "transaction_id": { "type": "string", "minLength": 1, "description": "Sign flows (decrypt_credential_response): set when the issuer deferred issuance. Never together with credential_count." },
+            "interval": { "type": "integer", "minimum": 0, "description": "Sign flows (decrypt_credential_response): optional polling interval in seconds, with transaction_id." },
+            "credential_count": { "type": "integer", "minimum": 1, "maximum": 256, "description": "Sign flows (decrypt_credential_response): the number of credentials the decrypted response held. Never together with transaction_id." },
+            "response_jwe": { "type": "string", "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$", "maxLength": 4194304, "description": "Sign flows (sign_presentation, response_mode direct_post.jwt): the finished compact JWE the orchestrator relays to the verifier unread. Five base64url segments; only the encrypted key of a direct ECDH-ES agreement may be empty. Never together with vp_token." },
+            "redacted_members": { "type": "array", "items": { "enum": ["dpop_jwk", "dpop_key_id", "refresh_token"] }, "uniqueItems": true, "minItems": 1, "description": "Set only on a replayed completion: the secret members withheld from the retained copy." }
+          },
+          "allOf": [
+            { "description": "A seed is never relayed in a completion; it travels only in an encrypted issuer response that the client decrypts itself.",
+              "not": { "required": ["credential_metadata"], "properties": { "credential_metadata": { "required": ["org.siros.secret_seed"] } } } },
+            { "description": "A decrypt_credential_response result reports a transaction_id or a credential_count, never both.",
+              "not": { "required": ["transaction_id", "credential_count"] } },
+            { "description": "A sign_presentation result for an encrypted response mode carries response_jwe and no vp_token: the orchestrator cannot decrypt the value and never builds the response itself.",
+              "not": { "required": ["response_jwe", "vp_token"] } },
+            { "if": { "required": ["credential_response_encrypted"], "properties": { "credential_response_encrypted": { "const": true } } },
+              "then": { "not": { "required": ["credential_metadata"] }, "properties": { "credentials": { "items": { "not": { "required": ["credential"] } } } } } }
+          ]
         }
       }
     }

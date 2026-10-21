@@ -1,6 +1,7 @@
 package wmp_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
+	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 )
 
 // TestVector is the schema for a single WMP conformance test vector.
@@ -19,6 +21,9 @@ type TestVector struct {
 	Input            json.RawMessage `json:"input"`
 	ExpectedResponse json.RawMessage `json:"expected_response,omitempty"`
 	ExpectedError    json.RawMessage `json:"expected_error,omitempty"`
+	// MustRefuse marks a negative vector: the input is a message a conforming
+	// receiver MUST refuse, so the conformance check has to report a violation.
+	MustRefuse bool   `json:"must_refuse,omitempty"`
 	Notes            string          `json:"notes,omitempty"`
 }
 
@@ -42,6 +47,11 @@ type rpcError struct {
 // Searches multiple locations: sibling checkout (local dev), and
 // wmp-spec/vectors/ (GitHub Actions CI).
 func vectorsDir() string {
+	// WMP_VECTORS_DIR overrides the search (for example to run the suite
+	// against a spec branch that is not checked out as a sibling).
+	if dir := os.Getenv("WMP_VECTORS_DIR"); dir != "" {
+		return dir
+	}
 	_, file, _, _ := runtime.Caller(0)
 	base := filepath.Dir(file)
 
@@ -212,7 +222,7 @@ func TestConformanceSessionCreate(t *testing.T) {
 	for _, v := range vectors {
 		t.Run(v.ID, func(t *testing.T) {
 			assertValidRequest(t, v.Input, v.ID)
-			if len(v.ExpectedResponse) > 0 {
+			if hasJSONValue(v.ExpectedResponse) {
 				assertValidResponse(t, v.ExpectedResponse, v.ID)
 			}
 		})
@@ -224,7 +234,7 @@ func TestConformanceSessionLifecycle(t *testing.T) {
 	for _, v := range vectors {
 		t.Run(v.ID, func(t *testing.T) {
 			assertValidRequest(t, v.Input, v.ID)
-			if len(v.ExpectedResponse) > 0 {
+			if hasJSONValue(v.ExpectedResponse) {
 				assertValidResponse(t, v.ExpectedResponse, v.ID)
 			}
 		})
@@ -236,11 +246,102 @@ func TestConformanceMessageDeliver(t *testing.T) {
 	for _, v := range vectors {
 		t.Run(v.ID, func(t *testing.T) {
 			assertValidRequest(t, v.Input, v.ID)
-			if len(v.ExpectedResponse) > 0 {
+			if hasJSONValue(v.ExpectedResponse) {
 				assertValidResponse(t, v.ExpectedResponse, v.ID)
 			}
 		})
 	}
+}
+
+// hasJSONValue reports whether raw holds a JSON value other than null. The
+// vector schema uses an explicit null expected_response to assert that no
+// response is produced (notifications).
+func hasJSONValue(raw json.RawMessage) bool {
+	t := bytes.TrimSpace(raw)
+	return len(t) > 0 && !bytes.Equal(t, []byte("null"))
+}
+
+// engineBlindSignMembers are the sign sub-flow params members of the
+// engine-blind encryption design. They must survive a decode into
+// openid4x.SignSubFlowParams and back: a member the typed params drop would be
+// silently lost by an orchestrator that copies them.
+var engineBlindSignMembers = []string{
+	"credential_response_encryption", "jwe", "deferred", "response_encryption", "state",
+}
+
+// assertFlowMessage applies the flow-specific conformance checks to a single
+// message of a flow-lifecycle vector. A must_refuse vector has to be reported
+// as a violation by the check; every other vector has to pass it.
+func assertFlowMessage(t *testing.T, raw json.RawMessage, v TestVector, id string) {
+	t.Helper()
+	var msg genericRPC
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		t.Fatalf("%s: failed to parse message: %v", id, err)
+	}
+	var violation error
+	checked := false
+	switch msg.Method {
+	case wmp.MethodFlowComplete:
+		var p struct {
+			Result json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal(msg.Params, &p); err != nil || len(p.Result) == 0 {
+			break
+		}
+		checked = true
+		violation = openid4x.ValidateCompletionResult(p.Result)
+	case wmp.MethodFlowStart:
+		checked = true
+		violation = checkSignParamsRoundTrip(msg.Params)
+	}
+	if !checked {
+		return
+	}
+	if v.MustRefuse {
+		if violation == nil {
+			t.Errorf("%s: must_refuse vector passed the conformance check", id)
+		}
+		return
+	}
+	if violation != nil {
+		t.Errorf("%s: %v", id, violation)
+	}
+}
+
+// checkSignParamsRoundTrip verifies, for a sign flow.start, that every
+// engine-blind member of params.params survives openid4x.SignSubFlowParams.
+func checkSignParamsRoundTrip(params json.RawMessage) error {
+	var p struct {
+		FlowType string          `json:"flow_type"`
+		Params   json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil || p.FlowType != "sign" {
+		return nil
+	}
+	var in map[string]json.RawMessage
+	if err := json.Unmarshal(p.Params, &in); err != nil {
+		return fmt.Errorf("sign params are not an object: %w", err)
+	}
+	var typed openid4x.SignSubFlowParams
+	if err := json.Unmarshal(p.Params, &typed); err != nil {
+		return fmt.Errorf("sign params do not decode: %w", err)
+	}
+	enc, err := json.Marshal(typed)
+	if err != nil {
+		return err
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(enc, &out); err != nil {
+		return err
+	}
+	for _, k := range engineBlindSignMembers {
+		if _, ok := in[k]; ok {
+			if _, kept := out[k]; !kept {
+				return fmt.Errorf("sign params member %q is dropped by SignSubFlowParams", k)
+			}
+		}
+	}
+	return nil
 }
 
 func TestConformanceFlowLifecycle(t *testing.T) {
@@ -257,12 +358,14 @@ func TestConformanceFlowLifecycle(t *testing.T) {
 				for i, step := range steps {
 					sid := fmt.Sprintf("%s/step-%d-%s", v.ID, i, step.Step)
 					assertValidRequest(t, step.Message, sid)
+					assertFlowMessage(t, step.Message, v, sid)
 				}
 			} else {
 				// Single input
 				assertValidRequest(t, v.Input, v.ID)
+				assertFlowMessage(t, v.Input, v, v.ID)
 			}
-			if len(v.ExpectedResponse) > 0 {
+			if hasJSONValue(v.ExpectedResponse) {
 				assertValidResponse(t, v.ExpectedResponse, v.ID)
 			}
 		})
@@ -274,7 +377,7 @@ func TestConformanceResolve(t *testing.T) {
 	for _, v := range vectors {
 		t.Run(v.ID, func(t *testing.T) {
 			assertValidRequest(t, v.Input, v.ID)
-			if len(v.ExpectedResponse) > 0 {
+			if hasJSONValue(v.ExpectedResponse) {
 				assertValidResponse(t, v.ExpectedResponse, v.ID)
 			}
 			if len(v.ExpectedError) > 0 {
