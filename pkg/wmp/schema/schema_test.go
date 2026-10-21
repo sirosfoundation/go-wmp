@@ -318,6 +318,8 @@ func TestValidateFlowCompleteEngineBlind(t *testing.T) {
 		`{"transaction_id":"tx","credential_metadata":{}}`,
 		`{"response_jwe":"h.k.iv.ct.tag","vp_token":"x"}`,
 		`{"response_jwe":"a.b"}`,
+		`{"interval":5}`,
+		`{"credential_count":1,"interval":5}`,
 	} {
 		if err := v.ValidateMethod("wmp.flow.complete", complete(bad)); err == nil {
 			t.Errorf("%s accepted", bad)

@@ -36,6 +36,8 @@
               "not": { "required": ["credential_metadata"], "properties": { "credential_metadata": { "required": ["org.siros.secret_seed"] } } } },
             { "description": "A decrypt_credential_response result reports a transaction_id or a credential_count, never both.",
               "not": { "required": ["transaction_id", "credential_count"] } },
+            { "description": "An interval belongs only to a deferred result: it requires transaction_id, and so (with the rule above) is never present with credential_count.",
+              "dependentRequired": { "interval": ["transaction_id"] } },
             { "description": "A sign_presentation result for an encrypted response mode carries response_jwe and no vp_token: the orchestrator cannot decrypt the value and never builds the response itself.",
               "not": { "required": ["response_jwe", "vp_token"] } },
             { "description": "A decrypt_credential_response result carries control members only: the decrypted credentials and credential_metadata never go back to the orchestrator.",

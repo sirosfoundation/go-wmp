@@ -178,7 +178,8 @@ func validateDecryptResult(m map[string]json.RawMessage) error {
 		if err := json.Unmarshal(rawCount, &n); err != nil || n == nil || *n < 1 || *n > MaxEncryptedCredentialCount {
 			return resultErr("credential_count is not an integer from 1 to %d", MaxEncryptedCredentialCount)
 		}
-		return nil
+		// An interval belongs only to a deferred (transaction_id) result.
+		return validateAbsentInterval(m)
 	}
 	var tx *string
 	if err := json.Unmarshal(rawTx, &tx); err != nil || tx == nil || *tx == "" {
