@@ -275,6 +275,16 @@ type SignSubFlowParams struct {
 	// whitespace and re-escapes some characters when marshalling. It is
 	// omitted when the request had none. Peers that do not know the member ignore it.
 	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
+	// VerifiedRequest is the OID4VP request as the engine validated it
+	// (client_id, client_id_scheme, response_mode, response_uri, signed,
+	// signature_verification, client_metadata), emitted identically at each
+	// point the engine hands the request context to the wallet. Opaque to
+	// this package, like ClientMetadata: its JSON value round-trips unchanged
+	// (encoding/json compacts insignificant whitespace). It carries no trust
+	// verdict. Omitted when absent; peers that do not know the member ignore
+	// it, and a wallet MUST NOT read its absence as a signed request (WMP
+	// OpenID4X profile, Section 7.5).
+	VerifiedRequest json.RawMessage `json:"verified_request,omitempty"`
 	// ResponseMode is the OID4VP response_mode of the request being answered.
 	// EC TS12 requires the key binding JWT of an SCA presentation to carry it.
 	// Empty for OID4VCI sign_proof.
