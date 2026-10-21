@@ -285,6 +285,18 @@ type SignSubFlowParams struct {
 	// it, and a wallet MUST NOT read its absence as a signed request (WMP
 	// OpenID4X profile, Section 7.5).
 	VerifiedRequest json.RawMessage `json:"verified_request,omitempty"`
+	// ResponseEncryption is, for a sign_presentation of a direct_post.jwt
+	// request, the recipient the wallet encrypts the JARM response to:
+	// {"jwk": <verifier public JWK, with kid when it has one>, "alg": "...",
+	// "enc": "..."}, resolved by the orchestrator. The wallet builds the
+	// vp_token, the JARM claims and the compact JWE itself and answers the
+	// sign sub-flow with response_jwe, so the orchestrator never holds the
+	// vp_token. Opaque to this package, like ClientMetadata. Omitted for
+	// every other response mode; peers that do not know the member ignore it.
+	ResponseEncryption json.RawMessage `json:"response_encryption,omitempty"`
+	// State is the request's OID4VP state, sent with ResponseEncryption so the
+	// wallet can include it as a JARM claim. Omitted when the request had none.
+	State string `json:"state,omitempty"`
 	// ResponseMode is the OID4VP response_mode of the request being answered.
 	// EC TS12 requires the key binding JWT of an SCA presentation to carry it.
 	// Empty for OID4VCI sign_proof.
