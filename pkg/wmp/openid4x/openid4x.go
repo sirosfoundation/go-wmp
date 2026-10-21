@@ -270,8 +270,10 @@ type SignSubFlowParams struct {
 	// client_metadata_uri). It is how the wallet sees members the engine does
 	// not model itself, notably vp_formats_supported, which for a zkp_req
 	// presentation holds system_id_values / proof_system_values. Opaque to
-	// this package: it round-trips byte-for-byte and is omitted when the
-	// request had none. Peers that do not know the member ignore it.
+	// this package: its JSON value (every member, nested object and array)
+	// round-trips unchanged, though encoding/json compacts insignificant
+	// whitespace and re-escapes some characters when marshalling. It is
+	// omitted when the request had none. Peers that do not know the member ignore it.
 	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
 	// ResponseMode is the OID4VP response_mode of the request being answered.
 	// EC TS12 requires the key binding JWT of an SCA presentation to carry it.

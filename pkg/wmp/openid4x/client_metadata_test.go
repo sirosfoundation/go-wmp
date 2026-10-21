@@ -3,6 +3,7 @@ package openid4x
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -36,8 +37,9 @@ func TestSignSubFlowParams_ClientMetadataAbsent(t *testing.T) {
 	}
 }
 
-// The object survives encode and decode member-for-member, nested objects and
-// arrays included, and is not reshaped by the typed struct.
+// The JSON value survives encode and decode member-for-member, nested objects
+// and arrays included, and is not reshaped by the typed struct. (Byte identity
+// is not promised: encoding/json compacts whitespace on Marshal.)
 func TestSignSubFlowParams_ClientMetadataVerbatimRoundTrip(t *testing.T) {
 	in := SignSubFlowParams{
 		Action: "sign_presentation", Nonce: "n", Audience: "a",
@@ -63,7 +65,8 @@ func TestSignSubFlowParams_ClientMetadataVerbatimRoundTrip(t *testing.T) {
 	if !bytes.Equal(back.ClientMetadata, []byte(nestedClientMetadata)) {
 		t.Errorf("decoded client_metadata changed: %s", back.ClientMetadata)
 	}
-	// A peer's own formatting is kept too: decoding does not re-encode.
+	// Decoding keeps the peer's own bytes; re-encoding compacts them but keeps
+	// the same JSON value.
 	spaced := `{"action":"sign_presentation","client_metadata":{ "a" : [1, 2] }}`
 	var p SignSubFlowParams
 	if err := json.Unmarshal([]byte(spaced), &p); err != nil {
@@ -71,6 +74,18 @@ func TestSignSubFlowParams_ClientMetadataVerbatimRoundTrip(t *testing.T) {
 	}
 	if string(p.ClientMetadata) != `{ "a" : [1, 2] }` {
 		t.Errorf("got %q", p.ClientMetadata)
+	}
+	out, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before, after struct {
+		CM map[string]any `json:"client_metadata"`
+	}
+	_ = json.Unmarshal([]byte(spaced), &before)
+	_ = json.Unmarshal(out, &after)
+	if before.CM == nil || !reflect.DeepEqual(before.CM, after.CM) {
+		t.Errorf("value changed on re-encode: %s", out)
 	}
 }
 
