@@ -285,6 +285,18 @@ type SignSubFlowParams struct {
 	// it, and a wallet MUST NOT read its absence as a signed request (WMP
 	// OpenID4X profile, Section 7.5).
 	VerifiedRequest json.RawMessage `json:"verified_request,omitempty"`
+	// ResponseEncryption is, for a sign_presentation of a direct_post.jwt
+	// request, the recipient the wallet encrypts the JARM response to:
+	// {"jwk": <verifier public JWK, with kid when it has one>, "alg": "...",
+	// "enc": "..."}, resolved by the orchestrator. The wallet builds the
+	// vp_token, the JARM claims and the compact JWE itself and answers the
+	// sign sub-flow with response_jwe, so the orchestrator never holds the
+	// vp_token. Opaque to this package, like ClientMetadata. Omitted for
+	// every other response mode; peers that do not know the member ignore it.
+	ResponseEncryption json.RawMessage `json:"response_encryption,omitempty"`
+	// State is the request's OID4VP state, sent with ResponseEncryption so the
+	// wallet can include it as a JARM claim. Omitted when the request had none.
+	State string `json:"state,omitempty"`
 	// ResponseMode is the OID4VP response_mode of the request being answered.
 	// EC TS12 requires the key binding JWT of an SCA presentation to carry it.
 	// Empty for OID4VCI sign_proof.
@@ -328,6 +340,33 @@ type SignSubFlowParams struct {
 	// §5.1/§6). Set after an authorization server rejects a PAR or token
 	// request with `use_attestation_challenge` (go-wallet-backend#366).
 	AttestationChallenge string `json:"attestation_challenge,omitempty"`
+
+	// CredentialResponseEncryption, on a generate_proof sign request, asks
+	// the client for a fresh ephemeral response-encryption key for the
+	// credential response (OID4VCI credential_response_encryption). The
+	// engine negotiated Alg and Enc from the issuer metadata; Required means
+	// it fails the issuance if the client declines. The client answers in the
+	// sign result with credential_response_encryption_jwk (a public JWK),
+	// which passes through as-is. Omitted when the issuer offers no response
+	// encryption; peers that do not know the member ignore it.
+	CredentialResponseEncryption *CredentialResponseEncryption `json:"credential_response_encryption,omitempty"`
+	// JWE, on a decrypt_credential_response sign request, is the issuer's
+	// compact JWE (a Credential or Deferred Credential Response), relayed
+	// unread: only the client holds the key. Deferred is true when it answers
+	// a Deferred Credential Request. The client answers in the sign result
+	// with transaction_id, interval or credential_count only, which pass
+	// through as-is.
+	JWE string `json:"jwe,omitempty"`
+	// Deferred is a pointer so that an explicit false is sent.
+	Deferred *bool `json:"deferred,omitempty"`
+}
+
+// CredentialResponseEncryption is the negotiated credential response
+// encryption of a generate_proof sign request.
+type CredentialResponseEncryption struct {
+	Alg      string `json:"alg"`
+	Enc      string `json:"enc"`
+	Required bool   `json:"required"`
 }
 
 // SelectionAction is the action params for accept_offer.

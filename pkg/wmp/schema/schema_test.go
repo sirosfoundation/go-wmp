@@ -285,3 +285,42 @@ func TestValidateTransactionDataCapability(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateFlowCompleteEngineBlind(t *testing.T) {
+	v, err := NewValidator()
+	if err != nil {
+		t.Fatalf("NewValidator() error: %v", err)
+	}
+	complete := func(result string) []byte {
+		return []byte(`{"jsonrpc":"2.0","method":"wmp.flow.complete","params":{"wmp":{"version":"0.1"},"flow_id":"f1","result":` + result + `}}`)
+	}
+	seed := `{"org.siros.secret_seed":{"nym":"00112233445566778899aabbccddeeff"}}`
+	for _, ok := range []string{
+		`{"credentials":[{"format":"mso_mdoc"}],"credential_response_encrypted":true,"refresh_token":"rt"}`,
+		`{"credentials":[{"format":"mso_mdoc","credential":"x"}],"credential_metadata":{"display":[]}}`,
+		`{"credential_count":1}`,
+		`{"transaction_id":"tx","interval":5}`,
+		`{"response_jwe":"h..iv.ct.tag"}`,
+	} {
+		if err := v.ValidateMethod("wmp.flow.complete", complete(ok)); err != nil {
+			t.Errorf("%s rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		`{"credential_metadata":` + seed + `}`,
+		`{"credential_response_encrypted":true,"credential_metadata":` + seed + `}`,
+		`{"credential_response_encrypted":true,"credential_metadata":{"display":[]}}`,
+		`{"credential_response_encrypted":true,"credentials":[{"credential":"x"}]}`,
+		`{"redacted_members":["credential_metadata"]}`,
+		`{"transaction_id":"tx","credential_count":1}`,
+		`{"credential_count":0}`,
+		`{"credential_count":1,"credentials":[{"credential":"x"}]}`,
+		`{"transaction_id":"tx","credential_metadata":{}}`,
+		`{"response_jwe":"h.k.iv.ct.tag","vp_token":"x"}`,
+		`{"response_jwe":"a.b"}`,
+	} {
+		if err := v.ValidateMethod("wmp.flow.complete", complete(bad)); err == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+}
