@@ -39,6 +39,23 @@ func TestValidateCompletionResult(t *testing.T) {
 		{"redacted empty", `{"redacted_members":[]}`, false},
 		{"redacted not array", `{"redacted_members":"dpop_jwk"}`, false},
 		{"count and transaction", `{"transaction_id":"tx","credential_count":1}`, false},
+		{"count with credentials", `{"credential_count":1,"credentials":[{"credential":"x"}]}`, false},
+		{"count with credential_metadata", `{"credential_count":1,"credential_metadata":{}}`, false},
+		{"transaction with credentials", `{"transaction_id":"tx","credentials":[]}`, false},
+		{"transaction with credential_metadata", `{"transaction_id":"tx","credential_metadata":{}}`, false},
+		{"encrypted flag null", `{"credential_response_encrypted":null}`, false},
+		{"encrypted credentials null", `{"credential_response_encrypted":true,"credentials":null}`, false},
+		{"encrypted credentials null entry", `{"credential_response_encrypted":true,"credentials":[null]}`, false},
+		{"encrypted credentials empty ok", `{"credential_response_encrypted":true,"credentials":[]}`, true},
+		{"transaction empty", `{"transaction_id":""}`, false},
+		{"transaction not string", `{"transaction_id":42}`, false},
+		{"transaction null", `{"transaction_id":null}`, false},
+		{"transaction interval negative", `{"transaction_id":"tx","interval":-1}`, false},
+		{"transaction interval not integer", `{"transaction_id":"tx","interval":"5"}`, false},
+		{"transaction interval null", `{"transaction_id":"tx","interval":null}`, false},
+		{"transaction interval zero", `{"transaction_id":"tx","interval":0}`, true},
+		{"interval alone", `{"interval":5}`, false},
+		{"count null", `{"credential_count":null}`, false},
 		{"count zero", `{"credential_count":0}`, false},
 		{"count too large", `{"credential_count":257}`, false},
 		{"count not integer", `{"credential_count":"1"}`, false},
@@ -82,9 +99,16 @@ func TestValidateCompletionResult_JWETooLong(t *testing.T) {
 // The error never quotes a value of the result: a seed must not reach a log.
 func TestValidateCompletionResult_ErrorDoesNotLeakValues(t *testing.T) {
 	const secret = "00112233445566778899aabbccddeeff"
-	raw := `{"credential_metadata":{"` + SecretSeedMember + `":{"nym":"` + secret + `"}}}`
-	err := ValidateCompletionResult(json.RawMessage(raw))
-	if err == nil || strings.Contains(err.Error(), secret) {
-		t.Fatalf("error %v must exist and not contain the seed", err)
+	for _, raw := range []string{
+		`{"credential_metadata":{"` + SecretSeedMember + `":{"nym":"` + secret + `"}}}`,
+		`{"redacted_members":["` + secret + `"]}`,
+		`{"redacted_members":["dpop_jwk","dpop_jwk","` + secret + `"]}`,
+		`{"transaction_id":"` + secret + `","credential_count":1}`,
+		`{"response_jwe":"` + secret + `"}`,
+	} {
+		err := ValidateCompletionResult(json.RawMessage(raw))
+		if err == nil || strings.Contains(err.Error(), secret) {
+			t.Fatalf("%s: error %v must exist and not contain the value", raw, err)
+		}
 	}
 }

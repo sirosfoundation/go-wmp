@@ -314,6 +314,8 @@ func TestValidateFlowCompleteEngineBlind(t *testing.T) {
 		`{"redacted_members":["credential_metadata"]}`,
 		`{"transaction_id":"tx","credential_count":1}`,
 		`{"credential_count":0}`,
+		`{"credential_count":1,"credentials":[{"credential":"x"}]}`,
+		`{"transaction_id":"tx","credential_metadata":{}}`,
 		`{"response_jwe":"h.k.iv.ct.tag","vp_token":"x"}`,
 		`{"response_jwe":"a.b"}`,
 	} {

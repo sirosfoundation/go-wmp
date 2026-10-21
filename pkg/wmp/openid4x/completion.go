@@ -52,7 +52,8 @@ func resultErr(format string, args ...any) error {
 //     credential_metadata and no credentials[].credential value;
 //   - redacted_members lists only dpop_jwk, dpop_key_id and refresh_token;
 //   - a decrypt_credential_response result has credential_count (1 to
-//     MaxEncryptedCredentialCount) or transaction_id, never both;
+//     MaxEncryptedCredentialCount) or transaction_id, never both, and carries
+//     no credentials or credential_metadata;
 //   - a response_jwe is a compact JWE of five base64url segments (only the
 //     encrypted key may be empty), at most MaxResponseJWELen long, and never
 //     accompanies a vp_token.
@@ -90,11 +91,11 @@ func validateEncryptedFlag(m map[string]json.RawMessage) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	var b bool
-	if err := json.Unmarshal(raw, &b); err != nil {
+	var b *bool
+	if err := json.Unmarshal(raw, &b); err != nil || b == nil {
 		return false, resultErr("credential_response_encrypted is not a boolean")
 	}
-	return b, nil
+	return *b, nil
 }
 
 func validateCredentialMetadata(m map[string]json.RawMessage, encrypted bool) error {
@@ -121,10 +122,13 @@ func validateNoCredentialValues(m map[string]json.RawMessage) error {
 		return nil
 	}
 	var creds []map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &creds); err != nil {
+	if err := json.Unmarshal(raw, &creds); err != nil || creds == nil {
 		return resultErr("credentials is not an array of objects")
 	}
 	for i, c := range creds {
+		if c == nil {
+			return resultErr("credentials[%d] is not an object", i)
+		}
 		if _, has := c["credential"]; has {
 			return resultErr("credentials[%d] carries a credential value although credential_response_encrypted is true", i)
 		}
@@ -144,10 +148,10 @@ func validateRedactedMembers(m map[string]json.RawMessage) error {
 	seen := make(map[string]bool, len(names))
 	for _, n := range names {
 		if !replaySecretMembers[n] {
-			return resultErr("redacted_members lists %q, which is not a replay secret member", n)
+			return resultErr("redacted_members lists a member that is not a replay secret member")
 		}
 		if seen[n] {
-			return resultErr("redacted_members lists %q twice", n)
+			return resultErr("redacted_members lists a member twice")
 		}
 		seen[n] = true
 	}
@@ -156,16 +160,44 @@ func validateRedactedMembers(m map[string]json.RawMessage) error {
 
 func validateDecryptResult(m map[string]json.RawMessage) error {
 	rawCount, hasCount := m["credential_count"]
-	_, hasTx := m["transaction_id"]
+	rawTx, hasTx := m["transaction_id"]
 	if hasCount && hasTx {
 		return resultErr("both transaction_id and credential_count")
 	}
-	if !hasCount {
+	if !hasCount && !hasTx {
+		return validateAbsentInterval(m)
+	}
+	// A decryption result carries control members only.
+	for _, k := range []string{"credentials", "credential_metadata"} {
+		if _, has := m[k]; has {
+			return resultErr("decryption result carries %s", k)
+		}
+	}
+	if hasCount {
+		var n *int
+		if err := json.Unmarshal(rawCount, &n); err != nil || n == nil || *n < 1 || *n > MaxEncryptedCredentialCount {
+			return resultErr("credential_count is not an integer from 1 to %d", MaxEncryptedCredentialCount)
+		}
 		return nil
 	}
-	var n int
-	if err := json.Unmarshal(rawCount, &n); err != nil || n < 1 || n > MaxEncryptedCredentialCount {
-		return resultErr("credential_count is not an integer from 1 to %d", MaxEncryptedCredentialCount)
+	var tx *string
+	if err := json.Unmarshal(rawTx, &tx); err != nil || tx == nil || *tx == "" {
+		return resultErr("transaction_id is not a non-empty string")
+	}
+	if rawIv, ok := m["interval"]; ok {
+		var iv *int
+		if err := json.Unmarshal(rawIv, &iv); err != nil || iv == nil || *iv < 0 {
+			return resultErr("interval is not a non-negative integer")
+		}
+	}
+	return nil
+}
+
+// validateAbsentInterval keeps interval, which only accompanies a
+// transaction_id, from standing alone as a decryption result.
+func validateAbsentInterval(m map[string]json.RawMessage) error {
+	if _, ok := m["interval"]; ok {
+		return resultErr("interval without transaction_id")
 	}
 	return nil
 }

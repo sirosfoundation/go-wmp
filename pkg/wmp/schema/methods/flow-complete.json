@@ -38,6 +38,9 @@
               "not": { "required": ["transaction_id", "credential_count"] } },
             { "description": "A sign_presentation result for an encrypted response mode carries response_jwe and no vp_token: the orchestrator cannot decrypt the value and never builds the response itself.",
               "not": { "required": ["response_jwe", "vp_token"] } },
+            { "description": "A decrypt_credential_response result carries control members only: the decrypted credentials and credential_metadata never go back to the orchestrator.",
+              "if": { "anyOf": [ { "required": ["credential_count"] }, { "required": ["transaction_id"] } ] },
+              "then": { "not": { "anyOf": [ { "required": ["credentials"] }, { "required": ["credential_metadata"] } ] } } },
             { "if": { "required": ["credential_response_encrypted"], "properties": { "credential_response_encrypted": { "const": true } } },
               "then": { "not": { "required": ["credential_metadata"] }, "properties": { "credentials": { "items": { "not": { "required": ["credential"] } } } } } }
           ]
