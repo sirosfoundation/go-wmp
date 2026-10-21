@@ -328,6 +328,33 @@ type SignSubFlowParams struct {
 	// §5.1/§6). Set after an authorization server rejects a PAR or token
 	// request with `use_attestation_challenge` (go-wallet-backend#366).
 	AttestationChallenge string `json:"attestation_challenge,omitempty"`
+
+	// CredentialResponseEncryption, on a generate_proof sign request, asks
+	// the client for a fresh ephemeral response-encryption key for the
+	// credential response (OID4VCI credential_response_encryption). The
+	// engine negotiated Alg and Enc from the issuer metadata; Required means
+	// it fails the issuance if the client declines. The client answers in the
+	// sign result with credential_response_encryption_jwk (a public JWK),
+	// which passes through as-is. Omitted when the issuer offers no response
+	// encryption; peers that do not know the member ignore it.
+	CredentialResponseEncryption *CredentialResponseEncryption `json:"credential_response_encryption,omitempty"`
+	// JWE, on a decrypt_credential_response sign request, is the issuer's
+	// compact JWE (a Credential or Deferred Credential Response), relayed
+	// unread: only the client holds the key. Deferred is true when it answers
+	// a Deferred Credential Request. The client answers in the sign result
+	// with transaction_id, interval or credential_count only, which pass
+	// through as-is.
+	JWE string `json:"jwe,omitempty"`
+	// Deferred is a pointer so that an explicit false is sent.
+	Deferred *bool `json:"deferred,omitempty"`
+}
+
+// CredentialResponseEncryption is the negotiated credential response
+// encryption of a generate_proof sign request.
+type CredentialResponseEncryption struct {
+	Alg      string `json:"alg"`
+	Enc      string `json:"enc"`
+	Required bool   `json:"required"`
 }
 
 // SelectionAction is the action params for accept_offer.
