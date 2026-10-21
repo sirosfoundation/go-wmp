@@ -265,6 +265,16 @@ type SignSubFlowParams struct {
 	// needs this rather than (or in addition to) Audience. Empty for
 	// non-ZK presentations and for OID4VCI sign_proof.
 	VerifierSessionID string `json:"verifier_session_id,omitempty"`
+	// ClientMetadata is the verifier's OID4VP client_metadata object, carried
+	// verbatim from the validated request (inline or fetched from
+	// client_metadata_uri). It is how the wallet sees members the engine does
+	// not model itself, notably vp_formats_supported, which for a zkp_req
+	// presentation holds system_id_values / proof_system_values. Opaque to
+	// this package: its JSON value (every member, nested object and array)
+	// round-trips unchanged, though encoding/json compacts insignificant
+	// whitespace and re-escapes some characters when marshalling. It is
+	// omitted when the request had none. Peers that do not know the member ignore it.
+	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
 	// ResponseMode is the OID4VP response_mode of the request being answered.
 	// EC TS12 requires the key binding JWT of an SCA presentation to carry it.
 	// Empty for OID4VCI sign_proof.
