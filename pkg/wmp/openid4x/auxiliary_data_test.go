@@ -55,16 +55,19 @@ func TestSignSubFlowParams_AuxiliaryDataToIssuer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(b), "auxiliary_data_to_issuer") {
+	if strings.Contains(string(b), "auxiliary_data_to_issuer") || strings.Contains(string(b), "credential_type") || strings.Contains(string(b), "credential_issuer") {
 		t.Fatalf("absent field must be omitted: %s", b)
 	}
 
-	in := `{"action":"generate_proof","nonce":"n","audience":"a","parent_flow_id":"p","auxiliary_data_to_issuer":[` +
+	in := `{"action":"generate_proof","nonce":"n","audience":"a","parent_flow_id":"p","credential_type":"urn:v","credential_issuer":"https://i.example","auxiliary_data_to_issuer":[` +
 		`{"type":"hash_commitment","alg":"sha-256","path":["a","psc"],"required":true},` +
 		`{"type":"https://x.example/t","extra":{"k":[1,2]}}]}`
 	var p SignSubFlowParams
 	if err := json.Unmarshal([]byte(in), &p); err != nil {
 		t.Fatal(err)
+	}
+	if p.CredentialType != "urn:v" || p.CredentialIssuer != "https://i.example" {
+		t.Fatalf("credential_type/credential_issuer = %q/%q", p.CredentialType, p.CredentialIssuer)
 	}
 	if len(p.AuxiliaryDataToIssuer) != 2 {
 		t.Fatalf("entries = %d", len(p.AuxiliaryDataToIssuer))
@@ -75,9 +78,14 @@ func TestSignSubFlowParams_AuxiliaryDataToIssuer(t *testing.T) {
 	}
 	var back struct {
 		Entries []json.RawMessage `json:"auxiliary_data_to_issuer"`
+		Type    string            `json:"credential_type"`
+		Issuer  string            `json:"credential_issuer"`
 	}
 	if err := json.Unmarshal(out, &back); err != nil {
 		t.Fatal(err)
+	}
+	if back.Type != "urn:v" || back.Issuer != "https://i.example" {
+		t.Errorf("re-marshalled credential_type/credential_issuer = %q/%q", back.Type, back.Issuer)
 	}
 	want := []string{
 		`{"type":"hash_commitment","alg":"sha-256","path":["a","psc"],"required":true}`,

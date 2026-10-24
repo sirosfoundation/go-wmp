@@ -362,6 +362,14 @@ type SignSubFlowParams struct {
 	// Omitted when the issuer advertises none; peers that do not know the
 	// member ignore it.
 	AuxiliaryDataToIssuer []json.RawMessage `json:"auxiliary_data_to_issuer,omitempty"`
+	// CredentialType and CredentialIssuer, on a generate_proof sign request
+	// (always set when AuxiliaryDataToIssuer is non-empty): the wallet derives
+	// its per-issuer value for (CredentialType, CredentialIssuer).
+	// CredentialType is the credential configuration's vct, or its doctype for
+	// mdoc; CredentialIssuer is the exact credential_issuer string of the
+	// issuer metadata. Same names and meaning as the engine's SignRequestParams.
+	CredentialType   string `json:"credential_type,omitempty"`
+	CredentialIssuer string `json:"credential_issuer,omitempty"`
 	// JWE, on a decrypt_credential_response sign request, is the issuer's
 	// compact JWE (a Credential or Deferred Credential Response), relayed
 	// unread: only the client holds the key. Deferred is true when it answers

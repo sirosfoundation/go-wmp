@@ -267,7 +267,7 @@ func hasJSONValue(raw json.RawMessage) bool {
 // silently lost by an orchestrator that copies them.
 var engineBlindSignMembers = []string{
 	"credential_response_encryption", "jwe", "deferred", "response_encryption", "state",
-	"auxiliary_data_to_issuer",
+	"auxiliary_data_to_issuer", "credential_type", "credential_issuer",
 }
 
 // assertFlowMessage applies the flow-specific conformance checks to a single
