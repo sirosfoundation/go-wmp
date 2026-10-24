@@ -308,6 +308,7 @@ func TestValidateFlowCompleteEngineBlind(t *testing.T) {
 	}
 	for _, bad := range []string{
 		`{"credential_metadata":` + seed + `}`,
+		`{"credential_metadata":{"display":[],"auxiliary_data":[{"type":"hash_commitment","opening":"x"}]}}`,
 		`{"credential_response_encrypted":true,"credential_metadata":` + seed + `}`,
 		`{"credential_response_encrypted":true,"credential_metadata":{"display":[]}}`,
 		`{"credential_response_encrypted":true,"credentials":[{"credential":"x"}]}`,

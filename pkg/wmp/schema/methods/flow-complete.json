@@ -20,7 +20,7 @@
           "properties": {
             "credentials": { "type": "array", "items": { "type": "object", "properties": { "format": { "type": "string" }, "credential": { "type": "string" } } }, "description": "OpenID4VCI flows: the issued credentials. When credential_response_encrypted is true the entries carry no credential value." },
             "credential_response_encrypted": { "type": "boolean", "description": "OpenID4VCI flows: true when the issuer's response was encrypted to a key only the client holds and the server relayed it unread. credentials[] entries then carry no credential value and credential_metadata is absent; the client pairs credentials[i] with the i-th credential it decrypted." },
-            "credential_metadata": { "type": "object", "description": "OpenID4VCI flows: only for a plain (unencrypted) issuer response, the display-only members (display, claims) of its response-level credential_metadata. Never present when credential_response_encrypted is true; never carries org.siros.secret_seed." },
+            "credential_metadata": { "type": "object", "description": "OpenID4VCI flows: only for a plain (unencrypted) issuer response, the display-only members (display, claims) of its response-level credential_metadata. Never present when credential_response_encrypted is true; never carries org.siros.secret_seed or auxiliary_data (or any member an implementation configures as secret-bearing)." },
             "refresh_token": { "type": "string", "description": "OpenID4VCI flows: issuer refresh token. A secret; withheld from replayed completions." },
             "dpop_jwk": { "type": "string", "description": "OpenID4VCI flows: private JWK of the DPoP key the refresh token is bound to. A secret; withheld from replayed completions." },
             "dpop_key_id": { "type": "string", "description": "OpenID4VCI flows: identifier of the client-held DPoP key. Withheld from replayed completions." },
@@ -33,7 +33,7 @@
           },
           "allOf": [
             { "description": "A seed is never relayed in a completion; it travels only in an encrypted issuer response that the client decrypts itself.",
-              "not": { "required": ["credential_metadata"], "properties": { "credential_metadata": { "required": ["org.siros.secret_seed"] } } } },
+              "not": { "required": ["credential_metadata"], "properties": { "credential_metadata": { "anyOf": [ { "required": ["org.siros.secret_seed"] }, { "required": ["auxiliary_data"] } ] } } } },
             { "description": "A decrypt_credential_response result reports a transaction_id or a credential_count, never both.",
               "not": { "required": ["transaction_id", "credential_count"] } },
             { "description": "An interval belongs only to a deferred result: it requires transaction_id, and so (with the rule above) is never present with credential_count.",

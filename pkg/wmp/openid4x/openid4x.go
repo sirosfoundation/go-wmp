@@ -350,6 +350,18 @@ type SignSubFlowParams struct {
 	// which passes through as-is. Omitted when the issuer offers no response
 	// encryption; peers that do not know the member ignore it.
 	CredentialResponseEncryption *CredentialResponseEncryption `json:"credential_response_encryption,omitempty"`
+	// AuxiliaryDataToIssuer, on a generate_proof sign request, carries the
+	// issuer's advertised auxiliary_data_supported.to_issuer entries
+	// (OpenID4VCI Credential Auxiliary Data) verbatim: type, alg, path,
+	// required, and any other member the issuer published. Opaque to this
+	// package: each entry round-trips unchanged (encoding/json compacts
+	// insignificant whitespace). For every entry it recognises the client puts
+	// {type, alg, path, commitment} in the signed part of every key proof, the
+	// same value in all proofs of the request, and it MUST send each entry with
+	// required=true. The orchestrator never computes or sees a commitment.
+	// Omitted when the issuer advertises none; peers that do not know the
+	// member ignore it.
+	AuxiliaryDataToIssuer []json.RawMessage `json:"auxiliary_data_to_issuer,omitempty"`
 	// JWE, on a decrypt_credential_response sign request, is the issuer's
 	// compact JWE (a Credential or Deferred Credential Response), relayed
 	// unread: only the client holds the key. Deferred is true when it answers
