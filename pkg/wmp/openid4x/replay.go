@@ -26,38 +26,66 @@ const (
 // caller must then not retain it. The replay copy of a conforming input
 // satisfies ValidateCompletionResult.
 func SplitReplaySecrets(data []byte) (replay, live []byte, ok bool) {
-	// A JSON key may be spelled with escapes ("\u0072efresh_token"), so any
-	// escape forces a parse; redacted_members is looked for too, because a
-	// live completion never carries it.
-	mentioned := bytes.Contains(data, []byte(`\u`)) || bytes.Contains(data, []byte(`"`+redactedMembersKey+`"`))
-	for _, k := range replaySecretMembers {
-		if bytes.Contains(data, []byte(`"`+k+`"`)) {
-			mentioned = true
-			break
-		}
-	}
-	if !mentioned {
+	if !mayNeedRedaction(data) {
 		return data, nil, true
 	}
-	var env map[string]json.RawMessage
-	if json.Unmarshal(data, &env) != nil || env == nil {
+	env, isObj := unmarshalObject(data)
+	if !isObj {
 		return nil, nil, false
 	}
 	var method string
 	if json.Unmarshal(env["method"], &method) != nil || method != methodFlowComplete {
 		return data, nil, true
 	}
-	var params map[string]json.RawMessage
-	if json.Unmarshal(env["params"], &params) != nil || params == nil {
+	params, isObj := unmarshalObject(env["params"])
+	if !isObj {
 		return nil, nil, false
 	}
-	var result map[string]json.RawMessage
-	if json.Unmarshal(params["result"], &result) != nil || result == nil {
+	result, isObj := unmarshalObject(params["result"])
+	if !isObj {
 		return nil, nil, false
 	}
 	if _, has := result[redactedMembersKey]; has {
 		return nil, nil, false
 	}
+	withheld := withholdSecrets(result)
+	if len(withheld) == 0 {
+		return data, nil, true
+	}
+	replay, ok = reassemble(env, params, result, withheld)
+	if !ok {
+		return nil, nil, false
+	}
+	return replay, data, true
+}
+
+// mayNeedRedaction reports whether data could carry a secret member or a
+// redacted_members member. A JSON key may be spelled with escapes
+// ("\u0072efresh_token"), so any escape counts; redacted_members counts
+// because a live completion never carries it.
+func mayNeedRedaction(data []byte) bool {
+	if bytes.Contains(data, []byte(`\u`)) || bytes.Contains(data, []byte(`"`+redactedMembersKey+`"`)) {
+		return true
+	}
+	for _, k := range replaySecretMembers {
+		if bytes.Contains(data, []byte(`"`+k+`"`)) {
+			return true
+		}
+	}
+	return false
+}
+
+func unmarshalObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil || m == nil {
+		return nil, false
+	}
+	return m, true
+}
+
+// withholdSecrets deletes the replay secret members from result and returns
+// their names, sorted.
+func withholdSecrets(result map[string]json.RawMessage) []string {
 	var withheld []string // replaySecretMembers is sorted
 	for _, k := range replaySecretMembers {
 		if _, has := result[k]; has {
@@ -65,21 +93,20 @@ func SplitReplaySecrets(data []byte) (replay, live []byte, ok bool) {
 			delete(result, k)
 		}
 	}
-	if len(withheld) == 0 {
-		return data, nil, true
-	}
+	return withheld
+}
+
+func reassemble(env, params, result map[string]json.RawMessage, withheld []string) ([]byte, bool) {
 	var err error
 	if result[redactedMembersKey], err = json.Marshal(withheld); err != nil {
-		return nil, nil, false
+		return nil, false
 	}
 	if params["result"], err = json.Marshal(result); err != nil {
-		return nil, nil, false
+		return nil, false
 	}
 	if env["params"], err = json.Marshal(params); err != nil {
-		return nil, nil, false
+		return nil, false
 	}
-	if replay, err = json.Marshal(env); err != nil {
-		return nil, nil, false
-	}
-	return replay, data, true
+	out, err := json.Marshal(env)
+	return out, err == nil
 }
