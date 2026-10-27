@@ -150,9 +150,11 @@ type SessionResumer interface {
 }
 
 // SessionExpirer is an optional interface for SessionServiceConfig.
-// ExpireHooks. OnSessionExpire runs once for each session the service
-// discovers to be expired (on a resume attempt or in Sweep), just before it
-// is deleted.
+// ExpireHooks. OnSessionExpire runs once for each session the service expires
+// (on a resume attempt, or in Sweep when the store implements
+// ExpiredSessionLister), AFTER the record has been deleted: the session passed
+// in is the last copy, and the store no longer has it. Sweep on a store
+// without ExpiredSessionLister only calls Cleanup and runs no hooks.
 type SessionExpirer interface {
 	OnSessionExpire(ctx context.Context, session *Session)
 }
