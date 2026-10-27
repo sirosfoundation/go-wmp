@@ -66,6 +66,18 @@ func WithProfile(profile Profile) PeerOption {
 	}
 }
 
+// WithSessionIdentity makes every outbound Notify and Call (including the
+// messages sent by FlowContext) carry the "wmp" metadata object: the
+// negotiated protocol version, sessionID and sender (core section 2.2.3
+// requires wmp.version on all messages). Metadata the caller already set is
+// never overwritten; only empty version, session_id and sender members are
+// filled. Empty sessionID or sender arguments are simply not stamped.
+func WithSessionIdentity(sessionID, sender string) PeerOption {
+	return func(p *Peer) { p.identity = &sessionIdentity{sessionID: sessionID, sender: sender} }
+}
+
+type sessionIdentity struct{ sessionID, sender string }
+
 // Peer represents one side of a WMP connection. It handles incoming messages
 // by dispatching to a Handler, and provides methods to send outgoing messages.
 type Peer struct {
@@ -77,6 +89,8 @@ type Peer struct {
 	maxMessageSize int
 	validator      Validator
 	authorizer     Authorizer
+	identity       *sessionIdentity // nil: outbound messages are not stamped
+	negotiated     atomic.Value     // string: version selected by the last create/resume
 
 	mu      sync.Mutex
 	pending map[string]chan *Response // keyed by request ID
@@ -302,29 +316,45 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		// Version negotiation: reject unsupported versions.
-		if !IsSupportedVersion(ps.WMP.Version) {
-			return nil, NewRPCError(ErrVersionNotSupported, map[string]interface{}{
-				"supported_versions": SupportedVersions,
-			})
+		// Version negotiation (core section 2.2.2): highest supported
+		// version that is not above the offered one, same MAJOR.
+		selected, vErr := negotiateOrReject(ps.WMP.Version)
+		if vErr != nil {
+			return nil, vErr
 		}
 		result, err := p.handler.SessionCreate(ctx, &ps)
 		if err != nil {
 			return nil, err
 		}
+		if result != nil {
+			if result.WMP.Version == "" {
+				result.WMP.Version = selected
+			}
+			p.negotiated.Store(result.WMP.Version)
+		}
 		// Run session create hooks if we have a session store.
 		if result != nil && p.sessions != nil && result.WMP.SessionID != "" {
-			sess := &Session{
-				ID:              result.WMP.SessionID,
-				Participants:    ps.Participants,
-				Capabilities:    result.Capabilities,
-				Security:        result.Security,
-				ResumptionToken: result.ResumptionToken,
+			// A handler that owns the session lifecycle (SessionService)
+			// has already stored the session with its owner and token
+			// expiry; never replace that record with a bare copy.
+			sess, existing := p.sessions.Get(result.WMP.SessionID)
+			if !existing {
+				sess = &Session{
+					ID:              result.WMP.SessionID,
+					Participants:    ps.Participants,
+					Capabilities:    result.Capabilities,
+					Security:        result.Security,
+					ResumptionToken: result.ResumptionToken,
+				}
 			}
 			if hookErr := p.registry.runSessionCreateHooks(ctx, sess, &ps); hookErr != nil {
 				return nil, toRPCError(hookErr)
 			}
-			_ = p.sessions.Create(sess)
+			if existing {
+				_ = p.sessions.Update(sess)
+			} else {
+				_ = p.sessions.Create(sess)
+			}
 		}
 		return result, nil
 
@@ -333,12 +363,31 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		if !IsSupportedVersion(ps.WMP.Version) {
-			return nil, NewRPCError(ErrVersionNotSupported, map[string]interface{}{
-				"supported_versions": SupportedVersions,
-			})
+		selected, vErr := negotiateOrReject(ps.WMP.Version)
+		if vErr != nil {
+			return nil, vErr
 		}
-		return p.handler.SessionResume(ctx, &ps)
+		result, err := p.handler.SessionResume(ctx, &ps)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil {
+			if result.WMP.Version == "" {
+				result.WMP.Version = selected
+			}
+			p.negotiated.Store(result.WMP.Version)
+			if p.sessions != nil && result.Resumed {
+				if sess, ok := p.sessions.Get(ps.SessionID); ok {
+					// The token has already been rotated: a rejecting hook
+					// ends this session's resumability, so the client
+					// creates a new session (core section 4.5.4).
+					if hookErr := p.registry.runSessionResumeHooks(ctx, sess, &ps); hookErr != nil {
+						return nil, toRPCError(hookErr)
+					}
+				}
+			}
+		}
+		return result, nil
 
 	case MethodSessionClose:
 		var ps SessionCloseParams
@@ -519,6 +568,10 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 
 // Notify sends a JSON-RPC 2.0 notification (no response expected).
 func (p *Peer) Notify(ctx context.Context, method string, params interface{}) error {
+	params, err := p.stamp(params)
+	if err != nil {
+		return err
+	}
 	req, err := NewNotification(method, params)
 	if err != nil {
 		return err
@@ -530,6 +583,10 @@ func (p *Peer) Notify(ctx context.Context, method string, params interface{}) er
 // The result is unmarshalled into the provided result pointer.
 func (p *Peer) Call(ctx context.Context, method string, params interface{}, result interface{}) error {
 	id, err := generateRequestID()
+	if err != nil {
+		return err
+	}
+	params, err = p.stamp(params)
 	if err != nil {
 		return err
 	}
@@ -681,6 +738,56 @@ func toRPCError(err error) *RPCError {
 		return rpcErr
 	}
 	return NewRPCError(ErrInternalError, nil)
+}
+
+// negotiateOrReject selects a version against SupportedVersions or returns
+// the -31013 error carrying supported_versions.
+func negotiateOrReject(offered string) (string, *RPCError) {
+	selected, ok := NegotiateVersion(offered, SupportedVersions)
+	if !ok {
+		return "", NewRPCError(ErrVersionNotSupported, map[string]interface{}{
+			"supported_versions": SupportedVersions,
+		})
+	}
+	return selected, nil
+}
+
+// stamp adds the session identity (WithSessionIdentity) to the "wmp" object
+// of outbound params. Params that are not a JSON object are returned as is.
+func (p *Peer) stamp(params interface{}) (interface{}, error) {
+	if p.identity == nil || params == nil {
+		return params, nil
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("marshal params: %w", err)
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil || obj == nil {
+		return params, nil
+	}
+	var meta Metadata
+	if m, ok := obj["wmp"]; ok {
+		if err := json.Unmarshal(m, &meta); err != nil {
+			return nil, fmt.Errorf("outbound wmp metadata: %w", err)
+		}
+	}
+	if meta.Version == "" {
+		meta.Version = Version
+		if v, ok := p.negotiated.Load().(string); ok && v != "" {
+			meta.Version = v
+		}
+	}
+	if meta.SessionID == "" {
+		meta.SessionID = p.identity.sessionID
+	}
+	if meta.Sender == "" {
+		meta.Sender = p.identity.sender
+	}
+	if obj["wmp"], err = json.Marshal(meta); err != nil {
+		return nil, fmt.Errorf("marshal wmp metadata: %w", err)
+	}
+	return obj, nil
 }
 
 // IsSupportedVersion returns true if the given version is in SupportedVersions.

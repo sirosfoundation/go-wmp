@@ -206,3 +206,18 @@ func (s *MemorySessionStore) RotateResumptionToken(id, oldToken, newToken string
 	s.sessions[id] = &updated
 	return &updated, nil
 }
+
+var _ ExpiredSessionLister = (*MemorySessionStore)(nil)
+
+// ListExpired implements ExpiredSessionLister.
+func (s *MemorySessionStore) ListExpired() ([]*Session, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*Session
+	for _, sess := range s.sessions {
+		if sess.IsExpired() {
+			result = append(result, sess)
+		}
+	}
+	return result, nil
+}
