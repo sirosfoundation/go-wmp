@@ -10,7 +10,7 @@ import (
 const testJWE = "eyJhbGciOiJFQ0RILUVTIn0..aXY.Y2lwaGVydGV4dA.dGFn"
 
 func TestValidateCompletionResult(t *testing.T) {
-	seed := `{"` + SecretSeedMember + `":{"nym":"00112233445566778899aabbccddeeff"}}`
+	aux := `{"` + AuxiliaryDataMember + `":[{"type":"hash_commitment","opening":"00112233445566778899aabbccddeeff"}]}`
 	tests := []struct {
 		name   string
 		result string
@@ -26,8 +26,8 @@ func TestValidateCompletionResult(t *testing.T) {
 		{"decrypt deferred", `{"transaction_id":"tx","interval":5}`, true},
 		{"response_jwe", `{"response_jwe":"` + testJWE + `"}`, true},
 
-		{"seed in plain completion", `{"credential_metadata":` + seed + `}`, false},
-		{"seed in encrypted completion", `{"credential_response_encrypted":true,"credential_metadata":` + seed + `}`, false},
+		{"auxiliary_data in plain completion", `{"credential_metadata":` + aux + `}`, false},
+		{"auxiliary_data in encrypted completion", `{"credential_response_encrypted":true,"credential_metadata":` + aux + `}`, false},
 		{"display metadata in encrypted completion", `{"credential_response_encrypted":true,"credential_metadata":{"display":[]}}`, false},
 		{"credential value in encrypted completion", `{"credential_response_encrypted":true,"credentials":[{"credential":"x"}]}`, false},
 		{"encrypted flag not boolean", `{"credential_response_encrypted":"true"}`, false},
@@ -101,11 +101,11 @@ func TestValidateCompletionResult_JWETooLong(t *testing.T) {
 	}
 }
 
-// The error never quotes a value of the result: a seed must not reach a log.
+// The error never quotes a value of the result: a secret must not reach a log.
 func TestValidateCompletionResult_ErrorDoesNotLeakValues(t *testing.T) {
 	const secret = "00112233445566778899aabbccddeeff"
 	for _, raw := range []string{
-		`{"credential_metadata":{"` + SecretSeedMember + `":{"nym":"` + secret + `"}}}`,
+		`{"credential_metadata":{"` + AuxiliaryDataMember + `":[{"opening":"` + secret + `"}]}}`,
 		`{"redacted_members":["` + secret + `"]}`,
 		`{"redacted_members":["dpop_jwk","dpop_jwk","` + secret + `"]}`,
 		`{"transaction_id":"` + secret + `","credential_count":1}`,

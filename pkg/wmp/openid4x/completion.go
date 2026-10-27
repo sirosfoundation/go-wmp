@@ -17,19 +17,12 @@ const (
 	// MaxResponseJWELen bounds a response_jwe the orchestrator relays.
 	MaxResponseJWELen = 4 << 20
 
-	// SecretSeedMember is the legacy credential_metadata member that carries a
-	// delivered secret seed. It is never relayed in a completion.
-	SecretSeedMember = "org.siros.secret_seed"
 	// AuxiliaryDataMember is the credential_metadata member of OpenID4VCI
 	// Credential Auxiliary Data (draft v0.1): entries such as a hash_commitment
-	// opening, which is a Secret Value. It is never relayed in a completion.
+	// opening, which is a Secret Value. It is the only secret-bearing
+	// credential_metadata member and is never relayed in a completion.
 	AuxiliaryDataMember = "auxiliary_data"
 )
-
-// DefaultSecretMembers are the credential_metadata members
-// ValidateCompletionResult treats as secret-bearing. A deployment that moves to
-// another member name uses ValidateCompletionResultWithMembers.
-var DefaultSecretMembers = []string{SecretSeedMember, AuxiliaryDataMember}
 
 // ReplaySecretMembers are the only result members a replayed wmp.flow.complete
 // withholds, and the only names a result's redacted_members may list (WMP
@@ -68,9 +61,8 @@ func resultErr(format string, args ...any) error {
 //
 // The rules:
 //   - credential_metadata is an object and never carries a secret-bearing
-//     member (by default org.siros.secret_seed or auxiliary_data; a secret
-//     travels only inside an encrypted issuer response that the client
-//     decrypts itself);
+//     member (auxiliary_data; a secret travels only inside an encrypted
+//     issuer response that the client decrypts itself);
 //   - credential_response_encrypted is a boolean; when true there is no
 //     credential_metadata and no credentials[].credential value;
 //   - redacted_members lists only dpop_jwk, dpop_key_id and refresh_token;
@@ -83,17 +75,6 @@ func resultErr(format string, args ...any) error {
 //
 // Members it does not know are ignored (Core Section 9.5).
 func ValidateCompletionResult(result json.RawMessage) error {
-	return ValidateCompletionResultWithMembers(result, DefaultSecretMembers)
-}
-
-// ValidateCompletionResultWithMembers is ValidateCompletionResult with the set
-// of secret-bearing credential_metadata member names given by the caller (the
-// engine's issuance.secret_members). An empty set means DefaultSecretMembers:
-// the check never silently weakens to "no secret members".
-func ValidateCompletionResultWithMembers(result json.RawMessage, secretMembers []string) error {
-	if len(secretMembers) == 0 {
-		secretMembers = DefaultSecretMembers
-	}
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(result, &m); err != nil || m == nil {
 		return resultErr("result is not an object")
@@ -103,7 +84,7 @@ func ValidateCompletionResultWithMembers(result json.RawMessage, secretMembers [
 	if err != nil {
 		return err
 	}
-	if err := validateCredentialMetadata(m, encrypted, secretMembers); err != nil {
+	if err := validateCredentialMetadata(m, encrypted); err != nil {
 		return err
 	}
 	if encrypted {
@@ -132,7 +113,7 @@ func validateEncryptedFlag(m map[string]json.RawMessage) (bool, error) {
 	return *b, nil
 }
 
-func validateCredentialMetadata(m map[string]json.RawMessage, encrypted bool, secretMembers []string) error {
+func validateCredentialMetadata(m map[string]json.RawMessage, encrypted bool) error {
 	raw, ok := m["credential_metadata"]
 	if !ok {
 		return nil
@@ -141,10 +122,8 @@ func validateCredentialMetadata(m map[string]json.RawMessage, encrypted bool, se
 	if err := json.Unmarshal(raw, &meta); err != nil || meta == nil {
 		return resultErr("credential_metadata is not an object")
 	}
-	for _, member := range secretMembers {
-		if _, secret := meta[member]; secret {
-			return resultErr("credential_metadata carries %s, which is never relayed", member)
-		}
+	if _, secret := meta[AuxiliaryDataMember]; secret {
+		return resultErr("credential_metadata carries %s, which is never relayed", AuxiliaryDataMember)
 	}
 	if encrypted {
 		return resultErr("credential_metadata present although credential_response_encrypted is true")
