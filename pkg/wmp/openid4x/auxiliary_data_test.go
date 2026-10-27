@@ -23,29 +23,13 @@ func TestValidateCompletionResult_AuxiliaryDataIsSecret(t *testing.T) {
 	}
 }
 
-func TestValidateCompletionResultWithMembers_ConfiguredSet(t *testing.T) {
-	raw := json.RawMessage(`{"credential_metadata":{"x.secret":"S","display":[]}}`)
+// auxiliary_data is the only secret-bearing member: any other (including the
+// removed legacy org.siros.secret_seed) is an unknown member and is ignored
+// (Core Section 9.5).
+func TestValidateCompletionResult_OnlyAuxiliaryDataIsSecret(t *testing.T) {
+	raw := json.RawMessage(`{"credential_metadata":{"org.siros.secret_seed":{"n":"S"},"x.secret":"S","display":[]}}`)
 	if err := ValidateCompletionResult(raw); err != nil {
-		t.Fatalf("an unconfigured member is not secret by default: %v", err)
-	}
-	if err := ValidateCompletionResultWithMembers(raw, []string{"x.secret"}); err == nil {
-		t.Fatal("a configured member must be refused")
-	}
-	// The configured set replaces the defaults ...
-	legacy := json.RawMessage(`{"credential_metadata":{"` + SecretSeedMember + `":{"n":"S"}}}`)
-	if err := ValidateCompletionResultWithMembers(legacy, []string{"x.secret"}); err != nil {
-		t.Fatalf("a member outside the configured set is not special: %v", err)
-	}
-	// ... but an empty set never weakens the check.
-	if err := ValidateCompletionResultWithMembers(legacy, nil); err == nil {
-		t.Fatal("an empty set must fall back to the defaults")
-	}
-	if err := ValidateCompletionResultWithMembers(legacy, []string{}); err == nil {
-		t.Fatal("an empty set must fall back to the defaults")
-	}
-	// Every other rule still applies.
-	if err := ValidateCompletionResultWithMembers(json.RawMessage(`{"credential_response_encrypted":true,"credential_metadata":{}}`), []string{"x.secret"}); err == nil {
-		t.Fatal("credential_metadata with an encrypted response must still be refused")
+		t.Fatalf("a member other than auxiliary_data is not secret: %v", err)
 	}
 }
 

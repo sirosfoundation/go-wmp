@@ -294,7 +294,7 @@ func TestValidateFlowCompleteEngineBlind(t *testing.T) {
 	complete := func(result string) []byte {
 		return []byte(`{"jsonrpc":"2.0","method":"wmp.flow.complete","params":{"wmp":{"version":"0.1"},"flow_id":"f1","result":` + result + `}}`)
 	}
-	seed := `{"org.siros.secret_seed":{"nym":"00112233445566778899aabbccddeeff"}}`
+	aux := `{"auxiliary_data":[{"type":"hash_commitment","opening":"00112233445566778899aabbccddeeff"}]}`
 	for _, ok := range []string{
 		`{"credentials":[{"format":"mso_mdoc"}],"credential_response_encrypted":true,"refresh_token":"rt"}`,
 		`{"credentials":[{"format":"mso_mdoc","credential":"x"}],"credential_metadata":{"display":[]}}`,
@@ -307,9 +307,9 @@ func TestValidateFlowCompleteEngineBlind(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{
-		`{"credential_metadata":` + seed + `}`,
+		`{"credential_metadata":` + aux + `}`,
 		`{"credential_metadata":{"display":[],"auxiliary_data":[{"type":"hash_commitment","opening":"x"}]}}`,
-		`{"credential_response_encrypted":true,"credential_metadata":` + seed + `}`,
+		`{"credential_response_encrypted":true,"credential_metadata":` + aux + `}`,
 		`{"credential_response_encrypted":true,"credential_metadata":{"display":[]}}`,
 		`{"credential_response_encrypted":true,"credentials":[{"credential":"x"}]}`,
 		`{"redacted_members":["credential_metadata"]}`,
