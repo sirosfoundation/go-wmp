@@ -47,6 +47,21 @@ type SessionCreateResult struct {
 	ResumptionToken string       `json:"resumption_token,omitempty"`
 }
 
+// MarshalJSON always emits "capabilities" (as {} when nothing was negotiated):
+// session-create-response.json requires it, and omitempty would drop an empty
+// map.
+func (r SessionCreateResult) MarshalJSON() ([]byte, error) {
+	type plain SessionCreateResult
+	out := struct {
+		plain
+		Capabilities Capabilities `json:"capabilities"`
+	}{plain: plain(r), Capabilities: r.Capabilities}
+	if out.Capabilities == nil {
+		out.Capabilities = Capabilities{}
+	}
+	return json.Marshal(out)
+}
+
 // SessionResumeParams are the params for wmp.session.resume.
 type SessionResumeParams struct {
 	WMP             Metadata `json:"wmp"`

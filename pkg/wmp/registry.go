@@ -18,6 +18,7 @@ type registry struct {
 	idResolvers  []IdentifierResolver      // ordered list of identifier resolvers
 	middleware   []Middleware
 	sessionHooks []SessionHook
+	resumeHooks  []SessionResumer
 
 	// flowOwners tracks which FlowHandler owns each active flow_id.
 	flowOwners map[string]FlowHandler
@@ -68,6 +69,10 @@ func (r *registry) register(p Profile) error {
 
 	if sh, ok := p.(SessionHook); ok {
 		r.sessionHooks = append(r.sessionHooks, sh)
+	}
+
+	if rh, ok := p.(SessionResumer); ok {
+		r.resumeHooks = append(r.resumeHooks, rh)
 	}
 
 	if ir, ok := p.(IdentifierResolver); ok {
@@ -164,6 +169,29 @@ func (r *registry) runSessionCreateHooks(ctx context.Context, session *Session, 
 
 	for _, h := range hooks {
 		if err := h.OnSessionCreate(ctx, session, params); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hasResumers reports whether any resume hook is registered.
+func (r *registry) hasResumers() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.resumeHooks) > 0
+}
+
+// runSessionResumers calls all registered resume hooks, stopping at the
+// first error.
+func (r *registry) runSessionResumers(ctx context.Context, session *Session, params *SessionResumeParams) error {
+	r.mu.RLock()
+	hooks := make([]SessionResumer, len(r.resumeHooks))
+	copy(hooks, r.resumeHooks)
+	r.mu.RUnlock()
+
+	for _, h := range hooks {
+		if err := h.OnSessionResume(ctx, session, params); err != nil {
 			return err
 		}
 	}

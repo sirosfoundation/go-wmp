@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -66,6 +67,18 @@ func WithProfile(profile Profile) PeerOption {
 	}
 }
 
+// WithSessionIdentity makes every outbound Notify and Call (including the
+// messages sent by FlowContext) carry the "wmp" metadata object: the
+// negotiated protocol version, sessionID and sender (core section 2.2.3
+// requires wmp.version on all messages). Metadata the caller already set is
+// never overwritten; only empty version, session_id and sender members are
+// filled. Empty sessionID or sender arguments are simply not stamped.
+func WithSessionIdentity(sessionID, sender string) PeerOption {
+	return func(p *Peer) { p.identity = &sessionIdentity{sessionID: sessionID, sender: sender} }
+}
+
+type sessionIdentity struct{ sessionID, sender string }
+
 // Peer represents one side of a WMP connection. It handles incoming messages
 // by dispatching to a Handler, and provides methods to send outgoing messages.
 type Peer struct {
@@ -77,6 +90,8 @@ type Peer struct {
 	maxMessageSize int
 	validator      Validator
 	authorizer     Authorizer
+	identity       *sessionIdentity // nil: outbound messages are not stamped
+	versions       versionCache     // fallback per-session versions (see versionFor)
 	orchestrator   *OrchestratorMessageOptions
 
 	mu      sync.Mutex
@@ -133,12 +148,32 @@ func (p *Peer) SetSessionStore(store SessionStore) {
 	p.sessions = store
 }
 
+// SessionStoreProvider is implemented by handlers that own a SessionStore
+// (SessionHandler). A Peer without WithSessionStore uses it, so the session
+// lookups behind capability gating, create/resume hooks and per-session
+// versions work with the store the handler actually writes to.
+type SessionStoreProvider interface {
+	SessionStore() SessionStore
+}
+
+// store returns the session store: the WithSessionStore one, else the
+// handler's, else nil.
+func (p *Peer) store() SessionStore {
+	if p.sessions != nil {
+		return p.sessions
+	}
+	if sp, ok := p.handler.(SessionStoreProvider); ok {
+		return sp.SessionStore()
+	}
+	return nil
+}
+
 // Session returns the session for the given ID, or nil. Implements PeerContext.
 func (p *Peer) Session(id string) *Session {
-	if p.sessions == nil {
+	if p.store() == nil {
 		return nil
 	}
-	s, _ := p.sessions.Get(id)
+	s, _ := p.store().Get(id)
 	return s
 }
 
@@ -162,35 +197,41 @@ func (p *Peer) Serve(ctx context.Context) error {
 			return fmt.Errorf("read: %w", err)
 		}
 
-		// Enforce message size limit.
-		if len(data) > p.maxMessageSize {
-			p.logger.Warn("message exceeds size limit", "size", len(data), "max", p.maxMessageSize)
-			resp := NewErrorResponse(nil, NewRPCError(ErrInvalidRequest, map[string]string{
-				"reason": "message too large",
-			}))
-			p.sendJSON(ctx, resp)
-			continue
-		}
-
-		// Try batch first.
-		decOpts := &DecodeOptions{MaxSize: p.maxMessageSize, MaxDepth: defaultMaxDepth}
-		if msgs, err := DecodeBatch(data, decOpts); err == nil && msgs != nil {
-			for _, msg := range msgs {
-				p.dispatch(ctx, msg)
-			}
-			continue
-		}
-
-		msg, err := DecodeMessage(data, decOpts)
-		if err != nil {
-			// Send parse error for requests; ignore malformed messages.
-			resp := NewErrorResponse(nil, NewRPCError(ErrParseError, nil))
-			p.sendJSON(ctx, resp)
-			continue
-		}
-
-		p.dispatch(ctx, msg)
+		p.handleInbound(ctx, data)
 	}
+}
+
+// handleInbound processes one raw transport message: size limit, batch,
+// single message, or a parse error response.
+func (p *Peer) handleInbound(ctx context.Context, data []byte) {
+	// Enforce message size limit.
+	if len(data) > p.maxMessageSize {
+		p.logger.Warn("message exceeds size limit", "size", len(data), "max", p.maxMessageSize)
+		resp := NewErrorResponse(nil, NewRPCError(ErrInvalidRequest, map[string]string{
+			"reason": "message too large",
+		}))
+		p.sendJSON(ctx, resp)
+		return
+	}
+
+	// Try batch first.
+	decOpts := &DecodeOptions{MaxSize: p.maxMessageSize, MaxDepth: defaultMaxDepth}
+	if msgs, err := DecodeBatch(data, decOpts); err == nil && msgs != nil {
+		for _, msg := range msgs {
+			p.dispatch(ctx, msg)
+		}
+		return
+	}
+
+	msg, err := DecodeMessage(data, decOpts)
+	if err != nil {
+		// Send parse error for requests; ignore malformed messages.
+		resp := NewErrorResponse(nil, NewRPCError(ErrParseError, nil))
+		p.sendJSON(ctx, resp)
+		return
+	}
+
+	p.dispatch(ctx, msg)
 }
 
 func (p *Peer) dispatch(ctx context.Context, msg *Message) {
@@ -258,8 +299,8 @@ func (p *Peer) handleRequest(ctx context.Context, req *Request) {
 		if meta.WMP.Sender != "" {
 			ctx = ContextWithSender(ctx, meta.WMP.Sender)
 		}
-		if meta.WMP.SessionID != "" && p.sessions != nil {
-			if sess, ok := p.sessions.Get(meta.WMP.SessionID); ok {
+		if meta.WMP.SessionID != "" && p.store() != nil {
+			if sess, ok := p.store().Get(meta.WMP.SessionID); ok {
 				ctx = ContextWithSession(ctx, sess)
 			}
 		}
@@ -303,43 +344,14 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		// Version negotiation: reject unsupported versions.
-		if !IsSupportedVersion(ps.WMP.Version) {
-			return nil, NewRPCError(ErrVersionNotSupported, map[string]interface{}{
-				"supported_versions": SupportedVersions,
-			})
-		}
-		result, err := p.handler.SessionCreate(ctx, &ps)
-		if err != nil {
-			return nil, err
-		}
-		// Run session create hooks if we have a session store.
-		if result != nil && p.sessions != nil && result.WMP.SessionID != "" {
-			sess := &Session{
-				ID:              result.WMP.SessionID,
-				Participants:    ps.Participants,
-				Capabilities:    result.Capabilities,
-				Security:        result.Security,
-				ResumptionToken: result.ResumptionToken,
-			}
-			if hookErr := p.registry.runSessionCreateHooks(ctx, sess, &ps); hookErr != nil {
-				return nil, toRPCError(hookErr)
-			}
-			_ = p.sessions.Create(sess)
-		}
-		return result, nil
+		return p.dispatchSessionCreate(ctx, &ps)
 
 	case MethodSessionResume:
 		var ps SessionResumeParams
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		if !IsSupportedVersion(ps.WMP.Version) {
-			return nil, NewRPCError(ErrVersionNotSupported, map[string]interface{}{
-				"supported_versions": SupportedVersions,
-			})
-		}
-		return p.handler.SessionResume(ctx, &ps)
+		return p.dispatchSessionResume(ctx, &ps)
 
 	case MethodSessionClose:
 		var ps SessionCloseParams
@@ -347,6 +359,7 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
 		p.handler.SessionClose(ctx, &ps)
+		p.forgetVersion(ps.WMP.SessionID)
 		return nil, nil
 
 	case MethodSessionAuthenticate:
@@ -540,17 +553,43 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 
 // Notify sends a JSON-RPC 2.0 notification (no response expected).
 func (p *Peer) Notify(ctx context.Context, method string, params interface{}) error {
+	params, err := p.stamp(method, params)
+	if err != nil {
+		return err
+	}
 	req, err := NewNotification(method, params)
 	if err != nil {
 		return err
 	}
-	return p.sendJSON(ctx, req)
+	err = p.sendJSON(ctx, req)
+	if err == nil && method == MethodSessionClose {
+		p.forgetVersion(stringMember(metaOf(params), "session_id"))
+	}
+	return err
+}
+
+// metaOf returns the "wmp" members of outbound params, or nil.
+func metaOf(params interface{}) map[string]json.RawMessage {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil
+	}
+	var obj map[string]json.RawMessage
+	var meta map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil || json.Unmarshal(obj["wmp"], &meta) != nil {
+		return nil
+	}
+	return meta
 }
 
 // Call sends a JSON-RPC 2.0 request and waits for the response.
 // The result is unmarshalled into the provided result pointer.
 func (p *Peer) Call(ctx context.Context, method string, params interface{}, result interface{}) error {
 	id, err := generateRequestID()
+	if err != nil {
+		return err
+	}
+	params, err = p.stamp(method, params)
 	if err != nil {
 		return err
 	}
@@ -581,11 +620,28 @@ func (p *Peer) Call(ctx context.Context, method string, params interface{}, resu
 		if resp.Error != nil {
 			return resp.Error
 		}
+		if resp.Result != nil && (method == MethodSessionCreate || method == MethodSessionResume) {
+			p.recordNegotiatedVersion(method, resp.Result)
+		}
 		if result != nil && resp.Result != nil {
 			return json.Unmarshal(resp.Result, result)
 		}
 		return nil
 	}
+}
+
+// recordNegotiatedVersion remembers the version the remote side selected in a
+// session.create/resume result, whatever Go type the caller decodes it into.
+// A resume result that does not say resumed:true selected nothing.
+func (p *Peer) recordNegotiatedVersion(method string, raw json.RawMessage) {
+	var r struct {
+		WMP     Metadata `json:"wmp"`
+		Resumed bool     `json:"resumed"`
+	}
+	if json.Unmarshal(raw, &r) != nil || (method == MethodSessionResume && !r.Resumed) {
+		return
+	}
+	p.recordVersion(r.WMP.SessionID, r.WMP.Version)
 }
 
 // HandleRequestSync dispatches a single JSON-RPC request synchronously and
@@ -640,8 +696,8 @@ func (p *Peer) HandleRequestSync(ctx context.Context, data []byte) ([]byte, erro
 		if meta.WMP.Sender != "" {
 			ctx = ContextWithSender(ctx, meta.WMP.Sender)
 		}
-		if meta.WMP.SessionID != "" && p.sessions != nil {
-			if sess, ok := p.sessions.Get(meta.WMP.SessionID); ok {
+		if meta.WMP.SessionID != "" && p.store() != nil {
+			if sess, ok := p.store().Get(meta.WMP.SessionID); ok {
 				ctx = ContextWithSession(ctx, sess)
 			}
 		}
@@ -702,6 +758,389 @@ func toRPCError(err error) *RPCError {
 		return rpcErr
 	}
 	return NewRPCError(ErrInternalError, nil)
+}
+
+// dispatchSessionCreate negotiates the version, calls the handler, runs the
+// create hooks and only then commits the negotiated version for the session.
+func (p *Peer) dispatchSessionCreate(ctx context.Context, ps *SessionCreateParams) (*SessionCreateResult, error) {
+	// Version negotiation (core section 2.2.2): highest supported version
+	// that is not above the offered one, same MAJOR.
+	selected, vErr := negotiateOrReject(ps.WMP.Version)
+	if vErr != nil {
+		return nil, vErr
+	}
+	result, err := p.handler.SessionCreate(ctx, ps)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if result.WMP.Version == "" {
+		result.WMP.Version = selected
+	}
+	// Run session create hooks if we have a session store.
+	if p.store() != nil && result.WMP.SessionID != "" {
+		if err := p.runCreateHooks(ctx, ps, result); err != nil {
+			return nil, err
+		}
+	}
+	p.recordVersion(result.WMP.SessionID, result.WMP.Version)
+	return result, nil
+}
+
+func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, result *SessionCreateResult) error {
+	// A handler that owns the session lifecycle (SessionService) has already
+	// stored the session with its owner and token expiry; never replace that
+	// record with a bare copy.
+	sess, existing := p.store().Get(result.WMP.SessionID)
+	if _, owns := p.handler.(SessionStoreProvider); owns && !existing {
+		// The handler persists its own sessions and the record is gone (it
+		// expired and was swept meanwhile). Recreating a bare copy would
+		// lose owner and expiry.
+		return NewRPCError(ErrSessionExpired, nil)
+	}
+	if !existing {
+		sess = &Session{
+			ID:              result.WMP.SessionID,
+			Participants:    ps.Participants,
+			Capabilities:    result.Capabilities,
+			Security:        result.Security,
+			ResumptionToken: result.ResumptionToken,
+			Metadata:        map[string]string{MetadataKeyVersion: result.WMP.Version},
+		}
+	}
+	// Hooks work on a private copy: the store may hand out its live record,
+	// which lifecycle code (Sweep) reads under the store's own lock.
+	sess = cloneSession(sess)
+	if hookErr := p.registry.runSessionCreateHooks(ctx, sess, ps); hookErr != nil {
+		if existing {
+			// The client never learns this session's ID or token: do not
+			// leave the handler-created record behind.
+			_ = p.store().Delete(sess.ID)
+		}
+		return toRPCError(hookErr)
+	}
+	var err error
+	if existing {
+		err = updateIfPresent(p.store(), sess)
+	} else {
+		err = p.store().Create(sess)
+	}
+	if errors.Is(err, ErrNoSuchSession) {
+		// The session was removed (expired and swept) while the hooks ran:
+		// writing it back would resurrect it.
+		return NewRPCError(ErrSessionExpired, nil)
+	}
+	if err != nil {
+		// The hook's changes (or the record itself) were not persisted and
+		// the client would hold a session the server cannot honour.
+		_ = p.store().Delete(sess.ID)
+		return NewRPCError(ErrInternalError, nil)
+	}
+	// What was persisted is what the client is told.
+	result.Capabilities = sess.Capabilities
+	result.Security = sess.Security
+	result.ResumptionToken = sess.ResumptionToken
+	return nil
+}
+
+// cloneSession deep-copies the mutable parts of a session.
+func cloneSession(s *Session) *Session {
+	c := *s
+	c.Participants = append([]string(nil), s.Participants...)
+	c.Security.EncryptedCapabilities = append([]string(nil), s.Security.EncryptedCapabilities...)
+	c.Security.CipherSuites = append([]int(nil), s.Security.CipherSuites...)
+	if s.Security.CipherSuite != nil {
+		suite := *s.Security.CipherSuite
+		c.Security.CipherSuite = &suite
+	}
+	if s.Capabilities != nil {
+		c.Capabilities = make(Capabilities, len(s.Capabilities))
+		for k, v := range s.Capabilities {
+			c.Capabilities[k] = append(json.RawMessage(nil), v...)
+		}
+	}
+	if s.Metadata != nil {
+		c.Metadata = make(map[string]string, len(s.Metadata))
+		for k, v := range s.Metadata {
+			c.Metadata[k] = v
+		}
+	}
+	return &c
+}
+
+// SessionUpdater is an optional SessionStore extension: UpdateIfPresent
+// replaces the stored session only if it still exists, atomically, and
+// returns ErrNoSuchSession otherwise. Plain Update is an upsert on some stores
+// and would resurrect a session removed in the meantime.
+type SessionUpdater interface {
+	UpdateIfPresent(session *Session) error
+}
+
+// updateIfPresent uses SessionUpdater when the store has it, else a
+// non-atomic Get followed by Update.
+func updateIfPresent(st SessionStore, sess *Session) error {
+	if u, ok := st.(SessionUpdater); ok {
+		return u.UpdateIfPresent(sess)
+	}
+	if _, ok := st.Get(sess.ID); !ok {
+		return ErrNoSuchSession
+	}
+	return st.Update(sess)
+}
+
+// dispatchSessionResume negotiates the version, calls the handler, runs the
+// resume hooks and commits the version only for a successful resume.
+func (p *Peer) dispatchSessionResume(ctx context.Context, ps *SessionResumeParams) (*SessionResumeResult, error) {
+	selected, vErr := negotiateOrReject(ps.WMP.Version)
+	if vErr != nil {
+		return nil, vErr
+	}
+	result, err := p.handler.SessionResume(ctx, ps)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if !result.Resumed {
+		if result.WMP.Version == "" {
+			result.WMP.Version = selected
+		}
+		return result, nil
+	}
+	if result.WMP.Version == "" {
+		// A session keeps the version negotiated at create (core section
+		// 2.2.3). Checked only after the handler authorised the resume, so a
+		// version error cannot reveal that a session exists.
+		version, vErr := p.resumeVersion(ps, selected)
+		if vErr != nil {
+			return nil, vErr
+		}
+		result.WMP.Version = version
+	}
+	if p.registry.hasResumers() {
+		// Resume authorization hooks must not be bypassed: without a session
+		// to show them the resume is refused (fail closed).
+		var sess *Session
+		if st := p.store(); st != nil {
+			sess, _ = st.Get(ps.SessionID)
+		}
+		if sess == nil {
+			return nil, NewRPCError(ErrInternalError, nil)
+		}
+		// The token has already been rotated: a rejecting hook ends this
+		// session's resumability, so the client creates a new session (core
+		// section 4.5.4).
+		if hookErr := p.registry.runSessionResumers(ctx, sess, ps); hookErr != nil {
+			return nil, toRPCError(hookErr)
+		}
+	}
+	p.recordVersion(ps.SessionID, result.WMP.Version)
+	return result, nil
+}
+
+// resumeVersion is the version for a resume whose handler named none: the
+// session's recorded one if the client still offers at least that, else the
+// freshly negotiated one.
+func (p *Peer) resumeVersion(ps *SessionResumeParams, negotiated string) (string, *RPCError) {
+	rec, ok := p.recordedVersion(p.versionKey(ps.SessionID))
+	if !ok {
+		return negotiated, nil
+	}
+	if v, ok := NegotiateVersion(ps.WMP.Version, []string{rec}); ok {
+		return v, nil
+	}
+	return "", versionError([]string{rec})
+}
+
+// versionKey maps a message's session ID to the key under which its
+// negotiated version is kept: an empty ID means the identity's session.
+func (p *Peer) versionKey(sessionID string) string {
+	if sessionID == "" && p.identity != nil {
+		return p.identity.sessionID
+	}
+	return sessionID
+}
+
+// versionCache holds negotiated versions for sessions the Peer cannot read
+// them back from (no session store, or a record without version metadata).
+// Entries are removed when the session is closed (inbound or outbound close).
+// A version is never evicted while its session is open, because dropping it
+// would silently change the version stamped on that session's messages.
+type versionCache struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func (c *versionCache) store(key, version string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = make(map[string]string)
+	}
+	c.m[key] = version
+}
+
+func (c *versionCache) load(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.m[key]
+	return v, ok
+}
+
+func (c *versionCache) delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, key)
+}
+
+func (c *versionCache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.m)
+}
+
+// recordedVersion returns the version on record for key: the store's, else
+// the cache's.
+func (p *Peer) recordedVersion(key string) (string, bool) {
+	if v, ok := p.storedVersion(key); ok {
+		return v, true
+	}
+	return p.versions.load(key)
+}
+
+// storedVersion returns the version recorded in the session store, if any.
+func (p *Peer) storedVersion(key string) (string, bool) {
+	if p.store() == nil || key == "" {
+		return "", false
+	}
+	if sess, ok := p.store().Get(key); ok {
+		v := sess.Metadata[MetadataKeyVersion]
+		return v, v != ""
+	}
+	return "", false
+}
+
+// recordVersion remembers the version negotiated for a session, so messages
+// of one session never carry the version negotiated for another. When the
+// session store already holds the version (SessionService and the sessions
+// the Peer creates itself record it in the session metadata) nothing is
+// cached: the store is authoritative and its expiry also ends the entry.
+func (p *Peer) recordVersion(sessionID, version string) {
+	if version == "" {
+		return
+	}
+	key := p.versionKey(sessionID)
+	if _, ok := p.storedVersion(key); ok {
+		return
+	}
+	p.versions.store(key, version)
+}
+
+// versionFor returns the version negotiated for the session, or Version.
+func (p *Peer) versionFor(sessionID string) string {
+	if v, ok := p.recordedVersion(p.versionKey(sessionID)); ok {
+		return v
+	}
+	return Version
+}
+
+// forgetVersion drops the cached version of a session that is gone. A close
+// the handler refused (the session still exists) keeps its version.
+func (p *Peer) forgetVersion(sessionID string) {
+	key := p.versionKey(sessionID)
+	if p.store() != nil {
+		if _, ok := p.store().Get(key); ok {
+			return
+		}
+	}
+	p.versions.delete(key)
+}
+
+// negotiateOrReject selects a version against SupportedVersions or returns
+// the -31013 error carrying supported_versions.
+func negotiateOrReject(offered string) (string, *RPCError) {
+	selected, ok := NegotiateVersion(offered, SupportedVersions)
+	if !ok {
+		return "", NewRPCError(ErrVersionNotSupported, map[string]interface{}{
+			"supported_versions": SupportedVersions,
+		})
+	}
+	return selected, nil
+}
+
+// stamp adds the session identity (WithSessionIdentity) to the "wmp" object
+// of outbound params. Params that are not a JSON object are returned as is.
+func (p *Peer) stamp(method string, params interface{}) (interface{}, error) {
+	if p.identity == nil || params == nil {
+		return params, nil
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("marshal params: %w", err)
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil || obj == nil {
+		return params, nil
+	}
+	meta := map[string]json.RawMessage{}
+	if m, ok := obj["wmp"]; ok {
+		if err := json.Unmarshal(m, &meta); err != nil {
+			return nil, fmt.Errorf("outbound wmp metadata: %w", err)
+		}
+		if meta == nil { // "wmp": null
+			meta = map[string]json.RawMessage{}
+		}
+	}
+	// Patch only missing or empty members; everything else the caller put in
+	// the envelope (signature, encrypted, assertions...) stays byte for byte.
+	sessionID := stringMember(meta, "session_id")
+	if sessionID == "" && method == MethodSessionResume {
+		// A resume names its target session at the top level, not in wmp.
+		sessionID = stringMember(obj, "session_id")
+	}
+	if sessionID == "" {
+		sessionID = p.identity.sessionID
+	}
+	if err := fillMember(meta, "session_id", sessionID); err != nil {
+		return nil, err
+	}
+	if err := fillMember(meta, "version", p.versionFor(sessionID)); err != nil {
+		return nil, err
+	}
+	if err := fillMember(meta, "sender", p.identity.sender); err != nil {
+		return nil, err
+	}
+	var err2 error
+	if obj["wmp"], err2 = json.Marshal(meta); err2 != nil {
+		return nil, fmt.Errorf("marshal wmp metadata: %w", err2)
+	}
+	return obj, nil
+}
+
+// stringMember returns meta[key] as a string, or "" if absent or not a string.
+func stringMember(meta map[string]json.RawMessage, key string) string {
+	var v string
+	if raw, ok := meta[key]; ok && json.Unmarshal(raw, &v) == nil {
+		return v
+	}
+	return ""
+}
+
+// fillMember sets meta[key] to value unless it already holds a non-empty
+// string or value is empty.
+func fillMember(meta map[string]json.RawMessage, key, value string) error {
+	if value == "" || stringMember(meta, key) != "" {
+		return nil
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("marshal wmp.%s: %w", key, err)
+	}
+	meta[key] = raw
+	return nil
 }
 
 // IsSupportedVersion returns true if the given version is in SupportedVersions.

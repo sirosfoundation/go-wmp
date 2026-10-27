@@ -138,3 +138,23 @@ type SessionHook interface {
 	// OnSessionClose is called when a session is being closed.
 	OnSessionClose(ctx context.Context, session *Session, params *SessionCloseParams)
 }
+
+// SessionResumer is an optional interface for profiles (registered with
+// Peer.Use) and for SessionServiceConfig.ResumeHooks. OnSessionResume runs
+// after a resume has been validated and the resumption token rotated; a
+// non-nil error rejects the resume. Because the presented token is already
+// spent, a rejected session cannot be resumed again and the client must
+// create a new one (core section 4.5.4).
+type SessionResumer interface {
+	OnSessionResume(ctx context.Context, session *Session, params *SessionResumeParams) error
+}
+
+// SessionExpirer is an optional interface for SessionServiceConfig.
+// ExpireHooks. OnSessionExpire runs once for each session the service expires
+// (on a resume attempt, or in Sweep when the store implements
+// ExpiredSessionLister), AFTER the record has been deleted: the session passed
+// in is the last copy, and the store no longer has it. Sweep on a store
+// without ExpiredSessionLister only calls Cleanup and runs no hooks.
+type SessionExpirer interface {
+	OnSessionExpire(ctx context.Context, session *Session)
+}

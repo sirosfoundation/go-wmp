@@ -23,6 +23,11 @@ type FlowContext struct {
 	FlowType string
 	Params   json.RawMessage
 
+	// sessionID is the session the flow was started in; every notification
+	// the flow sends carries it, whatever session the Peer's static identity
+	// names.
+	sessionID string
+
 	peer     PeerContext
 	actionCh chan *FlowActionParams
 	doneCh   chan struct{}
@@ -32,11 +37,16 @@ type FlowContext struct {
 
 // newFlowContext creates a FlowContext for a specific flow.
 func newFlowContext(flowID, flowType string, params json.RawMessage, peer PeerContext) *FlowContext {
+	return newSessionFlowContext(flowID, flowType, params, peer, "")
+}
+
+func newSessionFlowContext(flowID, flowType string, params json.RawMessage, peer PeerContext, sessionID string) *FlowContext {
 	return &FlowContext{
-		FlowID:   flowID,
-		FlowType: flowType,
-		Params:   params,
-		peer:     peer,
+		FlowID:    flowID,
+		FlowType:  flowType,
+		Params:    params,
+		sessionID: sessionID,
+		peer:      peer,
 		actionCh: make(chan *FlowActionParams, 10),
 		doneCh:   make(chan struct{}),
 	}
@@ -53,6 +63,7 @@ func (fc *FlowContext) Progress(ctx context.Context, step string, payload interf
 		}
 	}
 	return fc.peer.Notify(ctx, MethodFlowProgress, &FlowProgressParams{
+		WMP:     fc.meta(),
 		FlowID:  fc.FlowID,
 		Step:    step,
 		Payload: raw,
@@ -97,6 +108,7 @@ func (fc *FlowContext) Complete(ctx context.Context, result interface{}) error {
 		}
 	}
 	return fc.peer.Notify(ctx, MethodFlowComplete, &FlowCompleteParams{
+		WMP:    fc.meta(),
 		FlowID: fc.FlowID,
 		Result: raw,
 	})
@@ -113,11 +125,18 @@ func (fc *FlowContext) Error(ctx context.Context, code int, message string, data
 		}
 	}
 	return fc.peer.Notify(ctx, MethodFlowError, &FlowErrorParams{
+		WMP:     fc.meta(),
 		FlowID:  fc.FlowID,
 		Code:    code,
 		Message: message,
 		Data:    raw,
 	})
+}
+
+// meta is the wmp object for the flow's notifications: just the originating
+// session. The Peer fills version and sender (WithSessionIdentity).
+func (fc *FlowContext) meta() Metadata {
+	return Metadata{SessionID: fc.sessionID}
 }
 
 // cancel signals the flow goroutine to stop.
@@ -192,7 +211,13 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 		})
 	}
 
-	fc := newFlowContext(params.FlowID, params.FlowType, params.Params, p.peer)
+	// The session the request arrived in: the store-resolved one if known,
+	// else the one the request names.
+	sessionID := params.WMP.SessionID
+	if sess := SessionFromContext(ctx); sess != nil {
+		sessionID = sess.ID
+	}
+	fc := newSessionFlowContext(params.FlowID, params.FlowType, params.Params, p.peer, sessionID)
 	p.mu.Lock()
 	p.flows[params.FlowID] = fc
 	p.mu.Unlock()
