@@ -77,6 +77,7 @@ type Peer struct {
 	maxMessageSize int
 	validator      Validator
 	authorizer     Authorizer
+	orchestrator   *OrchestratorMessageOptions
 
 	mu      sync.Mutex
 	pending map[string]chan *Response // keyed by request ID
@@ -360,6 +361,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
+		if handled, err := p.interceptMessage(ctx, MethodMessageDeliver); handled {
+			return nil, err
+		}
 		p.handler.MessageDeliver(ctx, &ps)
 		return nil, nil
 
@@ -368,6 +372,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
+		if handled, err := p.interceptMessage(ctx, MethodMessageAck); handled {
+			return nil, err
+		}
 		p.handler.MessageAck(ctx, &ps)
 		return nil, nil
 
@@ -375,6 +382,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		var ps MessageStatusParams
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
+		}
+		if handled, err := p.interceptMessage(ctx, MethodMessageStatus); handled {
+			return nil, err
 		}
 		p.handler.MessageStatus(ctx, &ps)
 		return nil, nil
