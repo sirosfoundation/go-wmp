@@ -31,12 +31,25 @@ const (
 // another member name uses ValidateCompletionResultWithMembers.
 var DefaultSecretMembers = []string{SecretSeedMember, AuxiliaryDataMember}
 
-// replaySecretMembers are the only members a replayed completion may list in
-// redacted_members.
-var replaySecretMembers = map[string]bool{
-	"dpop_jwk":      true,
-	"dpop_key_id":   true,
-	"refresh_token": true,
+// ReplaySecretMembers are the only result members a replayed wmp.flow.complete
+// withholds, and the only names a result's redacted_members may list (WMP
+// OpenID4x profile Section 3.1.4): the OID4VCI refresh token and the DPoP key
+// it is bound to. credential_metadata is never withheld (Section 3.1.4.1). The
+// slice is sorted; callers must not modify it (SplitReplaySecrets does not
+// read it).
+var ReplaySecretMembers = []string{"dpop_jwk", "dpop_key_id", "refresh_token"}
+
+// replaySecretMembers is the fixed, sorted set SplitReplaySecrets withholds and
+// validateRedactedMembers accepts.
+var replaySecretMembers = [...]string{"dpop_jwk", "dpop_key_id", "refresh_token"}
+
+func isReplaySecretMember(name string) bool {
+	for _, m := range replaySecretMembers {
+		if m == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ErrCompletionResult is wrapped by every error ValidateCompletionResult
@@ -170,7 +183,7 @@ func validateRedactedMembers(m map[string]json.RawMessage) error {
 	}
 	seen := make(map[string]bool, len(names))
 	for _, n := range names {
-		if !replaySecretMembers[n] {
+		if !isReplaySecretMember(n) {
 			return resultErr("redacted_members lists a member that is not a replay secret member")
 		}
 		if seen[n] {
