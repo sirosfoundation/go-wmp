@@ -1684,3 +1684,31 @@ func TestSessionServiceConcurrentIDCollisionKeepsFirstSession(t *testing.T) {
 		})
 	}
 }
+
+// Resume hooks get a detached copy: neither the service's nor the Peer's hook
+// path may expose the store's live record. Run with -race.
+func TestResumeHooksGetDetachedSnapshot(t *testing.T) {
+	store := NewMemorySessionStore()
+	mutate := func(s *Session) {
+		s.ExpiresAt = time.Now().Add(-time.Hour)
+		s.Capabilities["mutated"] = json.RawMessage(`{}`)
+		s.Metadata["mutated"] = "x"
+	}
+	svc := newTestService(t, func(c *SessionServiceConfig) {
+		c.Store = store
+		c.ResumeHooks = []SessionResumer{resumeFunc(func(_ context.Context, s *Session, _ *SessionResumeParams) error { mutate(s); return nil })}
+	})
+	peer := NewPeer(nil, NewSessionHandler(svc))
+	if err := peer.Use(&resumeProfile{fn: mutate}); err != nil {
+		t.Fatal(err)
+	}
+	created := mustCreate(t, svc, alice)
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionResume, resumeParams(created, created.ResumptionToken))
+	if msg.Error != nil {
+		t.Fatalf("%+v", msg.Error)
+	}
+	live, _ := store.Get(created.WMP.SessionID)
+	if live.IsExpired() || live.Capabilities["mutated"] != nil || live.Metadata["mutated"] != "" {
+		t.Fatalf("a resume hook changed the stored session: %+v", live)
+	}
+}
