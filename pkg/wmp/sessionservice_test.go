@@ -784,3 +784,50 @@ func TestSessionHandlerClose(t *testing.T) {
 		t.Fatal("close through the handler must delete the session")
 	}
 }
+
+// SessionService sessions compose with capability gating (flow.start) and
+// orchestrator message interception on the same Peer.
+func TestSessionServiceComposesWithGatingAndOrchestrator(t *testing.T) {
+	store := NewMemorySessionStore()
+	svc := newTestService(t, func(c *SessionServiceConfig) {
+		c.Store = store
+		c.Supported = Capabilities{"cap-a": json.RawMessage(`{}`)}
+	})
+	h := &msgCounter{}
+	peer := NewPeer(nil, &composedHandler{SessionHandler: NewSessionHandler(svc), msgCounter: h},
+		WithSessionStore(store),
+		WithSessionIdentity("", "x509:san:dns:server"),
+		WithOrchestratorMessages(OrchestratorMessageOptions{}))
+	gated := &gatedFlows{}
+	if err := peer.Use(gated); err != nil {
+		t.Fatal(err)
+	}
+	p := createParams()
+	p.CapabilitiesOffered = Capabilities{"cap-a": json.RawMessage(`{}`), "cap-b": json.RawMessage(`{}`)}
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, p)
+	if msg.Error != nil {
+		t.Fatalf("create: %+v", msg.Error)
+	}
+	var created SessionCreateResult
+	_ = json.Unmarshal(msg.Result, &created)
+
+	// Negotiated cap-a: flow "a" starts; cap-b was not granted: -31005.
+	if m := flowStartRPC(t, peer, created.WMP.SessionID, "a"); m.Error != nil {
+		t.Fatalf("flow a: %+v", m.Error)
+	}
+	assertUnsupported(t, flowStartRPC(t, peer, created.WMP.SessionID, "b"), "b", "cap-b")
+
+	m := peerCall(t, peer, ctxFor(alice), MethodMessageDeliver, MessageDeliverParams{WMP: Metadata{Version: Version, SessionID: created.WMP.SessionID}})
+	if m.Error == nil || m.Error.Code != ErrParticipantNotFound || h.deliver != 0 {
+		t.Fatalf("deliver: %+v (handler calls %d)", m.Error, h.deliver)
+	}
+}
+
+type composedHandler struct {
+	SessionHandler
+	msgCounter *msgCounter
+}
+
+func (c *composedHandler) MessageDeliver(ctx context.Context, p *MessageDeliverParams) {
+	c.msgCounter.MessageDeliver(ctx, p)
+}

@@ -91,6 +91,7 @@ type Peer struct {
 	authorizer     Authorizer
 	identity       *sessionIdentity // nil: outbound messages are not stamped
 	negotiated     atomic.Value     // string: version selected by the last create/resume
+	orchestrator   *OrchestratorMessageOptions
 
 	mu      sync.Mutex
 	pending map[string]chan *Response // keyed by request ID
@@ -409,6 +410,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
+		if handled, err := p.interceptMessage(ctx, MethodMessageDeliver); handled {
+			return nil, err
+		}
 		p.handler.MessageDeliver(ctx, &ps)
 		return nil, nil
 
@@ -417,6 +421,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
+		if handled, err := p.interceptMessage(ctx, MethodMessageAck); handled {
+			return nil, err
+		}
 		p.handler.MessageAck(ctx, &ps)
 		return nil, nil
 
@@ -424,6 +431,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		var ps MessageStatusParams
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
+		}
+		if handled, err := p.interceptMessage(ctx, MethodMessageStatus); handled {
+			return nil, err
 		}
 		p.handler.MessageStatus(ctx, &ps)
 		return nil, nil
@@ -456,13 +466,24 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		}
 		// Check if a profile handles this flow type.
 		if fh, ok := p.registry.lookupFlowHandler(ps.FlowType); ok {
+			// Core §10.3: a flow type whose capability was not negotiated
+			// is refused with -31005 before the profile sees it.
+			if err := checkFlowCapability(ctx, fh, ps.FlowType); err != nil {
+				return nil, err
+			}
 			result, err := fh.StartFlow(ctx, &ps)
 			if err == nil && result != nil {
 				p.registry.trackFlow(ps.FlowID, fh)
 			}
 			return result, err
 		}
-		return p.handler.FlowStart(ctx, &ps)
+		result, err := p.handler.FlowStart(ctx, &ps)
+		if isMethodNotFound(err) {
+			// Nobody here implements this flow type: that is an
+			// unsupported capability (core §10.3), not an unknown method.
+			return nil, NewUnsupportedError(ps.FlowType, nil)
+		}
+		return result, err
 
 	case MethodFlowProgress:
 		var ps FlowProgressParams

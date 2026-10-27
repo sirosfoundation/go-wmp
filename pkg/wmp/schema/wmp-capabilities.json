@@ -95,7 +95,12 @@
         "supported_formats": {
           "type": "array",
           "items": { "type": "string" }
-        }
+        },
+        "supported_proof_types": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "batch_issuance": { "type": "boolean" }
       },
       "additionalProperties": false
     },
@@ -107,6 +112,10 @@
           "items": { "type": "string" }
         },
         "supported_formats": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "supported_algorithms": {
           "type": "array",
           "items": { "type": "string" }
         }
