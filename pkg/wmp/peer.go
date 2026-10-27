@@ -90,7 +90,7 @@ type Peer struct {
 	validator      Validator
 	authorizer     Authorizer
 	identity       *sessionIdentity // nil: outbound messages are not stamped
-	negotiated     atomic.Value     // string: version selected by the last create/resume
+	versions       sync.Map         // session ID (or "") -> version negotiated for it
 	orchestrator   *OrchestratorMessageOptions
 
 	mu      sync.Mutex
@@ -323,83 +323,14 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		// Version negotiation (core section 2.2.2): highest supported
-		// version that is not above the offered one, same MAJOR.
-		selected, vErr := negotiateOrReject(ps.WMP.Version)
-		if vErr != nil {
-			return nil, vErr
-		}
-		result, err := p.handler.SessionCreate(ctx, &ps)
-		if err != nil {
-			return nil, err
-		}
-		if result != nil {
-			if result.WMP.Version == "" {
-				result.WMP.Version = selected
-			}
-			p.negotiated.Store(result.WMP.Version)
-		}
-		// Run session create hooks if we have a session store.
-		if result != nil && p.sessions != nil && result.WMP.SessionID != "" {
-			// A handler that owns the session lifecycle (SessionService)
-			// has already stored the session with its owner and token
-			// expiry; never replace that record with a bare copy.
-			sess, existing := p.sessions.Get(result.WMP.SessionID)
-			if !existing {
-				sess = &Session{
-					ID:              result.WMP.SessionID,
-					Participants:    ps.Participants,
-					Capabilities:    result.Capabilities,
-					Security:        result.Security,
-					ResumptionToken: result.ResumptionToken,
-				}
-			}
-			if hookErr := p.registry.runSessionCreateHooks(ctx, sess, &ps); hookErr != nil {
-				if existing {
-					// The client never learns this session's ID or token:
-					// do not leave the handler-created record behind.
-					_ = p.sessions.Delete(sess.ID)
-				}
-				return nil, toRPCError(hookErr)
-			}
-			if existing {
-				_ = p.sessions.Update(sess)
-			} else {
-				_ = p.sessions.Create(sess)
-			}
-		}
-		return result, nil
+		return p.dispatchSessionCreate(ctx, &ps)
 
 	case MethodSessionResume:
 		var ps SessionResumeParams
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		selected, vErr := negotiateOrReject(ps.WMP.Version)
-		if vErr != nil {
-			return nil, vErr
-		}
-		result, err := p.handler.SessionResume(ctx, &ps)
-		if err != nil {
-			return nil, err
-		}
-		if result != nil {
-			if result.WMP.Version == "" {
-				result.WMP.Version = selected
-			}
-			p.negotiated.Store(result.WMP.Version)
-			if p.sessions != nil && result.Resumed {
-				if sess, ok := p.sessions.Get(ps.SessionID); ok {
-					// The token has already been rotated: a rejecting hook
-					// ends this session's resumability, so the client
-					// creates a new session (core section 4.5.4).
-					if hookErr := p.registry.runSessionResumers(ctx, sess, &ps); hookErr != nil {
-						return nil, toRPCError(hookErr)
-					}
-				}
-			}
-		}
-		return result, nil
+		return p.dispatchSessionResume(ctx, &ps)
 
 	case MethodSessionClose:
 		var ps SessionCloseParams
@@ -407,6 +338,7 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
 		p.handler.SessionClose(ctx, &ps)
+		p.versions.Delete(p.versionKey(ps.WMP.SessionID))
 		return nil, nil
 
 	case MethodSessionAuthenticate:
@@ -665,8 +597,8 @@ func (p *Peer) recordNegotiatedVersion(raw json.RawMessage) {
 	var r struct {
 		WMP Metadata `json:"wmp"`
 	}
-	if json.Unmarshal(raw, &r) == nil && r.WMP.Version != "" {
-		p.negotiated.Store(r.WMP.Version)
+	if json.Unmarshal(raw, &r) == nil {
+		p.recordVersion(r.WMP.SessionID, r.WMP.Version)
 	}
 }
 
@@ -786,6 +718,124 @@ func toRPCError(err error) *RPCError {
 	return NewRPCError(ErrInternalError, nil)
 }
 
+// dispatchSessionCreate negotiates the version, calls the handler, runs the
+// create hooks and only then commits the negotiated version for the session.
+func (p *Peer) dispatchSessionCreate(ctx context.Context, ps *SessionCreateParams) (*SessionCreateResult, error) {
+	// Version negotiation (core section 2.2.2): highest supported version
+	// that is not above the offered one, same MAJOR.
+	selected, vErr := negotiateOrReject(ps.WMP.Version)
+	if vErr != nil {
+		return nil, vErr
+	}
+	result, err := p.handler.SessionCreate(ctx, ps)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if result.WMP.Version == "" {
+		result.WMP.Version = selected
+	}
+	// Run session create hooks if we have a session store.
+	if p.sessions != nil && result.WMP.SessionID != "" {
+		if err := p.runCreateHooks(ctx, ps, result); err != nil {
+			return nil, err
+		}
+	}
+	p.recordVersion(result.WMP.SessionID, result.WMP.Version)
+	return result, nil
+}
+
+func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, result *SessionCreateResult) error {
+	// A handler that owns the session lifecycle (SessionService) has already
+	// stored the session with its owner and token expiry; never replace that
+	// record with a bare copy.
+	sess, existing := p.sessions.Get(result.WMP.SessionID)
+	if !existing {
+		sess = &Session{
+			ID:              result.WMP.SessionID,
+			Participants:    ps.Participants,
+			Capabilities:    result.Capabilities,
+			Security:        result.Security,
+			ResumptionToken: result.ResumptionToken,
+		}
+	}
+	if hookErr := p.registry.runSessionCreateHooks(ctx, sess, ps); hookErr != nil {
+		if existing {
+			// The client never learns this session's ID or token: do not
+			// leave the handler-created record behind.
+			_ = p.sessions.Delete(sess.ID)
+		}
+		return toRPCError(hookErr)
+	}
+	if existing {
+		_ = p.sessions.Update(sess)
+	} else {
+		_ = p.sessions.Create(sess)
+	}
+	return nil
+}
+
+// dispatchSessionResume negotiates the version, calls the handler, runs the
+// resume hooks and commits the version only for a successful resume.
+func (p *Peer) dispatchSessionResume(ctx context.Context, ps *SessionResumeParams) (*SessionResumeResult, error) {
+	selected, vErr := negotiateOrReject(ps.WMP.Version)
+	if vErr != nil {
+		return nil, vErr
+	}
+	result, err := p.handler.SessionResume(ctx, ps)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if result.WMP.Version == "" {
+		result.WMP.Version = selected
+	}
+	if !result.Resumed {
+		return result, nil
+	}
+	if p.sessions != nil {
+		if sess, ok := p.sessions.Get(ps.SessionID); ok {
+			// The token has already been rotated: a rejecting hook ends this
+			// session's resumability, so the client creates a new session
+			// (core section 4.5.4).
+			if hookErr := p.registry.runSessionResumers(ctx, sess, ps); hookErr != nil {
+				return nil, toRPCError(hookErr)
+			}
+		}
+	}
+	p.recordVersion(ps.SessionID, result.WMP.Version)
+	return result, nil
+}
+
+// versionKey maps a message's session ID to the key under which its
+// negotiated version is kept: an empty ID means the identity's session.
+func (p *Peer) versionKey(sessionID string) string {
+	if sessionID == "" && p.identity != nil {
+		return p.identity.sessionID
+	}
+	return sessionID
+}
+
+// recordVersion remembers the version negotiated for a session, so messages
+// of one session never carry the version negotiated for another.
+func (p *Peer) recordVersion(sessionID, version string) {
+	if version != "" {
+		p.versions.Store(p.versionKey(sessionID), version)
+	}
+}
+
+// versionFor returns the version negotiated for the session, or Version.
+func (p *Peer) versionFor(sessionID string) string {
+	if v, ok := p.versions.Load(p.versionKey(sessionID)); ok {
+		return v.(string)
+	}
+	return Version
+}
+
 // negotiateOrReject selects a version against SupportedVersions or returns
 // the -31013 error carrying supported_versions.
 func negotiateOrReject(offered string) (string, *RPCError) {
@@ -812,28 +862,55 @@ func (p *Peer) stamp(params interface{}) (interface{}, error) {
 	if json.Unmarshal(raw, &obj) != nil || obj == nil {
 		return params, nil
 	}
-	var meta Metadata
+	meta := map[string]json.RawMessage{}
 	if m, ok := obj["wmp"]; ok {
 		if err := json.Unmarshal(m, &meta); err != nil {
 			return nil, fmt.Errorf("outbound wmp metadata: %w", err)
 		}
 	}
-	if meta.Version == "" {
-		meta.Version = Version
-		if v, ok := p.negotiated.Load().(string); ok && v != "" {
-			meta.Version = v
-		}
+	// Patch only missing or empty members; everything else the caller put in
+	// the envelope (signature, encrypted, assertions...) stays byte for byte.
+	sessionID := stringMember(meta, "session_id")
+	if err := fillMember(meta, "session_id", p.identity.sessionID); err != nil {
+		return nil, err
 	}
-	if meta.SessionID == "" {
-		meta.SessionID = p.identity.sessionID
+	if sessionID == "" {
+		sessionID = p.identity.sessionID
 	}
-	if meta.Sender == "" {
-		meta.Sender = p.identity.sender
+	if err := fillMember(meta, "version", p.versionFor(sessionID)); err != nil {
+		return nil, err
 	}
-	if obj["wmp"], err = json.Marshal(meta); err != nil {
-		return nil, fmt.Errorf("marshal wmp metadata: %w", err)
+	if err := fillMember(meta, "sender", p.identity.sender); err != nil {
+		return nil, err
+	}
+	var err2 error
+	if obj["wmp"], err2 = json.Marshal(meta); err2 != nil {
+		return nil, fmt.Errorf("marshal wmp metadata: %w", err2)
 	}
 	return obj, nil
+}
+
+// stringMember returns meta[key] as a string, or "" if absent or not a string.
+func stringMember(meta map[string]json.RawMessage, key string) string {
+	var v string
+	if raw, ok := meta[key]; ok && json.Unmarshal(raw, &v) == nil {
+		return v
+	}
+	return ""
+}
+
+// fillMember sets meta[key] to value unless it already holds a non-empty
+// string or value is empty.
+func fillMember(meta map[string]json.RawMessage, key, value string) error {
+	if value == "" || stringMember(meta, key) != "" {
+		return nil
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("marshal wmp.%s: %w", key, err)
+	}
+	meta[key] = raw
+	return nil
 }
 
 // IsSupportedVersion returns true if the given version is in SupportedVersions.

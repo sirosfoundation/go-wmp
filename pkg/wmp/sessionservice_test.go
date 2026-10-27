@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"regexp"
 	"strings"
 	"sync"
@@ -192,18 +193,21 @@ func TestSessionServiceTTLClamp(t *testing.T) {
 	})
 	for _, tt := range []struct {
 		name string
-		ttl  int
+		ttl  int64
 		want time.Duration
 	}{
 		{"default", 0, 10 * time.Minute},
 		{"requested", 120, 2 * time.Minute},
 		{"clamped", 7200, time.Hour},
-		{"overflow", int(^uint(0) >> 1), time.Hour},
+		{"overflow", math.MaxInt64, time.Hour},
 		{"wraps to small positive when multiplied", 18446744074, time.Hour},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			if int64(int(tt.ttl)) != tt.ttl {
+				t.Skip("value does not fit int on this platform")
+			}
 			p := createParams()
-			p.TTL = tt.ttl
+			p.TTL = int(tt.ttl)
 			res, err := s.SessionCreate(ctxFor(alice), p)
 			if err != nil {
 				t.Fatal(err)
@@ -999,7 +1003,117 @@ func TestPeerRecordsVersionFromOutboundCreateResponse(t *testing.T) {
 	if err := client.Call(ctx, MethodSessionCreate, p, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if v, _ := client.negotiated.Load().(string); v != "0.2" {
+	var meta struct {
+		WMP Metadata `json:"wmp"`
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil || meta.WMP.SessionID == "" {
+		t.Fatalf("result %s: %v", raw, err)
+	}
+	if v := client.versionFor(meta.WMP.SessionID); v != "0.2" {
 		t.Fatalf("recorded version %q, want 0.2", v)
 	}
+	if v := client.versionFor("ses-other"); v != Version {
+		t.Fatalf("other sessions must keep the default, got %q", v)
+	}
+}
+
+func TestSessionServiceTTLFractionalMaxTTL(t *testing.T) {
+	store := NewMemorySessionStore()
+	s := newTestService(t, func(c *SessionServiceConfig) {
+		c.Store = store
+		c.DefaultTTL = time.Second
+		c.MaxTTL = 1500 * time.Millisecond
+	})
+	p := createParams()
+	p.TTL = 1
+	res, err := s.SessionCreate(ctxFor(alice), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, _ := store.Get(res.WMP.SessionID)
+	if got := sess.ExpiresAt.Sub(sess.CreatedAt); got != time.Second {
+		t.Fatalf("ttl = %s, want the requested 1s (not raised to MaxTTL)", got)
+	}
+}
+
+func outboundMeta(t *testing.T, peer *Peer, remote *chanTransport, params interface{}) map[string]json.RawMessage {
+	t.Helper()
+	if err := peer.Notify(context.Background(), "x.custom", params); err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal(readOutbound(t, remote)["wmp"], &meta); err != nil {
+		t.Fatal(err)
+	}
+	return meta
+}
+
+// Versions are kept per session: negotiating B at 0.2 must not change what is
+// stamped on messages of A (0.1).
+func TestWithSessionIdentityTracksVersionPerSession(t *testing.T) {
+	old := SupportedVersions
+	SupportedVersions = []string{"0.1", "0.2"}
+	defer func() { SupportedVersions = old }()
+
+	local, remote := newChanTransportPair()
+	peer := NewPeer(local, &BaseHandler{}, WithSessionIdentity("", ""))
+	peer.recordVersion("ses-A", "0.1")
+	peer.recordVersion("ses-B", "0.2")
+	for sid, want := range map[string]string{"ses-A": `"0.1"`, "ses-B": `"0.2"`} {
+		meta := outboundMeta(t, peer, remote, map[string]interface{}{"wmp": map[string]string{"session_id": sid}})
+		if string(meta["version"]) != want {
+			t.Fatalf("%s stamped %s, want %s", sid, meta["version"], want)
+		}
+	}
+}
+
+// The envelope the caller built is patched, not re-encoded: unknown members
+// and explicit false values survive.
+func TestStampPreservesExistingEnvelope(t *testing.T) {
+	local, remote := newChanTransportPair()
+	peer := NewPeer(local, &BaseHandler{}, WithSessionIdentity("ses-abc", "me"))
+	meta := outboundMeta(t, peer, remote, map[string]interface{}{"wmp": map[string]interface{}{
+		"encrypted": false, "x_ext": map[string]int{"n": 1}, "signature": "sig",
+	}})
+	if string(meta["encrypted"]) != "false" || string(meta["x_ext"]) != `{"n":1}` || string(meta["signature"]) != `"sig"` {
+		t.Fatalf("envelope members lost: %v", meta)
+	}
+	if string(meta["session_id"]) != `"ses-abc"` || string(meta["sender"]) != `"me"` || string(meta["version"]) != `"`+Version+`"` {
+		t.Fatalf("identity not filled: %v", meta)
+	}
+}
+
+func TestPeerVersionNotCommittedOnRejectedCreateOrUnresumed(t *testing.T) {
+	old := SupportedVersions
+	SupportedVersions = []string{"0.1", "0.2"}
+	defer func() { SupportedVersions = old }()
+
+	store := NewMemorySessionStore()
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Store = store; c.Versions = []string{"0.1", "0.2"} })
+	peer := NewPeer(nil, NewSessionHandler(svc), WithSessionStore(store), WithSessionIdentity("", ""))
+	if err := peer.Use(&rejectingCreateProfile{}); err != nil {
+		t.Fatal(err)
+	}
+	p := createParams()
+	p.WMP.Version = "0.2"
+	if msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, p); msg.Error == nil {
+		t.Fatal("create must be rejected by the hook")
+	}
+	n := 0
+	peer.versions.Range(func(_, _ any) bool { n++; return true })
+	if n != 0 {
+		t.Fatal("version of a rejected create was committed")
+	}
+	// A handler reporting Resumed=false must not commit either.
+	peer2 := NewPeer(nil, notResumedHandler{}, WithSessionIdentity("", ""))
+	peerCall(t, peer2, context.Background(), MethodSessionResume, &SessionResumeParams{WMP: Metadata{Version: "0.2"}, SessionID: "ses-x"})
+	if _, ok := peer2.versions.Load("ses-x"); ok {
+		t.Fatal("version of a non-resumed session was committed")
+	}
+}
+
+type notResumedHandler struct{ BaseHandler }
+
+func (notResumedHandler) SessionResume(context.Context, *SessionResumeParams) (*SessionResumeResult, error) {
+	return &SessionResumeResult{Resumed: false}, nil
 }

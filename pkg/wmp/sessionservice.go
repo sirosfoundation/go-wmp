@@ -164,7 +164,7 @@ func (s *SessionService) SessionCreate(ctx context.Context, p *SessionCreatePara
 	ttl := s.cfg.DefaultTTL
 	if p.TTL > 0 {
 		// Compare in seconds so the multiplication below cannot overflow.
-		if int64(p.TTL) >= int64(s.cfg.MaxTTL/time.Second) {
+		if int64(p.TTL) > int64(s.cfg.MaxTTL/time.Second) {
 			ttl = s.cfg.MaxTTL
 		} else {
 			ttl = time.Duration(p.TTL) * time.Second
