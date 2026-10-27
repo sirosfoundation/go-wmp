@@ -765,7 +765,7 @@ func toRPCError(err error) *RPCError {
 func (p *Peer) dispatchSessionCreate(ctx context.Context, ps *SessionCreateParams) (*SessionCreateResult, error) {
 	// Version negotiation (core section 2.2.2): highest supported version
 	// that is not above the offered one, same MAJOR.
-	selected, vErr := negotiateOrReject(ps.WMP.Version)
+	selected, vErr := p.negotiateOrReject(ps.WMP.Version)
 	if vErr != nil {
 		return nil, vErr
 	}
@@ -893,7 +893,7 @@ func updateIfPresent(st SessionStore, sess *Session) error {
 // dispatchSessionResume negotiates the version, calls the handler, runs the
 // resume hooks and commits the version only for a successful resume.
 func (p *Peer) dispatchSessionResume(ctx context.Context, ps *SessionResumeParams) (*SessionResumeResult, error) {
-	selected, vErr := negotiateOrReject(ps.WMP.Version)
+	selected, vErr := p.negotiateOrReject(ps.WMP.Version)
 	if vErr != nil {
 		return nil, vErr
 	}
@@ -948,6 +948,11 @@ func (p *Peer) resumeVersion(ps *SessionResumeParams, negotiated string) (string
 	rec, ok := p.recordedVersion(p.versionKey(ps.SessionID))
 	if !ok {
 		return negotiated, nil
+	}
+	// The recorded version must still be supported; never advertise one that
+	// is not.
+	if supported := p.supportedVersions(); !containsString(supported, rec) {
+		return "", versionRejection(ps.WMP.Version, supported)
 	}
 	if v, ok := NegotiateVersion(ps.WMP.Version, []string{rec}); ok {
 		return v, nil
@@ -1059,12 +1064,29 @@ func (p *Peer) forgetVersion(sessionID string) {
 	p.versions.delete(key)
 }
 
-// negotiateOrReject selects a version against SupportedVersions or returns
-// the -31013 error carrying supported_versions.
-func negotiateOrReject(offered string) (string, *RPCError) {
-	selected, ok := NegotiateVersion(offered, SupportedVersions)
+// VersionProvider is implemented by handlers that define their own supported
+// protocol versions (SessionHandler). A Peer negotiates against that set so a
+// service configured with different versions also works through a Peer;
+// otherwise the package-level SupportedVersions apply.
+type VersionProvider interface {
+	SupportedVersions() []string
+}
+
+// supportedVersions is the version set this Peer negotiates against.
+func (p *Peer) supportedVersions() []string {
+	if vp, ok := p.handler.(VersionProvider); ok {
+		return vp.SupportedVersions()
+	}
+	return SupportedVersions
+}
+
+// negotiateOrReject selects a version against the supported set or returns the
+// -31013 error carrying supported_versions.
+func (p *Peer) negotiateOrReject(offered string) (string, *RPCError) {
+	supported := p.supportedVersions()
+	selected, ok := NegotiateVersion(offered, supported)
 	if !ok {
-		return "", versionRejection(offered, SupportedVersions)
+		return "", versionRejection(offered, supported)
 	}
 	return selected, nil
 }
