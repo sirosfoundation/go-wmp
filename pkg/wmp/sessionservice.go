@@ -3,7 +3,7 @@ package wmp
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -122,7 +122,8 @@ func defaultSessionID() string {
 	if _, err := rand.Read(b); err != nil {
 		panic(fmt.Sprintf("wmp: crypto/rand unavailable: %v", err))
 	}
-	return "ses-" + base64.RawURLEncoding.EncodeToString(b)
+	// Hex, because wmp-metadata.json requires ^ses-[a-zA-Z0-9]+$.
+	return "ses-" + hex.EncodeToString(b)
 }
 
 func (s *SessionService) lockFor(id string) *sync.Mutex {
@@ -162,10 +163,12 @@ func (s *SessionService) SessionCreate(ctx context.Context, p *SessionCreatePara
 	}
 	ttl := s.cfg.DefaultTTL
 	if p.TTL > 0 {
-		ttl = time.Duration(p.TTL) * time.Second
-	}
-	if ttl > s.cfg.MaxTTL || ttl <= 0 { // <= 0 catches overflow of huge ttl values
-		ttl = s.cfg.MaxTTL
+		// Compare in seconds so the multiplication below cannot overflow.
+		if int64(p.TTL) >= int64(s.cfg.MaxTTL/time.Second) {
+			ttl = s.cfg.MaxTTL
+		} else {
+			ttl = time.Duration(p.TTL) * time.Second
+		}
 	}
 
 	id := s.cfg.NewSessionID()
@@ -251,7 +254,9 @@ func (s *SessionService) SessionResume(ctx context.Context, p *SessionResumePara
 		return nil, NewRPCError(ErrSessionNotFound, nil)
 	}
 	if sess.IsExpired() {
-		s.expire(ctx, sess)
+		if _, err := s.expire(ctx, sess); err != nil {
+			return nil, NewRPCError(ErrInternalError, nil)
+		}
 		return nil, NewRPCError(ErrSessionExpired, nil)
 	}
 	// All messages of a session use the version negotiated at create.
@@ -341,6 +346,11 @@ func (s *SessionService) SessionClose(ctx context.Context, p *SessionCloseParams
 	if !ok {
 		return
 	}
+	// Serialise with fallback token rotation so a concurrent resume cannot
+	// write the session back after it was closed.
+	mu := s.lockFor(p.WMP.SessionID)
+	mu.Lock()
+	defer mu.Unlock()
 	sess, ok := s.cfg.Store.Get(p.WMP.SessionID)
 	if !ok || !sess.OwnedBy(principal.Key()) {
 		return
@@ -348,17 +358,37 @@ func (s *SessionService) SessionClose(ctx context.Context, p *SessionCloseParams
 	_ = s.cfg.Store.Delete(sess.ID)
 }
 
-// expire runs the expire hooks for sess and removes it.
-func (s *SessionService) expire(ctx context.Context, sess *Session) {
-	for _, h := range s.cfg.ExpireHooks {
-		h.OnSessionExpire(ctx, sess)
+// expire removes sess and, only if this call removed it, runs the expire
+// hooks. The record is re-read under the per-session lock and deleted before
+// the hooks run, so concurrent sweeps and resume attempts in this process
+// run the hooks at most once per session. A failed delete returns the error
+// and runs no hooks. It reports whether this call expired the session.
+func (s *SessionService) expire(ctx context.Context, sess *Session) (bool, error) {
+	mu := s.lockFor(sess.ID)
+	mu.Lock()
+	cur, ok := s.cfg.Store.Get(sess.ID)
+	if !ok || !cur.IsExpired() {
+		mu.Unlock()
+		return false, nil
 	}
-	_ = s.cfg.Store.Delete(sess.ID)
+	err := s.cfg.Store.Delete(sess.ID)
+	mu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	for _, h := range s.cfg.ExpireHooks {
+		h.OnSessionExpire(ctx, cur)
+	}
+	return true, nil
 }
 
-// Sweep removes expired sessions and returns how many were removed. When the
-// store implements ExpiredSessionLister the ExpireHooks run for each one
-// first. Call it periodically; it is safe for concurrent use.
+// Sweep removes expired sessions and returns how many it removed. When the
+// store implements ExpiredSessionLister the ExpireHooks run for each removed
+// session, and sessions that expire while the sweep runs are left for the
+// next one so none is removed without its hooks; otherwise Sweep only calls
+// Cleanup. Deletion errors are returned (after the remaining sessions were
+// tried) and failed deletions are not counted. Call it periodically; it is
+// safe for concurrent use.
 func (s *SessionService) Sweep(ctx context.Context) (int, error) {
 	l, ok := s.cfg.Store.(ExpiredSessionLister)
 	if !ok {
@@ -368,12 +398,18 @@ func (s *SessionService) Sweep(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	removed := 0
+	var errs []error
 	for _, sess := range expired {
-		s.expire(ctx, sess)
+		done, err := s.expire(ctx, sess)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if done {
+			removed++
+		}
 	}
-	// Anything that expired between the listing and now is removed without hooks.
-	extra, err := s.cfg.Store.Cleanup()
-	return len(expired) + extra, err
+	return removed, errors.Join(errs...)
 }
 
 // SessionHandler adapts a SessionService to the session methods of Handler.

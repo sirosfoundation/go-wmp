@@ -35,6 +35,15 @@ func (s slowStore) Get(id string) (*Session, bool) {
 	return sess, ok
 }
 
+// slowListerStore is a slow store that still exposes ListExpired.
+type slowListerStore struct{ *MemorySessionStore }
+
+func (s slowListerStore) Get(id string) (*Session, bool) {
+	sess, ok := s.MemorySessionStore.Get(id)
+	time.Sleep(2 * time.Millisecond)
+	return sess, ok
+}
+
 func newTestService(t *testing.T, mutate func(*SessionServiceConfig)) *SessionService {
 	t.Helper()
 	cfg := SessionServiceConfig{
@@ -105,6 +114,11 @@ func TestSessionServiceCreate(t *testing.T) {
 		t.Fatalf("capabilities must be offered∩supported with server params: %v", a.Capabilities)
 	}
 
+	assertStoredSession(t, store, a)
+}
+
+func assertStoredSession(t *testing.T, store *MemorySessionStore, a *SessionCreateResult) {
+	t.Helper()
 	sess, ok := store.Get(a.WMP.SessionID)
 	if !ok {
 		t.Fatal("session not stored")
@@ -185,6 +199,7 @@ func TestSessionServiceTTLClamp(t *testing.T) {
 		{"requested", 120, 2 * time.Minute},
 		{"clamped", 7200, time.Hour},
 		{"overflow", int(^uint(0) >> 1), time.Hour},
+		{"wraps to small positive when multiplied", 18446744074, time.Hour},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			p := createParams()
@@ -830,4 +845,161 @@ type composedHandler struct {
 
 func (c *composedHandler) MessageDeliver(ctx context.Context, p *MessageDeliverParams) {
 	c.msgCounter.MessageDeliver(ctx, p)
+}
+
+func TestSessionServiceCloseNotResurrectedByFallbackResume(t *testing.T) {
+	inner := NewMemorySessionStore()
+	s := newTestService(t, func(c *SessionServiceConfig) { c.Store = slowStore{plainStore{inner}} })
+	created := mustCreate(t, s, alice)
+	closeParams := &SessionCloseParams{WMP: Metadata{SessionID: created.WMP.SessionID}}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = s.SessionResume(ctxFor(alice), resumeParams(created, created.ResumptionToken))
+	}()
+	go func() {
+		defer wg.Done()
+		time.Sleep(time.Millisecond) // land between the resume's read and write
+		s.SessionClose(ctxFor(alice), closeParams)
+	}()
+	wg.Wait()
+	if _, ok := inner.Get(created.WMP.SessionID); ok {
+		t.Fatal("a closed session was written back by a concurrent resume")
+	}
+}
+
+func TestSessionServiceExpireHookRunsOnce(t *testing.T) {
+	inner := NewMemorySessionStore()
+	var calls atomic.Int32
+	s := newTestService(t, func(c *SessionServiceConfig) {
+		c.Store = slowListerStore{inner}
+		c.ExpireHooks = []SessionExpireHook{expireFunc(func(context.Context, *Session) { calls.Add(1) })}
+	})
+	created := mustCreate(t, s, alice)
+	sess, _ := inner.Get(created.WMP.SessionID)
+	sess.ExpiresAt = time.Now().Add(-time.Second)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = s.SessionResume(ctxFor(alice), resumeParams(created, created.ResumptionToken))
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = s.Sweep(context.Background())
+		}()
+	}
+	wg.Wait()
+	if calls.Load() != 1 {
+		t.Fatalf("expire hook ran %d times, want 1", calls.Load())
+	}
+}
+
+// failDeleteStore fails Delete for every session.
+type failDeleteStore struct{ *MemorySessionStore }
+
+func (failDeleteStore) Delete(string) error { return errors.New("boom") }
+
+func TestSessionServiceSweepDeleteFailure(t *testing.T) {
+	inner := NewMemorySessionStore()
+	hooks := 0
+	s := newTestService(t, func(c *SessionServiceConfig) {
+		c.Store = failDeleteStore{inner}
+		c.ExpireHooks = []SessionExpireHook{expireFunc(func(context.Context, *Session) { hooks++ })}
+	})
+	created := mustCreate(t, s, alice)
+	sess, _ := inner.Get(created.WMP.SessionID)
+	sess.ExpiresAt = time.Now().Add(-time.Second)
+
+	n, err := s.Sweep(context.Background())
+	if err == nil || n != 0 || hooks != 0 {
+		t.Fatalf("sweep = %d, %v, hooks %d; want 0, error, 0", n, err, hooks)
+	}
+	if _, err := s.SessionResume(ctxFor(alice), resumeParams(created, created.ResumptionToken)); err == nil || rpcCode(t, err) != ErrInternalError {
+		t.Fatalf("resume of undeletable expired session: %v", err)
+	}
+}
+
+func TestSessionServiceSweepLeavesSessionsExpiringMidSweep(t *testing.T) {
+	inner := NewMemorySessionStore()
+	var s *SessionService
+	var late *Session
+	s = newTestService(t, func(c *SessionServiceConfig) {
+		c.Store = inner
+		c.ExpireHooks = []SessionExpireHook{expireFunc(func(context.Context, *Session) {
+			late.ExpiresAt = time.Now().Add(-time.Second) // expires while the sweep runs
+		})}
+	})
+	first := mustCreate(t, s, alice)
+	sess, _ := inner.Get(first.WMP.SessionID)
+	sess.ExpiresAt = time.Now().Add(-time.Second)
+	l := mustCreate(t, s, alice)
+	late, _ = inner.Get(l.WMP.SessionID)
+
+	if n, err := s.Sweep(context.Background()); err != nil || n != 1 {
+		t.Fatalf("sweep = %d, %v", n, err)
+	}
+	if _, ok := inner.Get(l.WMP.SessionID); !ok {
+		t.Fatal("session that expired mid-sweep was removed without running its hooks")
+	}
+	if n, _ := s.Sweep(context.Background()); n != 1 {
+		t.Fatalf("next sweep removed %d, want 1", n)
+	}
+}
+
+func TestPeerCreateHookRejectionRemovesHandlerSession(t *testing.T) {
+	store := NewMemorySessionStore()
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Store = store })
+	peer := NewPeer(nil, NewSessionHandler(svc), WithSessionStore(store))
+	if err := peer.Use(&rejectingCreateProfile{}); err != nil {
+		t.Fatal(err)
+	}
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, createParams())
+	if msg.Error == nil || msg.Error.Code != ErrNotAuthorized {
+		t.Fatalf("want -31002, got %+v", msg.Error)
+	}
+	if all, _ := store.List(); len(all) != 0 {
+		t.Fatalf("%d orphaned sessions left after rejected create", len(all))
+	}
+}
+
+type rejectingCreateProfile struct{}
+
+func (rejectingCreateProfile) Name() string           { return "reject-create" }
+func (rejectingCreateProfile) Capabilities() []string { return nil }
+func (rejectingCreateProfile) Init(PeerContext) error { return nil }
+func (rejectingCreateProfile) OnSessionCreate(context.Context, *Session, *SessionCreateParams) error {
+	return NewRPCError(ErrNotAuthorized, nil)
+}
+func (rejectingCreateProfile) OnSessionClose(context.Context, *Session, *SessionCloseParams) {}
+
+// A client Peer records the version the server selected, whatever type the
+// caller decodes the result into, and stamps it on later messages.
+func TestPeerRecordsVersionFromOutboundCreateResponse(t *testing.T) {
+	old := SupportedVersions
+	SupportedVersions = []string{"0.1", "0.2"}
+	defer func() { SupportedVersions = old }()
+
+	clientT, serverT := newChanTransportPair()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Versions = []string{"0.1", "0.2"} })
+	server := NewPeer(serverT, NewSessionHandler(svc))
+	client := NewPeer(clientT, &BaseHandler{}, WithSessionIdentity("", "me"))
+	go server.Serve(ContextWithPrincipal(ctx, alice))
+	go client.Serve(ctx)
+
+	p := createParams()
+	p.WMP.Version = "0.2"
+	var raw json.RawMessage // not a SessionCreateResult
+	if err := client.Call(ctx, MethodSessionCreate, p, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := client.negotiated.Load().(string); v != "0.2" {
+		t.Fatalf("recorded version %q, want 0.2", v)
+	}
 }

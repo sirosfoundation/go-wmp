@@ -349,6 +349,11 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 				}
 			}
 			if hookErr := p.registry.runSessionCreateHooks(ctx, sess, &ps); hookErr != nil {
+				if existing {
+					// The client never learns this session's ID or token:
+					// do not leave the handler-created record behind.
+					_ = p.sessions.Delete(sess.ID)
+				}
 				return nil, toRPCError(hookErr)
 			}
 			if existing {
@@ -638,10 +643,24 @@ func (p *Peer) Call(ctx context.Context, method string, params interface{}, resu
 		if resp.Error != nil {
 			return resp.Error
 		}
+		if resp.Result != nil && (method == MethodSessionCreate || method == MethodSessionResume) {
+			p.recordNegotiatedVersion(resp.Result)
+		}
 		if result != nil && resp.Result != nil {
 			return json.Unmarshal(resp.Result, result)
 		}
 		return nil
+	}
+}
+
+// recordNegotiatedVersion remembers the version the remote side selected in a
+// session.create/resume result, whatever Go type the caller decodes it into.
+func (p *Peer) recordNegotiatedVersion(raw json.RawMessage) {
+	var r struct {
+		WMP Metadata `json:"wmp"`
+	}
+	if json.Unmarshal(raw, &r) == nil && r.WMP.Version != "" {
+		p.negotiated.Store(r.WMP.Version)
 	}
 }
 

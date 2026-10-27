@@ -9,7 +9,7 @@ import (
 // Both parts must be plain decimal digits: signs, spaces, empty parts and
 // extra components are rejected.
 func parseVersion(v string) (major, minor int, ok bool) {
-	maj, min, found := strings.Cut(v, ".")
+	maj, mnr, found := strings.Cut(v, ".")
 	if !found {
 		return 0, 0, false
 	}
@@ -17,7 +17,7 @@ func parseVersion(v string) (major, minor int, ok bool) {
 	if major, err = parseVersionPart(maj); err != nil {
 		return 0, 0, false
 	}
-	if minor, err = parseVersionPart(min); err != nil {
+	if minor, err = parseVersionPart(mnr); err != nil {
 		return 0, 0, false
 	}
 	return major, minor, true
