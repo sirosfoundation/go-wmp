@@ -26,6 +26,7 @@ func TestErrorMessage(t *testing.T) {
 		{ErrConsignmentModeUnsupported, "Consignment mode unsupported"},
 		{ErrAssuranceLevelUnsupported, "Assurance level unsupported"},
 		{ErrPolicyUnsupported, "Policy unsupported"},
+		{ErrPlaintextHashMismatch, "Plaintext hash mismatch"},
 		{ErrParseError, "Parse error"},
 		{ErrInvalidRequest, "Invalid Request"},
 		{ErrMethodNotFound, "Method not found"},

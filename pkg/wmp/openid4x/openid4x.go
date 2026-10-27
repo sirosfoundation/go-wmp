@@ -22,6 +22,12 @@ const (
 	FlowTypeOID4VP  = "oid4vp"
 )
 
+// Capability names defined by this profile (§2).
+const (
+	CapabilityOID4VCI = "oid4vci"
+	CapabilityOID4VP  = "oid4vp"
+)
+
 // Step constants for OID4VCI flows.
 const (
 	StepParsingOffer            = "parsing_offer"
@@ -423,6 +429,10 @@ type Config struct {
 	// OID4VP configures verifiable presentation support. Nil to disable.
 	OID4VP *OID4VPCapability
 
+	// TransactionData configures the transaction_data capability descriptor
+	// returned by CapabilityDescriptors. Nil to omit.
+	TransactionData *wmp.TransactionDataCap
+
 	// OnVCIStart is called when an OID4VCI flow starts.
 	OnVCIStart FlowStartHandler
 
@@ -467,6 +477,20 @@ func (p *Profile) Capabilities() []string {
 		caps = append(caps, "oid4vp")
 	}
 	return caps
+}
+
+// RequiredCapability implements wmp.CapabilityRequirer: each flow type needs
+// the capability of the same name to have been negotiated (core §6.5 item 2;
+// this profile §2). wmp.Peer therefore answers wmp.flow.start for a flow type
+// the session did not negotiate with -31005.
+func (p *Profile) RequiredCapability(flowType string) string {
+	switch flowType {
+	case FlowTypeOID4VCI:
+		return CapabilityOID4VCI
+	case FlowTypeOID4VP:
+		return CapabilityOID4VP
+	}
+	return ""
 }
 
 func (p *Profile) Init(ctx wmp.PeerContext) error {
