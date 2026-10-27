@@ -276,9 +276,9 @@ func (s *SessionService) SessionResume(ctx context.Context, p *SessionResumePara
 		return nil, NewRPCError(ErrSessionExpired, nil)
 	}
 	// All messages of a session use the version negotiated at create.
-	version, ok := s.sessionVersion(sess, p.WMP.Version)
-	if !ok {
-		return nil, versionError([]string{sess.Metadata[MetadataKeyVersion]})
+	version, vErr := s.sessionVersion(sess, p.WMP.Version)
+	if vErr != nil {
+		return nil, vErr
 	}
 
 	newToken, err := NewResumptionToken()
@@ -337,12 +337,24 @@ func (s *SessionService) lostRotation(ctx context.Context, principal Principal, 
 // sessionVersion returns the version to use on resume: the one stored at
 // create, provided the client still offers at least that. Sessions without a
 // stored version (not created by this service) fall back to negotiation.
-func (s *SessionService) sessionVersion(sess *Session, offered string) (string, bool) {
+func (s *SessionService) sessionVersion(sess *Session, offered string) (string, *RPCError) {
 	stored := sess.Metadata[MetadataKeyVersion]
 	if stored == "" {
-		return NegotiateVersion(offered, s.cfg.Versions)
+		v, ok := NegotiateVersion(offered, s.cfg.Versions)
+		if !ok {
+			return "", versionError(s.cfg.Versions)
+		}
+		return v, nil
 	}
-	return NegotiateVersion(offered, []string{stored})
+	// The pinned version must still be one this service supports.
+	if !containsString(s.cfg.Versions, stored) {
+		return "", versionError(s.cfg.Versions)
+	}
+	v, ok := NegotiateVersion(offered, []string{stored})
+	if !ok {
+		return "", versionError([]string{stored})
+	}
+	return v, nil
 }
 
 // rotate swaps the resumption token atomically through TokenRotator, or under
@@ -469,6 +481,10 @@ type SessionHandler struct {
 
 // NewSessionHandler returns a SessionHandler backed by svc.
 func NewSessionHandler(svc *SessionService) SessionHandler { return SessionHandler{svc: svc} }
+
+// SupportedVersions returns the versions the service offers (implements
+// VersionProvider), so a Peer negotiates against the same set.
+func (h SessionHandler) SupportedVersions() []string { return h.svc.cfg.Versions }
 
 // SessionStore returns the service's store (implements SessionStoreProvider).
 func (h SessionHandler) SessionStore() SessionStore { return h.svc.cfg.Store }
