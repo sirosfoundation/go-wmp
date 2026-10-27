@@ -88,7 +88,9 @@ func redactCompletion(env map[string]json.RawMessage) (replay []byte, changed, o
 // because a live completion never carries it.
 func mayNeedRedaction(data []byte) bool {
 	lower := bytes.ToLower(data) // member names match case-insensitively downstream
-	if bytes.Contains(lower, []byte(`\u`)) || bytes.Contains(lower, []byte(`"`+redactedMembersKey+`"`)) {
+	// Unicode case folding (U+017F long s, U+212A Kelvin sign) can spell a
+	// secret member with non-ASCII bytes, so any such byte forces a parse.
+	if bytes.IndexFunc(data, func(r rune) bool { return r >= 0x80 }) >= 0 || bytes.Contains(lower, []byte(`\u`)) || bytes.Contains(lower, []byte(`"`+redactedMembersKey+`"`)) {
 		return true
 	}
 	for _, k := range replaySecretMembers {

@@ -54,6 +54,7 @@ func TestSplitReplaySecrets_FailClosed(t *testing.T) {
 		"case-variant params":  []byte(`{"method":"wmp.flow.complete","PARAMS":{"result":{"refresh_token":"S"}}}`),
 		"case-variant result":  completeMsgKey("Result", `{"refresh_token":"S"}`),
 		"case-variant secret":  completeMsg(`{"Refresh_Token":"S"}`),
+		"long s secret":        completeMsg("{\"refre\u017fh_token\":\"S\"}"),
 		"method not a string":  []byte(`{"jsonrpc":"2.0","method":42,"params":{"result":{"refresh_token":"S"}}}`),
 		"method null":          []byte(`{"method":null,"params":{"result":{"refresh_token":"S"}}}`),
 		"dup result":           []byte(`{"method":"wmp.flow.complete","params":{"result":{"refresh_token":"S"},"result":{}}}`),
@@ -160,5 +161,13 @@ func checkSplit(t *testing.T, in []byte, withheld []string) {
 	}
 	if err := ValidateCompletionResult(res); err != nil {
 		t.Errorf("replay does not validate: %v", err)
+	}
+}
+
+func TestSplitReplaySecrets_NonASCIISecretFreePassesThrough(t *testing.T) {
+	in := completeMsg(`{"credential_metadata":{"display":[{"name":"Åre kommun"}]}}`)
+	replay, live, ok := SplitReplaySecrets(in)
+	if !ok || live != nil || string(replay) != string(in) {
+		t.Fatalf("got %s / %s / %v", replay, live, ok)
 	}
 }
