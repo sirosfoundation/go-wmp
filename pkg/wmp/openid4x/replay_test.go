@@ -39,44 +39,7 @@ func TestSplitReplaySecrets(t *testing.T) {
 		{"error response mentioning member", []byte(`{"jsonrpc":"2.0","id":1,"result":{"refresh_token":"r"}}`), nil},
 	}
 	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			replay, live, ok := SplitReplaySecrets(tc.in)
-			if !ok {
-				t.Fatal("ok=false")
-			}
-			if tc.withheld == nil {
-				if live != nil || string(replay) != string(tc.in) {
-					t.Fatalf("expected unchanged replay and nil live, got %s / %s", replay, live)
-				}
-				return
-			}
-			if string(live) != string(tc.in) {
-				t.Fatalf("live must be the original")
-			}
-			res := resultOf(t, replay)
-			var m map[string]json.RawMessage
-			if err := json.Unmarshal(res, &m); err != nil {
-				t.Fatal(err)
-			}
-			for _, k := range ReplaySecretMembers {
-				if _, has := m[k]; has {
-					t.Errorf("%s leaked into replay", k)
-				}
-			}
-			var red []string
-			if err := json.Unmarshal(m["redacted_members"], &red); err != nil || !reflect.DeepEqual(red, tc.withheld) {
-				t.Errorf("redacted_members = %v (%v), want %v", red, err, tc.withheld)
-			}
-			// credential_metadata is never touched.
-			var orig map[string]json.RawMessage
-			_ = json.Unmarshal(resultOf(t, tc.in), &orig)
-			if string(m["credential_metadata"]) != string(orig["credential_metadata"]) {
-				t.Errorf("credential_metadata changed")
-			}
-			if err := ValidateCompletionResult(res); err != nil {
-				t.Errorf("replay does not validate: %v", err)
-			}
-		})
+		t.Run(tc.name, func(t *testing.T) { checkSplit(t, tc.in, tc.withheld) })
 	}
 }
 
@@ -87,6 +50,10 @@ func TestSplitReplaySecrets_FailClosed(t *testing.T) {
 		"result not object":    []byte(`{"method":"wmp.flow.complete","params":{"result":"refresh_token"}}`),
 		"result null":          []byte(`{"method":"wmp.flow.complete","params":{"result":null,"x":"refresh_token"}}`),
 		"already redacted":     completeMsg(`{"refresh_token":"r","redacted_members":["dpop_jwk"]}`),
+		"case-variant method":  []byte(`{"Method":"wmp.flow.complete","params":{"result":{"refresh_token":"S"}}}`),
+		"case-variant params":  []byte(`{"method":"wmp.flow.complete","PARAMS":{"result":{"refresh_token":"S"}}}`),
+		"case-variant result":  completeMsgKey("Result", `{"refresh_token":"S"}`),
+		"case-variant secret":  completeMsg(`{"Refresh_Token":"S"}`),
 		"method not a string":  []byte(`{"jsonrpc":"2.0","method":42,"params":{"result":{"refresh_token":"S"}}}`),
 		"method null":          []byte(`{"method":null,"params":{"result":{"refresh_token":"S"}}}`),
 		"dup result":           []byte(`{"method":"wmp.flow.complete","params":{"result":{"refresh_token":"S"},"result":{}}}`),
@@ -149,5 +116,49 @@ func TestSplitReplaySecrets_ResultOptionalAndEscapes(t *testing.T) {
 	in = []byte(`{"id":1,"result":{"refresh_token":"x"}}`)
 	if replay, live, ok = SplitReplaySecrets(in); !ok || live != nil || string(replay) != string(in) {
 		t.Fatalf("got %s / %s / %v", replay, live, ok)
+	}
+}
+
+func completeMsgKey(key, result string) []byte {
+	return []byte(`{"method":"wmp.flow.complete","params":{"` + key + `":` + result + `}}`)
+}
+
+func checkSplit(t *testing.T, in []byte, withheld []string) {
+	t.Helper()
+	replay, live, ok := SplitReplaySecrets(in)
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if withheld == nil {
+		if live != nil || string(replay) != string(in) {
+			t.Fatalf("expected unchanged replay and nil live, got %s / %s", replay, live)
+		}
+		return
+	}
+	if string(live) != string(in) {
+		t.Fatalf("live must be the original")
+	}
+	res := resultOf(t, replay)
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(res, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range ReplaySecretMembers {
+		if _, has := m[k]; has {
+			t.Errorf("%s leaked into replay", k)
+		}
+	}
+	var red []string
+	if err := json.Unmarshal(m["redacted_members"], &red); err != nil || !reflect.DeepEqual(red, withheld) {
+		t.Errorf("redacted_members = %v (%v), want %v", red, err, withheld)
+	}
+	// credential_metadata is never touched.
+	var orig map[string]json.RawMessage
+	_ = json.Unmarshal(resultOf(t, in), &orig)
+	if string(m["credential_metadata"]) != string(orig["credential_metadata"]) {
+		t.Errorf("credential_metadata changed")
+	}
+	if err := ValidateCompletionResult(res); err != nil {
+		t.Errorf("replay does not validate: %v", err)
 	}
 }

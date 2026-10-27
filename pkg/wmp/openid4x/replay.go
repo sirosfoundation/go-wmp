@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"strings"
 )
 
 const (
@@ -30,7 +31,7 @@ func SplitReplaySecrets(data []byte) (replay, live []byte, ok bool) {
 	if !mayNeedRedaction(data) {
 		return data, nil, true
 	}
-	env, isObj := unmarshalObject(data)
+	env, isObj := unmarshalObject(data, "method", "params")
 	if !isObj {
 		return nil, nil, false
 	}
@@ -58,7 +59,7 @@ func SplitReplaySecrets(data []byte) (replay, live []byte, ok bool) {
 // redactCompletion redacts the result of a decoded wmp.flow.complete
 // envelope. changed is false when there was nothing to withhold.
 func redactCompletion(env map[string]json.RawMessage) (replay []byte, changed, ok bool) {
-	params, isObj := unmarshalObject(env["params"])
+	params, isObj := unmarshalObject(env["params"], "result")
 	if !isObj {
 		return nil, false, false
 	}
@@ -66,7 +67,7 @@ func redactCompletion(env map[string]json.RawMessage) (replay []byte, changed, o
 	if !has {
 		return nil, false, true // result is optional
 	}
-	result, isObj := unmarshalObject(rawResult)
+	result, isObj := unmarshalObject(rawResult, append([]string{redactedMembersKey}, replaySecretMembers[:]...)...)
 	if !isObj {
 		return nil, false, false
 	}
@@ -86,11 +87,12 @@ func redactCompletion(env map[string]json.RawMessage) (replay []byte, changed, o
 // ("\u0072efresh_token"), so any escape counts; redacted_members counts
 // because a live completion never carries it.
 func mayNeedRedaction(data []byte) bool {
-	if bytes.Contains(data, []byte(`\u`)) || bytes.Contains(data, []byte(`"`+redactedMembersKey+`"`)) {
+	lower := bytes.ToLower(data) // member names match case-insensitively downstream
+	if bytes.Contains(lower, []byte(`\u`)) || bytes.Contains(lower, []byte(`"`+redactedMembersKey+`"`)) {
 		return true
 	}
 	for _, k := range replaySecretMembers {
-		if bytes.Contains(data, []byte(`"`+k+`"`)) {
+		if bytes.Contains(lower, []byte(`"`+k+`"`)) {
 			return true
 		}
 	}
@@ -100,8 +102,10 @@ func mayNeedRedaction(data []byte) bool {
 // unmarshalObject decodes a JSON object into its members. It reports false
 // for anything but exactly one object whose keys are distinct after unescaping:
 // a duplicate key would otherwise let a decoder keep one value while another
-// reader sees the other.
-func unmarshalObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+// reader sees the other. It also refuses a key that differs from one of the
+// exact names only in letter case, because Go's decoders (wmp.DecodeMessage
+// among them) match member names case-insensitively.
+func unmarshalObject(raw json.RawMessage, exact ...string) (map[string]json.RawMessage, bool) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return nil, false
@@ -113,7 +117,7 @@ func unmarshalObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 		if err != nil || !isStr {
 			return nil, false
 		}
-		if _, dup := m[key]; dup {
+		if _, dup := m[key]; dup || caseVariant(key, exact) {
 			return nil, false
 		}
 		var val json.RawMessage
@@ -129,6 +133,15 @@ func unmarshalObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 		return nil, false
 	}
 	return m, true
+}
+
+func caseVariant(key string, exact []string) bool {
+	for _, e := range exact {
+		if key != e && strings.EqualFold(key, e) {
+			return true
+		}
+	}
+	return false
 }
 
 // withholdSecrets deletes the replay secret members from result and returns
