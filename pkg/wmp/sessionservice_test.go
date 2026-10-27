@@ -1528,3 +1528,103 @@ func TestSessionServiceExpiryDuringRotationIsExpired(t *testing.T) {
 		t.Fatal("expired session must be removed")
 	}
 }
+
+type mutatingCreateProfile struct{ fn func(*Session) }
+
+func (mutatingCreateProfile) Name() string           { return "mutate-on-create" }
+func (mutatingCreateProfile) Capabilities() []string { return nil }
+func (mutatingCreateProfile) Init(PeerContext) error { return nil }
+func (p mutatingCreateProfile) OnSessionCreate(_ context.Context, s *Session, _ *SessionCreateParams) error {
+	p.fn(s)
+	return nil
+}
+func (mutatingCreateProfile) OnSessionClose(context.Context, *Session, *SessionCloseParams) {}
+
+// copyStore deep-copies sessions on Get, like a database-backed store.
+type copyStore struct{ *MemorySessionStore }
+
+func (s copyStore) Get(id string) (*Session, bool) {
+	sess, ok := s.MemorySessionStore.Get(id)
+	if !ok {
+		return nil, false
+	}
+	return cloneSession(sess), true
+}
+
+func TestPeerCreateHookChangesAreReflectedInResponse(t *testing.T) {
+	inner := NewMemorySessionStore()
+	st := copyStore{inner}
+	svc := newTestService(t, func(c *SessionServiceConfig) {
+		c.Store = st
+		c.Supported = Capabilities{"a": json.RawMessage(`{}`), "b": json.RawMessage(`{}`)}
+	})
+	peer := NewPeer(nil, NewSessionHandler(svc), WithSessionStore(st))
+	if err := peer.Use(mutatingCreateProfile{func(s *Session) { delete(s.Capabilities, "b") }}); err != nil {
+		t.Fatal(err)
+	}
+	p := createParams()
+	p.CapabilitiesOffered = Capabilities{"a": json.RawMessage(`{}`), "b": json.RawMessage(`{}`)}
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, p)
+	var res SessionCreateResult
+	if err := json.Unmarshal(msg.Result, &res); err != nil || msg.Error != nil {
+		t.Fatalf("%v %+v", err, msg.Error)
+	}
+	if _, ok := res.Capabilities["b"]; ok || len(res.Capabilities) != 1 {
+		t.Fatalf("response advertises %v, but the hook removed b", res.Capabilities)
+	}
+	stored, _ := st.Get(res.WMP.SessionID)
+	if _, ok := stored.Capabilities["b"]; ok {
+		t.Fatal("hook change was not persisted")
+	}
+}
+
+// Create hooks must not write the store's live record while lifecycle code
+// reads it: run with -race.
+func TestPeerCreateHooksUseSnapshot(t *testing.T) {
+	store := NewMemorySessionStore()
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Store = store })
+	peer := NewPeer(nil, NewSessionHandler(svc), WithSessionStore(store))
+	started := make(chan struct{})
+	if err := peer.Use(mutatingCreateProfile{func(s *Session) {
+		close(started)
+		for i := 0; i < 200; i++ {
+			s.ExpiresAt = time.Now().Add(time.Hour)
+			s.Capabilities["x"] = json.RawMessage(`{}`)
+			time.Sleep(100 * time.Microsecond)
+		}
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-started
+		for i := 0; i < 200; i++ {
+			_, _ = svc.Sweep(context.Background())
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, createParams())
+	wg.Wait()
+	if msg.Error != nil {
+		t.Fatalf("%+v", msg.Error)
+	}
+}
+
+func TestStampResumeUsesTargetSessionVersion(t *testing.T) {
+	local, remote := newChanTransportPair()
+	peer := NewPeer(local, &BaseHandler{}, WithSessionIdentity("ses-other", "me"))
+	peer.recordVersion("ses-t", "0.2")
+	peer.recordVersion("ses-other", "0.1")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = peer.Call(ctx, MethodSessionResume, &SessionResumeParams{SessionID: "ses-t", ResumptionToken: "t"}, nil)
+	var meta Metadata
+	if err := json.Unmarshal(readOutbound(t, remote)["wmp"], &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.Version != "0.2" || meta.SessionID != "ses-t" {
+		t.Fatalf("resume stamped %+v, want the target session ses-t at 0.2", meta)
+	}
+}

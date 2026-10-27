@@ -553,7 +553,7 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 
 // Notify sends a JSON-RPC 2.0 notification (no response expected).
 func (p *Peer) Notify(ctx context.Context, method string, params interface{}) error {
-	params, err := p.stamp(params)
+	params, err := p.stamp(method, params)
 	if err != nil {
 		return err
 	}
@@ -589,7 +589,7 @@ func (p *Peer) Call(ctx context.Context, method string, params interface{}, resu
 	if err != nil {
 		return err
 	}
-	params, err = p.stamp(params)
+	params, err = p.stamp(method, params)
 	if err != nil {
 		return err
 	}
@@ -810,6 +810,9 @@ func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, resu
 			Metadata:        map[string]string{MetadataKeyVersion: result.WMP.Version},
 		}
 	}
+	// Hooks work on a private copy: the store may hand out its live record,
+	// which lifecycle code (Sweep) reads under the store's own lock.
+	sess = cloneSession(sess)
 	if hookErr := p.registry.runSessionCreateHooks(ctx, sess, ps); hookErr != nil {
 		if existing {
 			// The client never learns this session's ID or token: do not
@@ -835,7 +838,31 @@ func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, resu
 		_ = p.store().Delete(sess.ID)
 		return NewRPCError(ErrInternalError, nil)
 	}
+	// What was persisted is what the client is told.
+	result.Capabilities = sess.Capabilities
+	result.Security = sess.Security
+	result.ResumptionToken = sess.ResumptionToken
 	return nil
+}
+
+// cloneSession deep-copies the mutable parts of a session.
+func cloneSession(s *Session) *Session {
+	c := *s
+	c.Participants = append([]string(nil), s.Participants...)
+	c.Security.EncryptedCapabilities = append([]string(nil), s.Security.EncryptedCapabilities...)
+	if s.Capabilities != nil {
+		c.Capabilities = make(Capabilities, len(s.Capabilities))
+		for k, v := range s.Capabilities {
+			c.Capabilities[k] = append(json.RawMessage(nil), v...)
+		}
+	}
+	if s.Metadata != nil {
+		c.Metadata = make(map[string]string, len(s.Metadata))
+		for k, v := range s.Metadata {
+			c.Metadata[k] = v
+		}
+	}
+	return &c
 }
 
 // SessionUpdater is an optional SessionStore extension: UpdateIfPresent
@@ -1041,7 +1068,7 @@ func negotiateOrReject(offered string) (string, *RPCError) {
 
 // stamp adds the session identity (WithSessionIdentity) to the "wmp" object
 // of outbound params. Params that are not a JSON object are returned as is.
-func (p *Peer) stamp(params interface{}) (interface{}, error) {
+func (p *Peer) stamp(method string, params interface{}) (interface{}, error) {
 	if p.identity == nil || params == nil {
 		return params, nil
 	}
@@ -1065,11 +1092,15 @@ func (p *Peer) stamp(params interface{}) (interface{}, error) {
 	// Patch only missing or empty members; everything else the caller put in
 	// the envelope (signature, encrypted, assertions...) stays byte for byte.
 	sessionID := stringMember(meta, "session_id")
-	if err := fillMember(meta, "session_id", p.identity.sessionID); err != nil {
-		return nil, err
+	if sessionID == "" && method == MethodSessionResume {
+		// A resume names its target session at the top level, not in wmp.
+		sessionID = stringMember(obj, "session_id")
 	}
 	if sessionID == "" {
 		sessionID = p.identity.sessionID
+	}
+	if err := fillMember(meta, "session_id", sessionID); err != nil {
+		return nil, err
 	}
 	if err := fillMember(meta, "version", p.versionFor(sessionID)); err != nil {
 		return nil, err
