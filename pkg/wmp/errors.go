@@ -21,6 +21,7 @@ const (
 	ErrConsignmentModeUnsupported = -31016
 	ErrAssuranceLevelUnsupported  = -31017
 	ErrPolicyUnsupported          = -31018
+	ErrPlaintextHashMismatch      = -31019
 )
 
 // Standard JSON-RPC 2.0 error codes.
@@ -73,6 +74,8 @@ func ErrorMessage(code int) string {
 		return "Assurance level unsupported"
 	case ErrPolicyUnsupported:
 		return "Policy unsupported"
+	case ErrPlaintextHashMismatch:
+		return "Plaintext hash mismatch"
 	case ErrParseError:
 		return "Parse error"
 	case ErrInvalidRequest:
