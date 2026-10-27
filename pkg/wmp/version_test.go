@@ -25,6 +25,9 @@ func TestNegotiateVersion(t *testing.T) {
 		{"negative rejected", "-0.1", []string{"0.1"}, "", false},
 		{"space rejected", "0. 1", []string{"0.1"}, "", false},
 		{"huge rejected", "0.99999999999", []string{"0.1"}, "", false},
+		{"leading zero minor rejected", "0.01", []string{"0.1"}, "", false},
+		{"leading zero major rejected", "00.1", []string{"0.1"}, "", false},
+		{"zero minor accepted", "0.0", []string{"0.0"}, "0.0", true},
 		{"junk supported ignored", "0.2", []string{"x", "0.1"}, "0.1", true},
 		{"nothing supported", "0.1", nil, "", false},
 	}

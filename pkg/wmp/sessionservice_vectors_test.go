@@ -31,13 +31,19 @@ type createResultView struct {
 	} `json:"result"`
 }
 
-func runCreateVector(t *testing.T, v TestVector) {
+// vectorPeer builds the responder a vector's setup describes.
+func vectorPeer(v TestVector) *wmp.Peer {
 	store := wmp.NewMemorySessionStore()
 	svc := wmp.NewSessionService(wmp.SessionServiceConfig{
 		Store:     store,
+		Versions:  v.Setup.SupportedVersions,
 		Supported: wmp.Capabilities{"messaging": json.RawMessage(`{"max_size":65536}`)},
 	})
-	peer := wmp.NewPeer(nil, wmp.NewSessionHandler(svc), wmp.WithSessionStore(store))
+	return wmp.NewPeer(nil, wmp.NewSessionHandler(svc), wmp.WithSessionStore(store))
+}
+
+func runCreateVector(t *testing.T, v TestVector) {
+	peer := vectorPeer(v)
 	resp, err := peer.HandleRequestSync(wmp.ContextWithPrincipal(context.Background(), wmp.Principal{Subject: "alice"}), v.Input)
 	if err != nil {
 		t.Fatal(err)
@@ -68,6 +74,30 @@ func TestSessionServiceVectors(t *testing.T) {
 			continue
 		}
 		t.Run(v.ID, func(t *testing.T) { runCreateVector(t, v) })
+	}
+}
+
+// Version-negotiation error vectors (errors.json) run through the service:
+// -31013 carries supported_versions, a malformed version is -32602.
+func TestSessionServiceVersionErrorVectors(t *testing.T) {
+	ran := 0
+	for _, v := range loadVectors(t, "errors.json") {
+		if len(v.Setup.SupportedVersions) == 0 || !hasJSONValue(v.ExpectedError) {
+			continue
+		}
+		ran++
+		t.Run(v.ID, func(t *testing.T) {
+			resp, err := vectorPeer(v).HandleRequestSync(wmp.ContextWithPrincipal(context.Background(), wmp.Principal{Subject: "alice"}), v.Input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !jsonEqual(t, resp, v.ExpectedError) {
+				t.Fatalf("response %s\nwant %s", resp, v.ExpectedError)
+			}
+		})
+	}
+	if ran == 0 {
+		t.Skip("no version-error vectors in this spec checkout")
 	}
 }
 

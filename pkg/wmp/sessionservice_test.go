@@ -147,7 +147,10 @@ func TestSessionServiceCreateRejects(t *testing.T) {
 		{"no principal", context.Background(), nil, ErrNotAuthorized},
 		{"anonymous principal", ctxFor(Principal{Tenant: "t"}), nil, ErrNotAuthorized},
 		{"other major", ctxFor(alice), func(p *SessionCreateParams) { p.WMP.Version = "1.0" }, ErrVersionNotSupported},
-		{"empty version", ctxFor(alice), func(p *SessionCreateParams) { p.WMP.Version = "" }, ErrVersionNotSupported},
+		{"empty version", ctxFor(alice), func(p *SessionCreateParams) { p.WMP.Version = "" }, ErrInvalidParams},
+		{"v prefix", ctxFor(alice), func(p *SessionCreateParams) { p.WMP.Version = "v0.1" }, ErrInvalidParams},
+		{"three parts", ctxFor(alice), func(p *SessionCreateParams) { p.WMP.Version = "0.1.0" }, ErrInvalidParams},
+		{"leading zero", ctxFor(alice), func(p *SessionCreateParams) { p.WMP.Version = "0.01" }, ErrInvalidParams},
 		{"unsupported mode", ctxFor(alice), func(p *SessionCreateParams) { p.Security.Mode = "mls" }, ErrInvalidParams},
 		{"negative ttl", ctxFor(alice), func(p *SessionCreateParams) { p.TTL = -1 }, ErrInvalidParams},
 	}
