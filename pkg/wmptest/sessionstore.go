@@ -37,6 +37,7 @@ var (
 		{"Rotate/SuccessIsOneTimeUse", testRotateSuccessIsOneTimeUse},
 		{"Rotate/Mismatch", testRotateMismatch},
 		{"Rotate/EmptyOldNeverMatchesEmptyStored", testRotateEmptyOldNeverMatchesEmptyStored},
+		{"Rotate/InvalidNewToken", testRotateInvalidNewToken},
 		{"Rotate/UnknownSession", testRotateUnknownSession},
 		{"Rotate/ExpiredSession", testRotateExpiredSession},
 		{"Rotate/ExpiredToken", testRotateExpiredToken},
@@ -211,7 +212,7 @@ func testRotateSuccessIsOneTimeUse(t *testing.T, newStore func() wmp.SessionStor
 		t.Fatalf("returned session: %+v", got)
 	}
 	stored, _ := s.Get("s1")
-	if stored.ResumptionToken != tokNew || stored.Owner != ownerAlice {
+	if stored.ResumptionToken != tokNew || stored.Owner != ownerAlice || !stored.ResumptionTokenExpiresAt.Equal(exp) {
 		t.Fatalf("stored session: %+v", stored)
 	}
 	// The old token is dead: replaying it must fail.
@@ -244,6 +245,25 @@ func testRotateEmptyOldNeverMatchesEmptyStored(t *testing.T, newStore func() wmp
 	}
 	if _, err := rot(s).RotateResumptionToken("s1", "", "n", time.Time{}); !errors.Is(err, wmp.ErrTokenMismatch) {
 		t.Fatalf("got %v, want ErrTokenMismatch", err)
+	}
+}
+
+func testRotateInvalidNewToken(t *testing.T, newStore func() wmp.SessionStore) {
+	s := newStore()
+	if err := s.Create(newSession("s1")); err != nil {
+		t.Fatal(err)
+	}
+	// Reusing the presented token (or an empty one) would leave the old token
+	// valid, defeating single use, and must not succeed - repeatedly.
+	for _, nt := range []string{tokS1, ""} {
+		for i := 0; i < 2; i++ {
+			if _, err := rot(s).RotateResumptionToken("s1", tokS1, nt, time.Time{}); !errors.Is(err, wmp.ErrInvalidNewToken) {
+				t.Fatalf("new=%q: got %v, want ErrInvalidNewToken", nt, err)
+			}
+		}
+	}
+	if got, _ := s.Get("s1"); got.ResumptionToken != tokS1 {
+		t.Fatal("rejected rotation changed the token")
 	}
 }
 

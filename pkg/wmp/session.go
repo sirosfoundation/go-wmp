@@ -16,6 +16,10 @@ var (
 	// not the session's current token (never issued, already rotated, or
 	// empty).
 	ErrTokenMismatch = errors.New("wmp: resumption token mismatch")
+	// ErrInvalidNewToken is returned when the replacement token is empty or
+	// equal to the presented token (which would leave the old token usable
+	// and break single-use).
+	ErrInvalidNewToken = errors.New("wmp: invalid replacement resumption token")
 	// ErrTokenExpired is returned when the presented token is the session's
 	// current token but its ResumptionTokenExpiresAt has passed.
 	ErrTokenExpired = errors.New("wmp: resumption token expired")
@@ -91,7 +95,8 @@ type SessionStore interface {
 //
 // It returns the updated session, ErrNoSuchSession if the session is absent
 // or expired, ErrTokenMismatch if oldToken is empty or not the current token,
-// or ErrTokenExpired if it is current but past ResumptionTokenExpiresAt. The
+// ErrTokenExpired if it is current but past ResumptionTokenExpiresAt, or
+// ErrInvalidNewToken if newToken is empty or equals oldToken. The
 // comparison must be constant-time (see TokensEqual). Stores that cannot be
 // atomic do not implement it; callers then serialise per session themselves.
 type TokenRotator interface {
@@ -180,6 +185,9 @@ var _ TokenRotator = (*MemorySessionStore)(nil)
 // replaced by an updated copy, so *Session values handed out earlier by Get
 // are never mutated.
 func (s *MemorySessionStore) RotateResumptionToken(id, oldToken, newToken string, exp time.Time) (*Session, error) {
+	if newToken == "" || TokensEqual(newToken, oldToken) {
+		return nil, ErrInvalidNewToken
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[id]
