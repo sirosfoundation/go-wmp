@@ -226,11 +226,14 @@ func (s *SessionService) negotiateCapabilities(ctx context.Context, offered Capa
 }
 
 // tokenExpiry is now+ResumptionTTL, never later than the session expiry.
+// A zero sessionExpiry means the session does not expire: the token then gets
+// the plain ResumptionTTL (or no expiry if that is unset too).
 func (s *SessionService) tokenExpiry(now, sessionExpiry time.Time) time.Time {
 	if s.cfg.ResumptionTTL <= 0 {
 		return sessionExpiry
 	}
-	if exp := now.Add(s.cfg.ResumptionTTL); exp.Before(sessionExpiry) {
+	exp := now.Add(s.cfg.ResumptionTTL)
+	if sessionExpiry.IsZero() || exp.Before(sessionExpiry) {
 		return exp
 	}
 	return sessionExpiry
@@ -392,6 +395,15 @@ func (s *SessionService) expire(ctx context.Context, sess *Session) (bool, error
 func (s *SessionService) Sweep(ctx context.Context) (int, error) {
 	l, ok := s.cfg.Store.(ExpiredSessionLister)
 	if !ok {
+		// Cleanup must not run between a fallback rotation's read and write.
+		for i := range s.locks {
+			s.locks[i].Lock()
+		}
+		defer func() {
+			for i := range s.locks {
+				s.locks[i].Unlock()
+			}
+		}()
 		return s.cfg.Store.Cleanup()
 	}
 	expired, err := l.ListExpired()
@@ -425,6 +437,9 @@ type SessionHandler struct {
 
 // NewSessionHandler returns a SessionHandler backed by svc.
 func NewSessionHandler(svc *SessionService) SessionHandler { return SessionHandler{svc: svc} }
+
+// SessionStore returns the service's store (implements SessionStoreProvider).
+func (h SessionHandler) SessionStore() SessionStore { return h.svc.cfg.Store }
 
 // Service returns the underlying SessionService.
 func (h SessionHandler) Service() *SessionService { return h.svc }

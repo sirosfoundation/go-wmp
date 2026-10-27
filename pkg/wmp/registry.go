@@ -175,6 +175,13 @@ func (r *registry) runSessionCreateHooks(ctx context.Context, session *Session, 
 	return nil
 }
 
+// hasResumers reports whether any resume hook is registered.
+func (r *registry) hasResumers() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.resumeHooks) > 0
+}
+
 // runSessionResumers calls all registered resume hooks, stopping at the
 // first error.
 func (r *registry) runSessionResumers(ctx context.Context, session *Session, params *SessionResumeParams) error {

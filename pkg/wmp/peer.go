@@ -147,12 +147,32 @@ func (p *Peer) SetSessionStore(store SessionStore) {
 	p.sessions = store
 }
 
+// SessionStoreProvider is implemented by handlers that own a SessionStore
+// (SessionHandler). A Peer without WithSessionStore uses it, so the session
+// lookups behind capability gating, create/resume hooks and per-session
+// versions work with the store the handler actually writes to.
+type SessionStoreProvider interface {
+	SessionStore() SessionStore
+}
+
+// store returns the session store: the WithSessionStore one, else the
+// handler's, else nil.
+func (p *Peer) store() SessionStore {
+	if p.sessions != nil {
+		return p.sessions
+	}
+	if sp, ok := p.handler.(SessionStoreProvider); ok {
+		return sp.SessionStore()
+	}
+	return nil
+}
+
 // Session returns the session for the given ID, or nil. Implements PeerContext.
 func (p *Peer) Session(id string) *Session {
-	if p.sessions == nil {
+	if p.store() == nil {
 		return nil
 	}
-	s, _ := p.sessions.Get(id)
+	s, _ := p.store().Get(id)
 	return s
 }
 
@@ -278,8 +298,8 @@ func (p *Peer) handleRequest(ctx context.Context, req *Request) {
 		if meta.WMP.Sender != "" {
 			ctx = ContextWithSender(ctx, meta.WMP.Sender)
 		}
-		if meta.WMP.SessionID != "" && p.sessions != nil {
-			if sess, ok := p.sessions.Get(meta.WMP.SessionID); ok {
+		if meta.WMP.SessionID != "" && p.store() != nil {
+			if sess, ok := p.store().Get(meta.WMP.SessionID); ok {
 				ctx = ContextWithSession(ctx, sess)
 			}
 		}
@@ -540,7 +560,25 @@ func (p *Peer) Notify(ctx context.Context, method string, params interface{}) er
 	if err != nil {
 		return err
 	}
-	return p.sendJSON(ctx, req)
+	err = p.sendJSON(ctx, req)
+	if err == nil && method == MethodSessionClose {
+		p.forgetVersion(stringMember(metaOf(params), "session_id"))
+	}
+	return err
+}
+
+// metaOf returns the "wmp" members of outbound params, or nil.
+func metaOf(params interface{}) map[string]json.RawMessage {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil
+	}
+	var obj map[string]json.RawMessage
+	var meta map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil || json.Unmarshal(obj["wmp"], &meta) != nil {
+		return nil
+	}
+	return meta
 }
 
 // Call sends a JSON-RPC 2.0 request and waits for the response.
@@ -657,8 +695,8 @@ func (p *Peer) HandleRequestSync(ctx context.Context, data []byte) ([]byte, erro
 		if meta.WMP.Sender != "" {
 			ctx = ContextWithSender(ctx, meta.WMP.Sender)
 		}
-		if meta.WMP.SessionID != "" && p.sessions != nil {
-			if sess, ok := p.sessions.Get(meta.WMP.SessionID); ok {
+		if meta.WMP.SessionID != "" && p.store() != nil {
+			if sess, ok := p.store().Get(meta.WMP.SessionID); ok {
 				ctx = ContextWithSession(ctx, sess)
 			}
 		}
@@ -741,7 +779,7 @@ func (p *Peer) dispatchSessionCreate(ctx context.Context, ps *SessionCreateParam
 		result.WMP.Version = selected
 	}
 	// Run session create hooks if we have a session store.
-	if p.sessions != nil && result.WMP.SessionID != "" {
+	if p.store() != nil && result.WMP.SessionID != "" {
 		if err := p.runCreateHooks(ctx, ps, result); err != nil {
 			return nil, err
 		}
@@ -754,7 +792,7 @@ func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, resu
 	// A handler that owns the session lifecycle (SessionService) has already
 	// stored the session with its owner and token expiry; never replace that
 	// record with a bare copy.
-	sess, existing := p.sessions.Get(result.WMP.SessionID)
+	sess, existing := p.store().Get(result.WMP.SessionID)
 	if !existing {
 		sess = &Session{
 			ID:              result.WMP.SessionID,
@@ -769,20 +807,20 @@ func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, resu
 		if existing {
 			// The client never learns this session's ID or token: do not
 			// leave the handler-created record behind.
-			_ = p.sessions.Delete(sess.ID)
+			_ = p.store().Delete(sess.ID)
 		}
 		return toRPCError(hookErr)
 	}
 	var err error
 	if existing {
-		err = p.sessions.Update(sess)
+		err = p.store().Update(sess)
 	} else {
-		err = p.sessions.Create(sess)
+		err = p.store().Create(sess)
 	}
 	if err != nil {
 		// The hook's changes (or the record itself) were not persisted and
 		// the client would hold a session the server cannot honour.
-		_ = p.sessions.Delete(sess.ID)
+		_ = p.store().Delete(sess.ID)
 		return NewRPCError(ErrInternalError, nil)
 	}
 	return nil
@@ -794,6 +832,13 @@ func (p *Peer) dispatchSessionResume(ctx context.Context, ps *SessionResumeParam
 	selected, vErr := negotiateOrReject(ps.WMP.Version)
 	if vErr != nil {
 		return nil, vErr
+	}
+	// A session keeps the version negotiated at create (core section 2.2.3):
+	// when one is on record, that is what this resume must use.
+	if rec, ok := p.recordedVersion(p.versionKey(ps.SessionID)); ok {
+		if selected, ok = NegotiateVersion(ps.WMP.Version, []string{rec}); !ok {
+			return nil, versionError([]string{rec})
+		}
 	}
 	result, err := p.handler.SessionResume(ctx, ps)
 	if err != nil {
@@ -808,14 +853,21 @@ func (p *Peer) dispatchSessionResume(ctx context.Context, ps *SessionResumeParam
 	if !result.Resumed {
 		return result, nil
 	}
-	if p.sessions != nil {
-		if sess, ok := p.sessions.Get(ps.SessionID); ok {
-			// The token has already been rotated: a rejecting hook ends this
-			// session's resumability, so the client creates a new session
-			// (core section 4.5.4).
-			if hookErr := p.registry.runSessionResumers(ctx, sess, ps); hookErr != nil {
-				return nil, toRPCError(hookErr)
-			}
+	if p.registry.hasResumers() {
+		// Resume authorization hooks must not be bypassed: without a session
+		// to show them the resume is refused (fail closed).
+		var sess *Session
+		if st := p.store(); st != nil {
+			sess, _ = st.Get(ps.SessionID)
+		}
+		if sess == nil {
+			return nil, NewRPCError(ErrInternalError, nil)
+		}
+		// The token has already been rotated: a rejecting hook ends this
+		// session's resumability, so the client creates a new session (core
+		// section 4.5.4).
+		if hookErr := p.registry.runSessionResumers(ctx, sess, ps); hookErr != nil {
+			return nil, toRPCError(hookErr)
 		}
 	}
 	p.recordVersion(ps.SessionID, result.WMP.Version)
@@ -831,13 +883,11 @@ func (p *Peer) versionKey(sessionID string) string {
 	return sessionID
 }
 
-// maxCachedVersions bounds versionCache.
-const maxCachedVersions = 256
-
 // versionCache holds negotiated versions for sessions the Peer cannot read
 // them back from (no session store, or a record without version metadata).
-// It is bounded: at the limit an arbitrary entry is dropped, which only
-// makes that session fall back to Version.
+// Entries are removed when the session is closed (inbound or outbound close).
+// A version is never evicted while its session is open, because dropping it
+// would silently change the version stamped on that session's messages.
 type versionCache struct {
 	mu sync.Mutex
 	m  map[string]string
@@ -848,12 +898,6 @@ func (c *versionCache) store(key, version string) {
 	defer c.mu.Unlock()
 	if c.m == nil {
 		c.m = make(map[string]string)
-	}
-	if _, ok := c.m[key]; !ok && len(c.m) >= maxCachedVersions {
-		for k := range c.m {
-			delete(c.m, k)
-			break
-		}
 	}
 	c.m[key] = version
 }
@@ -877,12 +921,21 @@ func (c *versionCache) len() int {
 	return len(c.m)
 }
 
+// recordedVersion returns the version on record for key: the store's, else
+// the cache's.
+func (p *Peer) recordedVersion(key string) (string, bool) {
+	if v, ok := p.storedVersion(key); ok {
+		return v, true
+	}
+	return p.versions.load(key)
+}
+
 // storedVersion returns the version recorded in the session store, if any.
 func (p *Peer) storedVersion(key string) (string, bool) {
-	if p.sessions == nil || key == "" {
+	if p.store() == nil || key == "" {
 		return "", false
 	}
-	if sess, ok := p.sessions.Get(key); ok {
+	if sess, ok := p.store().Get(key); ok {
 		v := sess.Metadata[MetadataKeyVersion]
 		return v, v != ""
 	}
@@ -907,11 +960,7 @@ func (p *Peer) recordVersion(sessionID, version string) {
 
 // versionFor returns the version negotiated for the session, or Version.
 func (p *Peer) versionFor(sessionID string) string {
-	key := p.versionKey(sessionID)
-	if v, ok := p.storedVersion(key); ok {
-		return v
-	}
-	if v, ok := p.versions.load(key); ok {
+	if v, ok := p.recordedVersion(p.versionKey(sessionID)); ok {
 		return v
 	}
 	return Version
@@ -921,8 +970,8 @@ func (p *Peer) versionFor(sessionID string) string {
 // the handler refused (the session still exists) keeps its version.
 func (p *Peer) forgetVersion(sessionID string) {
 	key := p.versionKey(sessionID)
-	if p.sessions != nil {
-		if _, ok := p.sessions.Get(key); ok {
+	if p.store() != nil {
+		if _, ok := p.store().Get(key); ok {
 			return
 		}
 	}

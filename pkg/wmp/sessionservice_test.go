@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"regexp"
 	"strings"
@@ -1158,12 +1159,14 @@ func TestPeerVersionBookkeeping(t *testing.T) {
 		t.Fatalf("closed session kept its cached version: %q", v)
 	}
 
-	// Cache is bounded for sessions without store metadata.
-	for i := 0; i < maxCachedVersions+50; i++ {
-		peer.versions.store("ses-c"+strings.Repeat("x", i%7)+string(rune('a'+i%26))+time.Duration(i).String(), "0.2")
+	// Cached versions are never evicted while the session is open.
+	for i := 0; i < 300; i++ {
+		peer.recordVersion(fmt.Sprintf("ses-c%d", i), "0.2")
 	}
-	if peer.versions.len() > maxCachedVersions {
-		t.Fatalf("cache grew to %d", peer.versions.len())
+	for i := 0; i < 300; i++ {
+		if v := peer.versionFor(fmt.Sprintf("ses-c%d", i)); v != "0.2" {
+			t.Fatalf("session %d lost its version: %q", i, v)
+		}
 	}
 }
 
@@ -1210,5 +1213,123 @@ func TestPeerCreateHookPersistenceFailureRollsBack(t *testing.T) {
 	}
 	if all, _ := inner.List(); len(all) != 0 {
 		t.Fatalf("%d records left after failed persistence", len(all))
+	}
+}
+
+func TestPeerResumeHooksRunWithHandlerStore(t *testing.T) {
+	store := NewMemorySessionStore()
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Store = store })
+	peer := NewPeer(nil, NewSessionHandler(svc)) // no WithSessionStore: the handler's store is used
+	if err := peer.Use(&rejectingResumeProfile{}); err != nil {
+		t.Fatal(err)
+	}
+	created := mustCreate(t, svc, alice)
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionResume, resumeParams(created, created.ResumptionToken))
+	if msg.Error == nil || msg.Error.Code != ErrNotAuthorized {
+		t.Fatalf("resume authorization hook bypassed: %+v", msg.Error)
+	}
+}
+
+type resumedNoStoreHandler struct{ BaseHandler }
+
+func (resumedNoStoreHandler) SessionResume(context.Context, *SessionResumeParams) (*SessionResumeResult, error) {
+	return &SessionResumeResult{Resumed: true}, nil
+}
+
+func TestPeerResumeFailsClosedWithoutStoreWhenHooksRegistered(t *testing.T) {
+	peer := NewPeer(nil, resumedNoStoreHandler{})
+	if err := peer.Use(&rejectingResumeProfile{}); err != nil {
+		t.Fatal(err)
+	}
+	msg := peerCall(t, peer, context.Background(), MethodSessionResume, &SessionResumeParams{WMP: Metadata{Version: Version}, SessionID: "ses-x"})
+	if msg.Error == nil || msg.Error.Code != ErrInternalError {
+		t.Fatalf("want fail-closed -32603, got %+v", msg.Error)
+	}
+}
+
+func TestSessionServiceTokenTTLOnNonExpiringSession(t *testing.T) {
+	store := NewMemorySessionStore()
+	s := newTestService(t, func(c *SessionServiceConfig) { c.Store = store; c.ResumptionTTL = time.Minute })
+	created := mustCreate(t, s, alice)
+	sess, _ := store.Get(created.WMP.SessionID)
+	sess.ExpiresAt = time.Time{} // non-expiring session
+	if _, err := s.SessionResume(ctxFor(alice), resumeParams(created, created.ResumptionToken)); err != nil {
+		t.Fatal(err)
+	}
+	sess, _ = store.Get(created.WMP.SessionID)
+	if sess.ResumptionTokenExpiresAt.IsZero() {
+		t.Fatal("rotated token must still get the configured ResumptionTTL")
+	}
+}
+
+// slowUpdateStore delays Update, widening the read-to-write window of the
+// fallback token rotation.
+type slowUpdateStore struct{ plainStore }
+
+func (s slowUpdateStore) Update(sess *Session) error {
+	time.Sleep(60 * time.Millisecond)
+	return s.plainStore.Update(sess)
+}
+
+func TestSessionServiceSweepSerialisedWithFallbackRotation(t *testing.T) {
+	inner := NewMemorySessionStore()
+	s := newTestService(t, func(c *SessionServiceConfig) { c.Store = slowUpdateStore{plainStore{inner}} })
+	created := mustCreate(t, s, alice)
+	sess, _ := inner.Get(created.WMP.SessionID)
+	sess.ExpiresAt = time.Now().Add(30 * time.Millisecond)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = s.SessionResume(ctxFor(alice), resumeParams(created, created.ResumptionToken))
+	}()
+	go func() {
+		defer wg.Done()
+		time.Sleep(45 * time.Millisecond) // session expired, resume still inside Update
+		_, _ = s.Sweep(context.Background())
+	}()
+	wg.Wait()
+	if _, ok := inner.Get(created.WMP.SessionID); ok {
+		t.Fatal("a swept session was written back by a concurrent resume")
+	}
+}
+
+// A handler that reports Resumed without a version gets the session's
+// recorded one, not a fresh negotiation.
+type resumedNoVersionHandler struct{ BaseHandler }
+
+func (resumedNoVersionHandler) SessionResume(context.Context, *SessionResumeParams) (*SessionResumeResult, error) {
+	return &SessionResumeResult{Resumed: true}, nil
+}
+
+func TestPeerResumeKeepsRecordedVersion(t *testing.T) {
+	old := SupportedVersions
+	SupportedVersions = []string{"0.1", "0.2"}
+	defer func() { SupportedVersions = old }()
+	peer := NewPeer(nil, resumedNoVersionHandler{})
+	peer.recordVersion("ses-a", "0.1")
+	msg := peerCall(t, peer, context.Background(), MethodSessionResume, &SessionResumeParams{WMP: Metadata{Version: "0.2"}, SessionID: "ses-a"})
+	var res SessionResumeResult
+	_ = json.Unmarshal(msg.Result, &res)
+	if msg.Error != nil || res.WMP.Version != "0.1" {
+		t.Fatalf("version %q err %+v, want recorded 0.1", res.WMP.Version, msg.Error)
+	}
+	peer.recordVersion("ses-b", "0.2")
+	msg = peerCall(t, peer, context.Background(), MethodSessionResume, &SessionResumeParams{WMP: Metadata{Version: "0.1"}, SessionID: "ses-b"})
+	if msg.Error == nil || msg.Error.Code != ErrVersionNotSupported {
+		t.Fatalf("client offering below the session version: %+v", msg.Error)
+	}
+}
+
+func TestPeerOutboundCloseForgetsVersion(t *testing.T) {
+	local, _ := newChanTransportPair()
+	peer := NewPeer(local, &BaseHandler{})
+	peer.recordVersion("ses-a", "0.2")
+	if err := peer.Notify(context.Background(), MethodSessionClose, &SessionCloseParams{WMP: Metadata{Version: "0.2", SessionID: "ses-a"}, Reason: ReasonComplete}); err != nil {
+		t.Fatal(err)
+	}
+	if v := peer.versionFor("ses-a"); v != Version {
+		t.Fatalf("version kept after outbound close: %q", v)
 	}
 }
