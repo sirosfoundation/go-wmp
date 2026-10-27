@@ -264,6 +264,26 @@ func (p *Peer) handleResponse(resp *Response) {
 	}
 }
 
+// enrichContext adds the sender and the session named in the request's wmp
+// metadata to ctx. These are unauthenticated claims.
+func (p *Peer) enrichContext(ctx context.Context, params json.RawMessage) context.Context {
+	var meta struct {
+		WMP Metadata `json:"wmp"`
+	}
+	if json.Unmarshal(params, &meta) != nil {
+		return ctx
+	}
+	if meta.WMP.Sender != "" {
+		ctx = ContextWithSender(ctx, meta.WMP.Sender)
+	}
+	if st := p.store(); meta.WMP.SessionID != "" && st != nil {
+		if sess, ok := st.Get(meta.WMP.SessionID); ok {
+			ctx = ContextWithSession(ctx, sess)
+		}
+	}
+	return ctx
+}
+
 func (p *Peer) handleRequest(ctx context.Context, req *Request) {
 	ctx = ContextWithIsNotification(ctx, req.IsNotification())
 
@@ -292,19 +312,7 @@ func (p *Peer) handleRequest(ctx context.Context, req *Request) {
 	// Extract WMP metadata for context enrichment.
 	// IMPORTANT: These values are unauthenticated claims. Callers must verify
 	// identity assertions and session ownership separately.
-	var meta struct {
-		WMP Metadata `json:"wmp"`
-	}
-	if err := json.Unmarshal(req.Params, &meta); err == nil {
-		if meta.WMP.Sender != "" {
-			ctx = ContextWithSender(ctx, meta.WMP.Sender)
-		}
-		if meta.WMP.SessionID != "" && p.store() != nil {
-			if sess, ok := p.store().Get(meta.WMP.SessionID); ok {
-				ctx = ContextWithSession(ctx, sess)
-			}
-		}
-	}
+	ctx = p.enrichContext(ctx, req.Params)
 
 	// Run through middleware chain, then dispatch.
 	result, err := p.registry.runMiddleware(ctx, req.Method, req.Params, func(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
@@ -689,19 +697,7 @@ func (p *Peer) HandleRequestSync(ctx context.Context, data []byte) ([]byte, erro
 	// Extract WMP metadata for context enrichment.
 	// IMPORTANT: These values are unauthenticated claims. Callers must verify
 	// identity assertions and session ownership separately.
-	var meta struct {
-		WMP Metadata `json:"wmp"`
-	}
-	if err := json.Unmarshal(req.Params, &meta); err == nil {
-		if meta.WMP.Sender != "" {
-			ctx = ContextWithSender(ctx, meta.WMP.Sender)
-		}
-		if meta.WMP.SessionID != "" && p.store() != nil {
-			if sess, ok := p.store().Get(meta.WMP.SessionID); ok {
-				ctx = ContextWithSession(ctx, sess)
-			}
-		}
-	}
+	ctx = p.enrichContext(ctx, req.Params)
 
 	// Run through middleware chain, then dispatch.
 	result, dispatchErr := p.registry.runMiddleware(ctx, req.Method, req.Params, func(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
@@ -920,25 +916,33 @@ func (p *Peer) dispatchSessionResume(ctx context.Context, ps *SessionResumeParam
 		}
 		result.WMP.Version = version
 	}
-	if p.registry.hasResumers() {
-		// Resume authorization hooks must not be bypassed: without a session
-		// to show them the resume is refused (fail closed).
-		var sess *Session
-		if st := p.store(); st != nil {
-			sess, _ = st.Get(ps.SessionID)
-		}
-		if sess == nil {
-			return nil, NewRPCError(ErrInternalError, nil)
-		}
-		// The token has already been rotated: a rejecting hook ends this
-		// session's resumability, so the client creates a new session (core
-		// section 4.5.4).
-		if hookErr := p.registry.runSessionResumers(ctx, cloneSession(sess), ps); hookErr != nil {
-			return nil, toRPCError(hookErr)
-		}
+	if err := p.runResumeHooks(ctx, ps); err != nil {
+		return nil, err
 	}
 	p.recordVersion(ps.SessionID, result.WMP.Version)
 	return result, nil
+}
+
+// runResumeHooks runs the registered resume hooks on a private copy of the
+// session. Resume authorization hooks must not be bypassed: without a session
+// to show them the resume is refused (fail closed). The token has already been
+// rotated, so a rejecting hook ends this session's resumability and the client
+// creates a new session (core section 4.5.4).
+func (p *Peer) runResumeHooks(ctx context.Context, ps *SessionResumeParams) error {
+	if !p.registry.hasResumers() {
+		return nil
+	}
+	var sess *Session
+	if st := p.store(); st != nil {
+		sess, _ = st.Get(ps.SessionID)
+	}
+	if sess == nil {
+		return NewRPCError(ErrInternalError, nil)
+	}
+	if err := p.registry.runSessionResumers(ctx, cloneSession(sess), ps); err != nil {
+		return toRPCError(err)
+	}
+	return nil
 }
 
 // resumeVersion is the version for a resume whose handler named none: the
