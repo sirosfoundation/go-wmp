@@ -952,7 +952,7 @@ func (p *Peer) resumeVersion(ps *SessionResumeParams, negotiated string) (string
 	if v, ok := NegotiateVersion(ps.WMP.Version, []string{rec}); ok {
 		return v, nil
 	}
-	return "", versionError([]string{rec})
+	return "", versionRejection(ps.WMP.Version, []string{rec})
 }
 
 // versionKey maps a message's session ID to the key under which its
@@ -1064,9 +1064,7 @@ func (p *Peer) forgetVersion(sessionID string) {
 func negotiateOrReject(offered string) (string, *RPCError) {
 	selected, ok := NegotiateVersion(offered, SupportedVersions)
 	if !ok {
-		return "", NewRPCError(ErrVersionNotSupported, map[string]interface{}{
-			"supported_versions": SupportedVersions,
-		})
+		return "", versionRejection(offered, SupportedVersions)
 	}
 	return selected, nil
 }
