@@ -18,7 +18,7 @@ type registry struct {
 	idResolvers  []IdentifierResolver      // ordered list of identifier resolvers
 	middleware   []Middleware
 	sessionHooks []SessionHook
-	resumeHooks  []SessionResumeHook
+	resumeHooks  []SessionResumer
 
 	// flowOwners tracks which FlowHandler owns each active flow_id.
 	flowOwners map[string]FlowHandler
@@ -71,7 +71,7 @@ func (r *registry) register(p Profile) error {
 		r.sessionHooks = append(r.sessionHooks, sh)
 	}
 
-	if rh, ok := p.(SessionResumeHook); ok {
+	if rh, ok := p.(SessionResumer); ok {
 		r.resumeHooks = append(r.resumeHooks, rh)
 	}
 
@@ -175,11 +175,11 @@ func (r *registry) runSessionCreateHooks(ctx context.Context, session *Session, 
 	return nil
 }
 
-// runSessionResumeHooks calls all registered resume hooks, stopping at the
+// runSessionResumers calls all registered resume hooks, stopping at the
 // first error.
-func (r *registry) runSessionResumeHooks(ctx context.Context, session *Session, params *SessionResumeParams) error {
+func (r *registry) runSessionResumers(ctx context.Context, session *Session, params *SessionResumeParams) error {
 	r.mu.RLock()
-	hooks := make([]SessionResumeHook, len(r.resumeHooks))
+	hooks := make([]SessionResumer, len(r.resumeHooks))
 	copy(hooks, r.resumeHooks)
 	r.mu.RUnlock()
 

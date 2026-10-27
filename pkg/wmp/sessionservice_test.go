@@ -320,7 +320,7 @@ func TestSessionServiceResumeExpired(t *testing.T) {
 	var expired []string
 	s := newTestService(t, func(c *SessionServiceConfig) {
 		c.Store = store
-		c.ExpireHooks = []SessionExpireHook{expireFunc(func(_ context.Context, s *Session) { expired = append(expired, s.ID) })}
+		c.ExpireHooks = []SessionExpirer{expireFunc(func(_ context.Context, s *Session) { expired = append(expired, s.ID) })}
 	})
 	created := mustCreate(t, s, alice)
 	sess, _ := store.Get(created.WMP.SessionID)
@@ -379,7 +379,7 @@ func TestSessionServiceResumeHooksAndReplay(t *testing.T) {
 	var gotParams *SessionResumeParams
 	s := newTestService(t, func(c *SessionServiceConfig) {
 		c.Replay = fixedReplay(3)
-		c.ResumeHooks = []SessionResumeHook{resumeFunc(func(_ context.Context, s *Session, p *SessionResumeParams) error {
+		c.ResumeHooks = []SessionResumer{resumeFunc(func(_ context.Context, s *Session, p *SessionResumeParams) error {
 			gotSession, gotParams = s, p
 			return nil
 		})}
@@ -401,7 +401,7 @@ func TestSessionServiceResumeHooksAndReplay(t *testing.T) {
 
 func TestSessionServiceResumeHookRejects(t *testing.T) {
 	s := newTestService(t, func(c *SessionServiceConfig) {
-		c.ResumeHooks = []SessionResumeHook{resumeFunc(func(context.Context, *Session, *SessionResumeParams) error {
+		c.ResumeHooks = []SessionResumer{resumeFunc(func(context.Context, *Session, *SessionResumeParams) error {
 			return NewRPCError(ErrNotAuthorized, nil)
 		})}
 	})
@@ -523,7 +523,7 @@ func TestSessionServiceSweep(t *testing.T) {
 			hooks := 0
 			s := newTestService(t, func(c *SessionServiceConfig) {
 				c.Store = tc.wrap(inner)
-				c.ExpireHooks = []SessionExpireHook{expireFunc(func(context.Context, *Session) { hooks++ })}
+				c.ExpireHooks = []SessionExpirer{expireFunc(func(context.Context, *Session) { hooks++ })}
 			})
 			live := mustCreate(t, s, alice)
 			for i := 0; i < 2; i++ {
@@ -875,7 +875,7 @@ func TestSessionServiceExpireHookRunsOnce(t *testing.T) {
 	var calls atomic.Int32
 	s := newTestService(t, func(c *SessionServiceConfig) {
 		c.Store = slowListerStore{inner}
-		c.ExpireHooks = []SessionExpireHook{expireFunc(func(context.Context, *Session) { calls.Add(1) })}
+		c.ExpireHooks = []SessionExpirer{expireFunc(func(context.Context, *Session) { calls.Add(1) })}
 	})
 	created := mustCreate(t, s, alice)
 	sess, _ := inner.Get(created.WMP.SessionID)
@@ -909,7 +909,7 @@ func TestSessionServiceSweepDeleteFailure(t *testing.T) {
 	hooks := 0
 	s := newTestService(t, func(c *SessionServiceConfig) {
 		c.Store = failDeleteStore{inner}
-		c.ExpireHooks = []SessionExpireHook{expireFunc(func(context.Context, *Session) { hooks++ })}
+		c.ExpireHooks = []SessionExpirer{expireFunc(func(context.Context, *Session) { hooks++ })}
 	})
 	created := mustCreate(t, s, alice)
 	sess, _ := inner.Get(created.WMP.SessionID)
@@ -930,7 +930,7 @@ func TestSessionServiceSweepLeavesSessionsExpiringMidSweep(t *testing.T) {
 	var late *Session
 	s = newTestService(t, func(c *SessionServiceConfig) {
 		c.Store = inner
-		c.ExpireHooks = []SessionExpireHook{expireFunc(func(context.Context, *Session) {
+		c.ExpireHooks = []SessionExpirer{expireFunc(func(context.Context, *Session) {
 			late.ExpiresAt = time.Now().Add(-time.Second) // expires while the sweep runs
 		})}
 	})

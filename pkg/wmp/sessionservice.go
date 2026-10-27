@@ -27,16 +27,16 @@ const (
 	sessionLockStripe = 64
 )
 
-// ReplaySource tells SessionService how many messages a resuming client
+// MessageReplayer tells SessionService how many messages a resuming client
 // missed, for the result's missed_messages. Without one the count is 0.
-type ReplaySource interface {
+type MessageReplayer interface {
 	// MissedSince returns the number of messages queued for the session
 	// after lastReceivedID (all of them when lastReceivedID is empty).
 	MissedSince(sessionID, lastReceivedID string) int
 }
 
 // ExpiredSessionLister is an optional SessionStore extension. Stores that
-// implement it let Sweep run SessionExpireHooks for each session it removes;
+// implement it let Sweep run SessionExpirers for each session it removes;
 // without it Sweep only calls Cleanup.
 type ExpiredSessionLister interface {
 	// ListExpired returns the sessions whose TTL has passed and that have not
@@ -70,11 +70,11 @@ type SessionServiceConfig struct {
 	// bits. It must be unguessable.
 	NewSessionID func() string
 	// Replay supplies missed_messages on resume. Optional.
-	Replay ReplaySource
+	Replay MessageReplayer
 	// ResumeHooks run after a resume is validated and the token rotated.
-	ResumeHooks []SessionResumeHook
+	ResumeHooks []SessionResumer
 	// ExpireHooks run when an expired session is discovered.
-	ExpireHooks []SessionExpireHook
+	ExpireHooks []SessionExpirer
 }
 
 // SessionService implements wmp.session.create, resume and close on top of a

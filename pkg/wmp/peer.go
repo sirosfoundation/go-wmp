@@ -176,35 +176,41 @@ func (p *Peer) Serve(ctx context.Context) error {
 			return fmt.Errorf("read: %w", err)
 		}
 
-		// Enforce message size limit.
-		if len(data) > p.maxMessageSize {
-			p.logger.Warn("message exceeds size limit", "size", len(data), "max", p.maxMessageSize)
-			resp := NewErrorResponse(nil, NewRPCError(ErrInvalidRequest, map[string]string{
-				"reason": "message too large",
-			}))
-			p.sendJSON(ctx, resp)
-			continue
-		}
-
-		// Try batch first.
-		decOpts := &DecodeOptions{MaxSize: p.maxMessageSize, MaxDepth: defaultMaxDepth}
-		if msgs, err := DecodeBatch(data, decOpts); err == nil && msgs != nil {
-			for _, msg := range msgs {
-				p.dispatch(ctx, msg)
-			}
-			continue
-		}
-
-		msg, err := DecodeMessage(data, decOpts)
-		if err != nil {
-			// Send parse error for requests; ignore malformed messages.
-			resp := NewErrorResponse(nil, NewRPCError(ErrParseError, nil))
-			p.sendJSON(ctx, resp)
-			continue
-		}
-
-		p.dispatch(ctx, msg)
+		p.handleInbound(ctx, data)
 	}
+}
+
+// handleInbound processes one raw transport message: size limit, batch,
+// single message, or a parse error response.
+func (p *Peer) handleInbound(ctx context.Context, data []byte) {
+	// Enforce message size limit.
+	if len(data) > p.maxMessageSize {
+		p.logger.Warn("message exceeds size limit", "size", len(data), "max", p.maxMessageSize)
+		resp := NewErrorResponse(nil, NewRPCError(ErrInvalidRequest, map[string]string{
+			"reason": "message too large",
+		}))
+		p.sendJSON(ctx, resp)
+		return
+	}
+
+	// Try batch first.
+	decOpts := &DecodeOptions{MaxSize: p.maxMessageSize, MaxDepth: defaultMaxDepth}
+	if msgs, err := DecodeBatch(data, decOpts); err == nil && msgs != nil {
+		for _, msg := range msgs {
+			p.dispatch(ctx, msg)
+		}
+		return
+	}
+
+	msg, err := DecodeMessage(data, decOpts)
+	if err != nil {
+		// Send parse error for requests; ignore malformed messages.
+		resp := NewErrorResponse(nil, NewRPCError(ErrParseError, nil))
+		p.sendJSON(ctx, resp)
+		return
+	}
+
+	p.dispatch(ctx, msg)
 }
 
 func (p *Peer) dispatch(ctx context.Context, msg *Message) {
@@ -387,7 +393,7 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 					// The token has already been rotated: a rejecting hook
 					// ends this session's resumability, so the client
 					// creates a new session (core section 4.5.4).
-					if hookErr := p.registry.runSessionResumeHooks(ctx, sess, &ps); hookErr != nil {
+					if hookErr := p.registry.runSessionResumers(ctx, sess, &ps); hookErr != nil {
 						return nil, toRPCError(hookErr)
 					}
 				}
