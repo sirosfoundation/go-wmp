@@ -8,6 +8,7 @@ const (
 	ctxKeySession contextKey = iota
 	ctxKeySender
 	ctxKeyIsNotification
+	ctxKeyPrincipal
 )
 
 // ContextWithSession returns a context with the session attached.
