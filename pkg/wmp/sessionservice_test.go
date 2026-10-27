@@ -1099,15 +1099,13 @@ func TestPeerVersionNotCommittedOnRejectedCreateOrUnresumed(t *testing.T) {
 	if msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, p); msg.Error == nil {
 		t.Fatal("create must be rejected by the hook")
 	}
-	n := 0
-	peer.versions.Range(func(_, _ any) bool { n++; return true })
-	if n != 0 {
+	if peer.versions.len() != 0 {
 		t.Fatal("version of a rejected create was committed")
 	}
 	// A handler reporting Resumed=false must not commit either.
 	peer2 := NewPeer(nil, notResumedHandler{}, WithSessionIdentity("", ""))
 	peerCall(t, peer2, context.Background(), MethodSessionResume, &SessionResumeParams{WMP: Metadata{Version: "0.2"}, SessionID: "ses-x"})
-	if _, ok := peer2.versions.Load("ses-x"); ok {
+	if _, ok := peer2.versions.load("ses-x"); ok {
 		t.Fatal("version of a non-resumed session was committed")
 	}
 }
@@ -1116,4 +1114,101 @@ type notResumedHandler struct{ BaseHandler }
 
 func (notResumedHandler) SessionResume(context.Context, *SessionResumeParams) (*SessionResumeResult, error) {
 	return &SessionResumeResult{Resumed: false}, nil
+}
+
+// Version bookkeeping edge cases from review.
+func TestPeerVersionBookkeeping(t *testing.T) {
+	store := NewMemorySessionStore()
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Store = store; c.Versions = []string{"0.1", "0.2"} })
+	old := SupportedVersions
+	SupportedVersions = []string{"0.1", "0.2"}
+	defer func() { SupportedVersions = old }()
+	peer := NewPeer(nil, NewSessionHandler(svc), WithSessionStore(store), WithSessionIdentity("", ""))
+
+	p := createParams()
+	p.WMP.Version = "0.2"
+	var created SessionCreateResult
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, p)
+	_ = json.Unmarshal(msg.Result, &created)
+	id := created.WMP.SessionID
+	if peer.versions.len() != 0 {
+		t.Fatal("a store-backed version must not also be cached (it would outlive session expiry)")
+	}
+	if v := peer.versionFor(id); v != "0.2" {
+		t.Fatalf("store-backed version = %q", v)
+	}
+
+	// A close the service refuses (not the owner) keeps a cached version;
+	// the owner's close drops it. Session without version metadata, so the
+	// version lives in the cache.
+	closeBy := func(p Principal, id string) {
+		req, _ := NewNotification(MethodSessionClose, &SessionCloseParams{WMP: Metadata{Version: "0.2", SessionID: id}, Reason: ReasonComplete})
+		data, _ := json.Marshal(req)
+		_, _ = peer.HandleRequestSync(ctxFor(p), data)
+	}
+	bare := "ses-bare"
+	_ = store.Create(&Session{ID: bare, Owner: alice.Key(), ExpiresAt: time.Now().Add(time.Hour)})
+	peer.recordVersion(bare, "0.2")
+	closeBy(bob, bare)
+	if v := peer.versionFor(bare); v != "0.2" {
+		t.Fatalf("refused close lost the version: %q", v)
+	}
+	closeBy(alice, bare)
+	if v := peer.versionFor(bare); v != Version {
+		t.Fatalf("closed session kept its cached version: %q", v)
+	}
+
+	// Cache is bounded for sessions without store metadata.
+	for i := 0; i < maxCachedVersions+50; i++ {
+		peer.versions.store("ses-c"+strings.Repeat("x", i%7)+string(rune('a'+i%26))+time.Duration(i).String(), "0.2")
+	}
+	if peer.versions.len() > maxCachedVersions {
+		t.Fatalf("cache grew to %d", peer.versions.len())
+	}
+}
+
+func TestStampNullWMPDoesNotPanic(t *testing.T) {
+	local, remote := newChanTransportPair()
+	peer := NewPeer(local, &BaseHandler{}, WithSessionIdentity("ses-abc", "me"))
+	meta := outboundMeta(t, peer, remote, map[string]interface{}{"wmp": nil})
+	if string(meta["session_id"]) != `"ses-abc"` {
+		t.Fatalf("meta = %v", meta)
+	}
+	if err := peer.Notify(context.Background(), "x.custom", json.RawMessage(`{"wmp":null}`)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPeerOutboundDeclinedResumeKeepsVersion(t *testing.T) {
+	local, _ := newChanTransportPair()
+	peer := NewPeer(local, &BaseHandler{}, WithSessionIdentity("ses-a", ""))
+	peer.recordVersion("ses-a", "0.1")
+	peer.recordNegotiatedVersion(MethodSessionResume, json.RawMessage(`{"wmp":{"version":"0.2","session_id":"ses-a"},"resumed":false}`))
+	if v := peer.versionFor("ses-a"); v != "0.1" {
+		t.Fatalf("declined resume overwrote version: %q", v)
+	}
+	peer.recordNegotiatedVersion(MethodSessionResume, json.RawMessage(`{"wmp":{"version":"0.2","session_id":"ses-a"},"resumed":true}`))
+	if v := peer.versionFor("ses-a"); v != "0.2" {
+		t.Fatalf("resumed version = %q", v)
+	}
+}
+
+// failingStore fails Create and Update.
+type failingStore struct{ *MemorySessionStore }
+
+func (failingStore) Create(*Session) error { return errors.New("boom") }
+func (failingStore) Update(*Session) error { return errors.New("boom") }
+
+func TestPeerCreateHookPersistenceFailureRollsBack(t *testing.T) {
+	inner := NewMemorySessionStore()
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Store = inner })
+	// The service writes through inner; the Peer's Update goes through the failing wrapper.
+	peer := NewPeer(nil, NewSessionHandler(svc), WithSessionStore(failingStore{inner}))
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, createParams())
+	if msg.Error == nil || msg.Error.Code != ErrInternalError {
+		t.Fatalf("want -32603, got %+v", msg.Error)
+	}
+	if all, _ := inner.List(); len(all) != 0 {
+		t.Fatalf("%d records left after failed persistence", len(all))
+	}
 }

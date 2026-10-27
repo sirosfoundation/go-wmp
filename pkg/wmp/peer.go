@@ -90,7 +90,7 @@ type Peer struct {
 	validator      Validator
 	authorizer     Authorizer
 	identity       *sessionIdentity // nil: outbound messages are not stamped
-	versions       sync.Map         // session ID (or "") -> version negotiated for it
+	versions       versionCache     // fallback per-session versions (see versionFor)
 	orchestrator   *OrchestratorMessageOptions
 
 	mu      sync.Mutex
@@ -338,7 +338,7 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
 		p.handler.SessionClose(ctx, &ps)
-		p.versions.Delete(p.versionKey(ps.WMP.SessionID))
+		p.forgetVersion(ps.WMP.SessionID)
 		return nil, nil
 
 	case MethodSessionAuthenticate:
@@ -582,7 +582,7 @@ func (p *Peer) Call(ctx context.Context, method string, params interface{}, resu
 			return resp.Error
 		}
 		if resp.Result != nil && (method == MethodSessionCreate || method == MethodSessionResume) {
-			p.recordNegotiatedVersion(resp.Result)
+			p.recordNegotiatedVersion(method, resp.Result)
 		}
 		if result != nil && resp.Result != nil {
 			return json.Unmarshal(resp.Result, result)
@@ -593,13 +593,16 @@ func (p *Peer) Call(ctx context.Context, method string, params interface{}, resu
 
 // recordNegotiatedVersion remembers the version the remote side selected in a
 // session.create/resume result, whatever Go type the caller decodes it into.
-func (p *Peer) recordNegotiatedVersion(raw json.RawMessage) {
+// A resume result that does not say resumed:true selected nothing.
+func (p *Peer) recordNegotiatedVersion(method string, raw json.RawMessage) {
 	var r struct {
-		WMP Metadata `json:"wmp"`
+		WMP     Metadata `json:"wmp"`
+		Resumed bool     `json:"resumed"`
 	}
-	if json.Unmarshal(raw, &r) == nil {
-		p.recordVersion(r.WMP.SessionID, r.WMP.Version)
+	if json.Unmarshal(raw, &r) != nil || (method == MethodSessionResume && !r.Resumed) {
+		return
 	}
+	p.recordVersion(r.WMP.SessionID, r.WMP.Version)
 }
 
 // HandleRequestSync dispatches a single JSON-RPC request synchronously and
@@ -759,6 +762,7 @@ func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, resu
 			Capabilities:    result.Capabilities,
 			Security:        result.Security,
 			ResumptionToken: result.ResumptionToken,
+			Metadata:        map[string]string{MetadataKeyVersion: result.WMP.Version},
 		}
 	}
 	if hookErr := p.registry.runSessionCreateHooks(ctx, sess, ps); hookErr != nil {
@@ -769,10 +773,17 @@ func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, resu
 		}
 		return toRPCError(hookErr)
 	}
+	var err error
 	if existing {
-		_ = p.sessions.Update(sess)
+		err = p.sessions.Update(sess)
 	} else {
-		_ = p.sessions.Create(sess)
+		err = p.sessions.Create(sess)
+	}
+	if err != nil {
+		// The hook's changes (or the record itself) were not persisted and
+		// the client would hold a session the server cannot honour.
+		_ = p.sessions.Delete(sess.ID)
+		return NewRPCError(ErrInternalError, nil)
 	}
 	return nil
 }
@@ -820,20 +831,102 @@ func (p *Peer) versionKey(sessionID string) string {
 	return sessionID
 }
 
-// recordVersion remembers the version negotiated for a session, so messages
-// of one session never carry the version negotiated for another.
-func (p *Peer) recordVersion(sessionID, version string) {
-	if version != "" {
-		p.versions.Store(p.versionKey(sessionID), version)
+// maxCachedVersions bounds versionCache.
+const maxCachedVersions = 256
+
+// versionCache holds negotiated versions for sessions the Peer cannot read
+// them back from (no session store, or a record without version metadata).
+// It is bounded: at the limit an arbitrary entry is dropped, which only
+// makes that session fall back to Version.
+type versionCache struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func (c *versionCache) store(key, version string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = make(map[string]string)
 	}
+	if _, ok := c.m[key]; !ok && len(c.m) >= maxCachedVersions {
+		for k := range c.m {
+			delete(c.m, k)
+			break
+		}
+	}
+	c.m[key] = version
+}
+
+func (c *versionCache) load(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.m[key]
+	return v, ok
+}
+
+func (c *versionCache) delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, key)
+}
+
+func (c *versionCache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.m)
+}
+
+// storedVersion returns the version recorded in the session store, if any.
+func (p *Peer) storedVersion(key string) (string, bool) {
+	if p.sessions == nil || key == "" {
+		return "", false
+	}
+	if sess, ok := p.sessions.Get(key); ok {
+		v := sess.Metadata[MetadataKeyVersion]
+		return v, v != ""
+	}
+	return "", false
+}
+
+// recordVersion remembers the version negotiated for a session, so messages
+// of one session never carry the version negotiated for another. When the
+// session store already holds the version (SessionService and the sessions
+// the Peer creates itself record it in the session metadata) nothing is
+// cached: the store is authoritative and its expiry also ends the entry.
+func (p *Peer) recordVersion(sessionID, version string) {
+	if version == "" {
+		return
+	}
+	key := p.versionKey(sessionID)
+	if _, ok := p.storedVersion(key); ok {
+		return
+	}
+	p.versions.store(key, version)
 }
 
 // versionFor returns the version negotiated for the session, or Version.
 func (p *Peer) versionFor(sessionID string) string {
-	if v, ok := p.versions.Load(p.versionKey(sessionID)); ok {
-		return v.(string)
+	key := p.versionKey(sessionID)
+	if v, ok := p.storedVersion(key); ok {
+		return v
+	}
+	if v, ok := p.versions.load(key); ok {
+		return v
 	}
 	return Version
+}
+
+// forgetVersion drops the cached version of a session that is gone. A close
+// the handler refused (the session still exists) keeps its version.
+func (p *Peer) forgetVersion(sessionID string) {
+	key := p.versionKey(sessionID)
+	if p.sessions != nil {
+		if _, ok := p.sessions.Get(key); ok {
+			return
+		}
+	}
+	p.versions.delete(key)
 }
 
 // negotiateOrReject selects a version against SupportedVersions or returns
@@ -866,6 +959,9 @@ func (p *Peer) stamp(params interface{}) (interface{}, error) {
 	if m, ok := obj["wmp"]; ok {
 		if err := json.Unmarshal(m, &meta); err != nil {
 			return nil, fmt.Errorf("outbound wmp metadata: %w", err)
+		}
+		if meta == nil { // "wmp": null
+			meta = map[string]json.RawMessage{}
 		}
 	}
 	// Patch only missing or empty members; everything else the caller put in
