@@ -142,7 +142,8 @@ type SessionHook interface {
 // SessionResumer is an optional interface for profiles (registered with
 // Peer.Use) and for SessionServiceConfig.ResumeHooks. OnSessionResume runs
 // after a resume has been validated and the resumption token rotated; a
-// non-nil error rejects the resume. Because the presented token is already
+// non-nil error rejects the resume. The session passed in is a private copy
+// for authorisation and observation: changes to it are not persisted. Because the presented token is already
 // spent, a rejected session cannot be resumed again and the client must
 // create a new one (core section 4.5.4).
 type SessionResumer interface {

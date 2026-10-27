@@ -1687,3 +1687,85 @@ func TestSessionServiceConcurrentIDCollisionKeepsFirstSession(t *testing.T) {
 		})
 	}
 }
+
+// Resume hooks get a detached copy: neither the service's nor the Peer's hook
+// path may expose the store's live record. Run with -race.
+func TestResumeHooksGetDetachedSnapshot(t *testing.T) {
+	store := NewMemorySessionStore()
+	mutate := func(s *Session) {
+		s.ExpiresAt = time.Now().Add(-time.Hour)
+		s.Capabilities["mutated"] = json.RawMessage(`{}`)
+		s.Metadata["mutated"] = "x"
+	}
+	svc := newTestService(t, func(c *SessionServiceConfig) {
+		c.Store = store
+		c.ResumeHooks = []SessionResumer{resumeFunc(func(_ context.Context, s *Session, _ *SessionResumeParams) error { mutate(s); return nil })}
+	})
+	peer := NewPeer(nil, NewSessionHandler(svc))
+	if err := peer.Use(&resumeProfile{fn: mutate}); err != nil {
+		t.Fatal(err)
+	}
+	created := mustCreate(t, svc, alice)
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionResume, resumeParams(created, created.ResumptionToken))
+	if msg.Error != nil {
+		t.Fatalf("%+v", msg.Error)
+	}
+	live, _ := store.Get(created.WMP.SessionID)
+	if live.IsExpired() || live.Capabilities["mutated"] != nil || live.Metadata["mutated"] != "" {
+		t.Fatalf("a resume hook changed the stored session: %+v", live)
+	}
+}
+
+func TestPeerNegotiatesAgainstServiceVersions(t *testing.T) {
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Versions = []string{"1.0"} }) // global SupportedVersions is 0.1
+	peer := NewPeer(nil, NewSessionHandler(svc))
+	p := createParams()
+	p.WMP.Version = "1.0"
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, p)
+	if msg.Error != nil {
+		t.Fatalf("create at the service's version through a Peer: %+v", msg.Error)
+	}
+	var created SessionCreateResult
+	_ = json.Unmarshal(msg.Result, &created)
+	r := resumeParams(&created, created.ResumptionToken)
+	r.WMP.Version = "1.0"
+	if msg = peerCall(t, peer, ctxFor(alice), MethodSessionResume, r); msg.Error != nil {
+		t.Fatalf("resume: %+v", msg.Error)
+	}
+	// A version only the global list knows is refused, with the service's set.
+	p.WMP.Version = "0.1"
+	msg = peerCall(t, peer, ctxFor(alice), MethodSessionCreate, p)
+	if msg.Error == nil || msg.Error.Code != ErrVersionNotSupported || !strings.Contains(string(msg.Error.Data), `"1.0"`) {
+		t.Fatalf("0.1 offer: %+v", msg.Error)
+	}
+}
+
+func TestSessionServiceResumeRejectsNoLongerSupportedPinnedVersion(t *testing.T) {
+	store := NewMemorySessionStore()
+	old := NewSessionService(SessionServiceConfig{Store: store, Versions: []string{"0.1", "0.2"}})
+	p := createParams()
+	p.WMP.Version = "0.2"
+	created, err := old.SessionCreate(ctxFor(alice), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := NewSessionService(SessionServiceConfig{Store: store, Versions: []string{"0.1"}}) // 0.2 dropped
+	r := resumeParams(created, created.ResumptionToken)
+	r.WMP.Version = "0.2"
+	if _, err = now.SessionResume(ctxFor(alice), r); err == nil || rpcCode(t, err) != ErrVersionNotSupported {
+		t.Fatalf("resume of an unsupported pinned version: %v", err)
+	}
+	// Refused before rotation: the token still works for a service that supports it.
+	if _, err = old.SessionResume(ctxFor(alice), r); err != nil {
+		t.Fatalf("token was burned by the refused resume: %v", err)
+	}
+}
+
+func TestPeerResumeFallbackRejectsUnsupportedRecordedVersion(t *testing.T) {
+	peer := NewPeer(nil, resumedNoVersionHandler{}) // SupportedVersions is 0.1
+	peer.recordVersion("ses-a", "0.2")
+	msg := peerCall(t, peer, context.Background(), MethodSessionResume, &SessionResumeParams{WMP: Metadata{Version: "0.2"}, SessionID: "ses-a"})
+	if msg.Error == nil || msg.Error.Code != ErrVersionNotSupported {
+		t.Fatalf("want -31013, got %+v", msg.Error)
+	}
+}
