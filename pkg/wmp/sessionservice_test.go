@@ -1399,3 +1399,132 @@ func listAll(s *MemorySessionStore) ([]*Session, error) {
 	}
 	return out, nil
 }
+
+func TestFlowNotificationsCarryTheirOwnSession(t *testing.T) {
+	local, remote := newChanTransportPair()
+	peer := NewPeer(local, &BaseHandler{}, WithSessionIdentity("ses-A", "me"))
+	peer.recordVersion("ses-A", "0.1")
+	peer.recordVersion("ses-B", "0.2")
+	fc := newSessionFlowContext("f", "sign", nil, peer, "ses-B")
+	ctx := context.Background()
+	for name, send := range map[string]func() error{
+		"progress": func() error { return fc.Progress(ctx, "s", nil) },
+		"complete": func() error { return fc.Complete(ctx, nil) },
+		"error":    func() error { return fc.Error(ctx, ErrFlowError, "m", nil) },
+	} {
+		if err := send(); err != nil {
+			t.Fatal(err)
+		}
+		var meta Metadata
+		if err := json.Unmarshal(readOutbound(t, remote)["wmp"], &meta); err != nil {
+			t.Fatal(err)
+		}
+		if meta.SessionID != "ses-B" || meta.Version != "0.2" || meta.Sender != "me" {
+			t.Fatalf("%s: meta = %+v, want session B at 0.2", name, meta)
+		}
+	}
+	// Without a static session identity the flow's own session is still sent.
+	local2, remote2 := newChanTransportPair()
+	peer2 := NewPeer(local2, &BaseHandler{}, WithSessionIdentity("", "me"))
+	peer2.recordVersion("ses-B", "0.2")
+	if err := newSessionFlowContext("f", "sign", nil, peer2, "ses-B").Progress(ctx, "s", nil); err != nil {
+		t.Fatal(err)
+	}
+	var meta Metadata
+	_ = json.Unmarshal(readOutbound(t, remote2)["wmp"], &meta)
+	if meta.SessionID != "ses-B" || meta.Version != "0.2" {
+		t.Fatalf("meta = %+v", meta)
+	}
+}
+
+func TestAsyncFlowProfileCapturesRequestSession(t *testing.T) {
+	local, remote := newChanTransportPair()
+	peer := NewPeer(local, &BaseHandler{}, WithSessionIdentity("ses-A", ""))
+	profile := NewAsyncFlowProfile("async")
+	profile.Handle("sign", func(ctx context.Context, fc *FlowContext) error { return fc.Progress(ctx, "go", nil) })
+	if err := profile.Init(peer); err != nil {
+		t.Fatal(err)
+	}
+	ctx := ContextWithSession(context.Background(), &Session{ID: "ses-B"})
+	if _, err := profile.StartFlow(ctx, &FlowStartParams{WMP: Metadata{SessionID: "ses-claimed"}, FlowType: "sign", FlowID: "f1"}); err != nil {
+		t.Fatal(err)
+	}
+	var meta Metadata
+	_ = json.Unmarshal(readOutbound(t, remote)["wmp"], &meta)
+	if meta.SessionID != "ses-B" {
+		t.Fatalf("flow notification session = %q, want the request's resolved session ses-B", meta.SessionID)
+	}
+}
+
+// createDeletingHandler simulates a sweep removing the session right after
+// the service created it.
+type createDeletingHandler struct {
+	SessionHandler
+	store SessionStore
+}
+
+func (h createDeletingHandler) SessionCreate(ctx context.Context, p *SessionCreateParams) (*SessionCreateResult, error) {
+	res, err := h.SessionHandler.SessionCreate(ctx, p)
+	if err == nil {
+		_ = h.store.Delete(res.WMP.SessionID)
+	}
+	return res, err
+}
+
+func TestPeerCreateDoesNotRecreateSweptHandlerSession(t *testing.T) {
+	store := NewMemorySessionStore()
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Store = store })
+	peer := NewPeer(nil, createDeletingHandler{NewSessionHandler(svc), store}, WithSessionStore(store))
+	if err := peer.Use(&resumeProfile{fn: func(*Session) {}}); err != nil {
+		t.Fatal(err)
+	}
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, createParams())
+	if msg.Error == nil || msg.Error.Code != ErrSessionExpired {
+		t.Fatalf("want -31001, got %+v", msg.Error)
+	}
+	if all, _ := listAll(store); len(all) != 0 {
+		t.Fatalf("swept session was recreated without owner/expiry: %+v", all[0])
+	}
+}
+
+// staleFirstGetStore shows the first Get an unexpired copy, as if the session
+// expired right after the expiry check.
+type staleFirstGetStore struct {
+	*MemorySessionStore
+	once sync.Once
+}
+
+func (s *staleFirstGetStore) Get(id string) (*Session, bool) {
+	sess, ok := s.MemorySessionStore.Get(id)
+	if !ok {
+		return sess, ok
+	}
+	stale := false
+	s.once.Do(func() { stale = true })
+	if stale {
+		cp := *sess
+		cp.ExpiresAt = time.Now().Add(time.Hour)
+		return &cp, true
+	}
+	return sess, ok
+}
+
+func TestSessionServiceExpiryDuringRotationIsExpired(t *testing.T) {
+	inner := NewMemorySessionStore()
+	hooks := 0
+	s := newTestService(t, func(c *SessionServiceConfig) {
+		c.Store = &staleFirstGetStore{MemorySessionStore: inner}
+		c.ExpireHooks = []SessionExpirer{expireFunc(func(context.Context, *Session) { hooks++ })}
+	})
+	created := mustCreate(t, s, alice)
+	sess, _ := inner.Get(created.WMP.SessionID)
+	sess.ExpiresAt = time.Now().Add(-time.Second)
+
+	_, err := s.SessionResume(ctxFor(alice), resumeParams(created, created.ResumptionToken))
+	if err == nil || rpcCode(t, err) != ErrSessionExpired || hooks != 1 {
+		t.Fatalf("err %v hooks %d; want -31001 and one expire hook", err, hooks)
+	}
+	if _, ok := inner.Get(created.WMP.SessionID); ok {
+		t.Fatal("expired session must be removed")
+	}
+}

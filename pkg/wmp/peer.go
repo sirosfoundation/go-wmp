@@ -794,6 +794,12 @@ func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, resu
 	// stored the session with its owner and token expiry; never replace that
 	// record with a bare copy.
 	sess, existing := p.store().Get(result.WMP.SessionID)
+	if _, owns := p.handler.(SessionStoreProvider); owns && !existing {
+		// The handler persists its own sessions and the record is gone (it
+		// expired and was swept meanwhile). Recreating a bare copy would
+		// lose owner and expiry.
+		return NewRPCError(ErrSessionExpired, nil)
+	}
 	if !existing {
 		sess = &Session{
 			ID:              result.WMP.SessionID,

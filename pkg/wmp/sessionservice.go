@@ -277,7 +277,9 @@ func (s *SessionService) SessionResume(ctx context.Context, p *SessionResumePara
 	case err == nil:
 	case errors.Is(err, ErrTokenExpired):
 		return nil, NewRPCError(ErrSessionExpired, nil)
-	case errors.Is(err, ErrNoSuchSession), errors.Is(err, ErrTokenMismatch):
+	case errors.Is(err, ErrNoSuchSession):
+		return nil, s.lostRotation(ctx, principal, p.SessionID)
+	case errors.Is(err, ErrTokenMismatch):
 		return nil, NewRPCError(ErrSessionNotFound, nil)
 	default:
 		return nil, NewRPCError(ErrInternalError, nil)
@@ -300,6 +302,21 @@ func (s *SessionService) SessionResume(ctx context.Context, p *SessionResumePara
 		Capabilities:    rotated.Capabilities,
 		Security:        rotated.Security,
 	}, nil
+}
+
+// lostRotation maps a rotation that found no live session. If the caller's own
+// session expired between the expiry check and the rotation, it is expired
+// properly (hooks run, record removed) and the caller gets -31001; anything
+// else is -31000.
+func (s *SessionService) lostRotation(ctx context.Context, principal Principal, id string) error {
+	sess, ok := s.cfg.Store.Get(id)
+	if !ok || !sess.OwnedBy(principal.Key()) || !sess.IsExpired() {
+		return NewRPCError(ErrSessionNotFound, nil)
+	}
+	if _, err := s.expire(ctx, sess); err != nil {
+		return NewRPCError(ErrInternalError, nil)
+	}
+	return NewRPCError(ErrSessionExpired, nil)
 }
 
 // sessionVersion returns the version to use on resume: the one stored at
