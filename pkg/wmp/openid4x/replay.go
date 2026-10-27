@@ -3,6 +3,7 @@ package openid4x
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 )
 
 const (
@@ -33,30 +34,51 @@ func SplitReplaySecrets(data []byte) (replay, live []byte, ok bool) {
 	if !isObj {
 		return nil, nil, false
 	}
-	var method string
-	if json.Unmarshal(env["method"], &method) != nil || method != methodFlowComplete {
+	if rawMethod, has := env["method"]; has {
+		var method *string
+		if json.Unmarshal(rawMethod, &method) != nil || method == nil {
+			return nil, nil, false
+		}
+		if *method != methodFlowComplete {
+			return data, nil, true
+		}
+	} else {
+		return data, nil, true // a response or malformed non-notification carries no completion
+	}
+	replay, changed, ok := redactCompletion(env)
+	switch {
+	case !ok:
+		return nil, nil, false
+	case !changed:
 		return data, nil, true
 	}
+	return replay, data, true
+}
+
+// redactCompletion redacts the result of a decoded wmp.flow.complete
+// envelope. changed is false when there was nothing to withhold.
+func redactCompletion(env map[string]json.RawMessage) (replay []byte, changed, ok bool) {
 	params, isObj := unmarshalObject(env["params"])
 	if !isObj {
-		return nil, nil, false
+		return nil, false, false
 	}
-	result, isObj := unmarshalObject(params["result"])
+	rawResult, has := params["result"]
+	if !has {
+		return nil, false, true // result is optional
+	}
+	result, isObj := unmarshalObject(rawResult)
 	if !isObj {
-		return nil, nil, false
+		return nil, false, false
 	}
 	if _, has := result[redactedMembersKey]; has {
-		return nil, nil, false
+		return nil, false, false
 	}
 	withheld := withholdSecrets(result)
 	if len(withheld) == 0 {
-		return data, nil, true
+		return nil, false, true
 	}
 	replay, ok = reassemble(env, params, result, withheld)
-	if !ok {
-		return nil, nil, false
-	}
-	return replay, data, true
+	return replay, ok, ok
 }
 
 // mayNeedRedaction reports whether data could carry a secret member or a
@@ -75,9 +97,35 @@ func mayNeedRedaction(data []byte) bool {
 	return false
 }
 
+// unmarshalObject decodes a JSON object into its members. It reports false
+// for anything but exactly one object whose keys are distinct after unescaping:
+// a duplicate key would otherwise let a decoder keep one value while another
+// reader sees the other.
 func unmarshalObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
-	var m map[string]json.RawMessage
-	if json.Unmarshal(raw, &m) != nil || m == nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, false
+	}
+	m := map[string]json.RawMessage{}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		key, isStr := keyTok.(string)
+		if err != nil || !isStr {
+			return nil, false
+		}
+		if _, dup := m[key]; dup {
+			return nil, false
+		}
+		var val json.RawMessage
+		if dec.Decode(&val) != nil {
+			return nil, false
+		}
+		m[key] = val
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return nil, false
+	}
+	if _, err := dec.Token(); err != io.EOF {
 		return nil, false
 	}
 	return m, true

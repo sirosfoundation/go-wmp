@@ -87,6 +87,13 @@ func TestSplitReplaySecrets_FailClosed(t *testing.T) {
 		"result not object":    []byte(`{"method":"wmp.flow.complete","params":{"result":"refresh_token"}}`),
 		"result null":          []byte(`{"method":"wmp.flow.complete","params":{"result":null,"x":"refresh_token"}}`),
 		"already redacted":     completeMsg(`{"refresh_token":"r","redacted_members":["dpop_jwk"]}`),
+		"method not a string":  []byte(`{"jsonrpc":"2.0","method":42,"params":{"result":{"refresh_token":"S"}}}`),
+		"method null":          []byte(`{"method":null,"params":{"result":{"refresh_token":"S"}}}`),
+		"dup result":           []byte(`{"method":"wmp.flow.complete","params":{"result":{"refresh_token":"S"},"result":{}}}`),
+		"dup params":           []byte(`{"method":"wmp.flow.complete","params":{"result":{"refresh_token":"S"}},"params":{}}`),
+		"dup secret key":       completeMsg(`{"refresh_token":"S","\u0072efresh_token":"T"}`),
+		"dup method":           []byte(`{"method":"x","method":"wmp.flow.complete","params":{"result":{"refresh_token":"S"}}}`),
+		"trailing data":        append(completeMsg(`{"refresh_token":"S"}`), []byte(` {}`)...),
 		"redacted, no secrets": completeMsg(`{"redacted_members":["refresh_token"]}`),
 		"redacted, empty list": completeMsg(`{"redacted_members":[]}`),
 		"escaped dpop":         completeMsg(`{"dpop_\u006awk":{"kty":"EC"},"redacted_members":["x"]}`),
@@ -129,5 +136,18 @@ func TestSplitReplaySecrets_EscapedKeysRedacted(t *testing.T) {
 	}
 	if err := ValidateCompletionResult(resultOf(t, replay)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSplitReplaySecrets_ResultOptionalAndEscapes(t *testing.T) {
+	in := []byte(`{"method":"wmp.flow.complete","params":{"flow_id":"\u0066"}}`)
+	replay, live, ok := SplitReplaySecrets(in)
+	if !ok || live != nil || string(replay) != string(in) {
+		t.Fatalf("got %s / %s / %v", replay, live, ok)
+	}
+	// A message with no method (a response) passes through.
+	in = []byte(`{"id":1,"result":{"refresh_token":"x"}}`)
+	if replay, live, ok = SplitReplaySecrets(in); !ok || live != nil || string(replay) != string(in) {
+		t.Fatalf("got %s / %s / %v", replay, live, ok)
 	}
 }
