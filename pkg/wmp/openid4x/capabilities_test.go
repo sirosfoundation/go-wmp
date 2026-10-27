@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
+	"github.com/sirosfoundation/go-wmp/pkg/wmp/schema"
 )
 
 func TestCapabilityDescriptors_Spec(t *testing.T) {
@@ -139,5 +140,35 @@ func TestProfile_FlowStartGatedByNegotiatedCapability(t *testing.T) {
 	}
 	if startedVP {
 		t.Fatal("OnVPStart must not run for a flow type whose capability was not negotiated")
+	}
+}
+
+// Descriptors built here must pass the embedded capability schema, or a Peer
+// with a schema.Validator rejects the session negotiation that carries them.
+func TestCapabilityDescriptors_PassEmbeddedSchema(t *testing.T) {
+	caps, err := CapabilityDescriptors(CapabilityConfig{
+		OID4VCI:         &OID4VCICapability{SupportedGrants: []string{GrantAuthorizationCode}, SupportedFormats: []string{FormatVCSDJWT}, SupportedProofTypes: []string{ProofTypeJWT}, BatchIssuance: true},
+		OID4VP:          &OID4VPCapability{SupportedResponseModes: []string{ResponseModeDCAPI}, SupportedFormats: []string{FormatMSOmDOC}, SupportedAlgorithms: []string{"ES256"}},
+		TransactionData: &wmp.TransactionDataCap{Versions: []int{1}, HashAlgs: []string{"sha-256"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := schema.NewValidator()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := wmp.NewRequest("1", wmp.MethodSessionCreate, wmp.SessionCreateParams{
+		WMP:                 wmp.Metadata{Version: wmp.Version},
+		Participants:        []string{"did:web:a.example"},
+		CapabilitiesOffered: caps,
+		Security:            wmp.SecurityMode{Mode: "tls"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(req)
+	if err := v.ValidateMethod(wmp.MethodSessionCreate, data); err != nil {
+		t.Fatalf("session.create with generated descriptors rejected: %v", err)
 	}
 }
