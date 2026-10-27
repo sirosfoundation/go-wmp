@@ -6,7 +6,7 @@ import (
 )
 
 // parseVersion parses a "MAJOR.MINOR" protocol version (core section 2.2).
-// Both parts must be plain decimal digits: signs, spaces, empty parts and
+// Both parts must be plain decimal digits without leading zeros: signs, spaces, empty parts and
 // extra components are rejected.
 func parseVersion(v string) (major, minor int, ok bool) {
 	maj, mnr, found := strings.Cut(v, ".")
@@ -24,7 +24,8 @@ func parseVersion(v string) (major, minor int, ok bool) {
 }
 
 func parseVersionPart(s string) (int, error) {
-	if s == "" || len(s) > 6 {
+	// No leading zeros: "0.01" is malformed (spec errors vector).
+	if s == "" || len(s) > 6 || (len(s) > 1 && s[0] == '0') {
 		return 0, strconv.ErrSyntax
 	}
 	for _, r := range s {
@@ -56,4 +57,15 @@ func NegotiateVersion(offered string, supported []string) (selected string, ok b
 		best, selected = minor, s
 	}
 	return selected, best >= 0
+}
+
+// versionRejection is the error for an offered version that NegotiateVersion
+// could not match: -32602 when it is not a valid "MAJOR.MINOR" string
+// (including an absent one), else -31013 carrying supported_versions
+// (core sections 2.2.2 and 3.8).
+func versionRejection(offered string, supported []string) *RPCError {
+	if _, _, ok := parseVersion(offered); !ok {
+		return NewRPCError(ErrInvalidParams, nil)
+	}
+	return NewRPCError(ErrVersionNotSupported, map[string]interface{}{"supported_versions": supported})
 }

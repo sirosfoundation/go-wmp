@@ -18,6 +18,11 @@ type TestVector struct {
 	ID               string          `json:"id"`
 	Description      string          `json:"description"`
 	ConformanceLevel string          `json:"conformance_level"`
+	// Setup configures the responder under test (spec vectors README); the
+	// RPC service harness honours supported_versions.
+	Setup struct {
+		SupportedVersions []string `json:"supported_versions"`
+	} `json:"setup"`
 	Input            json.RawMessage `json:"input"`
 	ExpectedResponse json.RawMessage `json:"expected_response,omitempty"`
 	ExpectedError    json.RawMessage `json:"expected_error,omitempty"`

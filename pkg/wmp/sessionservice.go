@@ -132,10 +132,6 @@ func (s *SessionService) lockFor(id string) *sync.Mutex {
 	return &s.locks[h.Sum32()%sessionLockStripe]
 }
 
-func versionError(supported []string) *RPCError {
-	return NewRPCError(ErrVersionNotSupported, map[string]interface{}{"supported_versions": supported})
-}
-
 // SessionCreate implements wmp.session.create. The caller must have an
 // authenticated Principal in ctx (-31002 otherwise); the session is owned by
 // it. The client never chooses the session ID.
@@ -146,7 +142,7 @@ func (s *SessionService) SessionCreate(ctx context.Context, p *SessionCreatePara
 	}
 	version, ok := NegotiateVersion(p.WMP.Version, s.cfg.Versions)
 	if !ok {
-		return nil, versionError(s.cfg.Versions)
+		return nil, versionRejection(p.WMP.Version, s.cfg.Versions)
 	}
 	mode := p.Security.Mode
 	if mode == "" {
@@ -263,7 +259,7 @@ func (s *SessionService) SessionResume(ctx context.Context, p *SessionResumePara
 		return nil, NewRPCError(ErrNotAuthorized, nil)
 	}
 	if _, ok := NegotiateVersion(p.WMP.Version, s.cfg.Versions); !ok {
-		return nil, versionError(s.cfg.Versions)
+		return nil, versionRejection(p.WMP.Version, s.cfg.Versions)
 	}
 	sess, ok := s.cfg.Store.Get(p.SessionID)
 	if !ok || !sess.OwnedBy(principal.Key()) {
@@ -278,7 +274,7 @@ func (s *SessionService) SessionResume(ctx context.Context, p *SessionResumePara
 	// All messages of a session use the version negotiated at create.
 	version, ok := s.sessionVersion(sess, p.WMP.Version)
 	if !ok {
-		return nil, versionError([]string{sess.Metadata[MetadataKeyVersion]})
+		return nil, versionRejection(p.WMP.Version, []string{sess.Metadata[MetadataKeyVersion]})
 	}
 
 	newToken, err := NewResumptionToken()
