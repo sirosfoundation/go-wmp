@@ -295,7 +295,9 @@ func (s *SessionService) SessionResume(ctx context.Context, p *SessionResumePara
 	}
 
 	for _, h := range s.cfg.ResumeHooks {
-		if err := h.OnSessionResume(ctx, rotated, p); err != nil {
+		// A private copy: the store may hand out its live record, and hooks
+		// are for authorisation and observation, not for changing the session.
+		if err := h.OnSessionResume(ctx, cloneSession(rotated), p); err != nil {
 			return nil, toRPCError(err)
 		}
 	}

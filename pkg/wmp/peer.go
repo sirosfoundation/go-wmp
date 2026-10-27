@@ -933,7 +933,7 @@ func (p *Peer) dispatchSessionResume(ctx context.Context, ps *SessionResumeParam
 		// The token has already been rotated: a rejecting hook ends this
 		// session's resumability, so the client creates a new session (core
 		// section 4.5.4).
-		if hookErr := p.registry.runSessionResumers(ctx, sess, ps); hookErr != nil {
+		if hookErr := p.registry.runSessionResumers(ctx, cloneSession(sess), ps); hookErr != nil {
 			return nil, toRPCError(hookErr)
 		}
 	}
