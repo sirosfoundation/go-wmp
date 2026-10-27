@@ -175,9 +175,6 @@ func (s *SessionService) SessionCreate(ctx context.Context, p *SessionCreatePara
 	if id == "" {
 		return nil, NewRPCError(ErrInternalError, nil)
 	}
-	if _, exists := s.cfg.Store.Get(id); exists {
-		return nil, NewRPCError(ErrInternalError, nil)
-	}
 	token, err := NewResumptionToken()
 	if err != nil {
 		return nil, NewRPCError(ErrInternalError, nil)
@@ -201,7 +198,7 @@ func (s *SessionService) SessionCreate(ctx context.Context, p *SessionCreatePara
 		ExpiresAt:                expires,
 		Owner:                    principal.Key(),
 	}
-	if err := s.cfg.Store.Create(sess); err != nil {
+	if err := s.insert(sess); err != nil {
 		return nil, NewRPCError(ErrInternalError, nil)
 	}
 	return &SessionCreateResult{
@@ -210,6 +207,22 @@ func (s *SessionService) SessionCreate(ctx context.Context, p *SessionCreatePara
 		Security:        sess.Security,
 		ResumptionToken: token,
 	}, nil
+}
+
+// insert stores a new session, refusing an ID that is already taken instead of
+// overwriting that session. Atomic through SessionCreator, else serialised per
+// ID within this process.
+func (s *SessionService) insert(sess *Session) error {
+	if c, ok := s.cfg.Store.(SessionCreator); ok {
+		return c.CreateIfAbsent(sess)
+	}
+	mu := s.lockFor(sess.ID)
+	mu.Lock()
+	defer mu.Unlock()
+	if _, exists := s.cfg.Store.Get(sess.ID); exists {
+		return ErrSessionExists
+	}
+	return s.cfg.Store.Create(sess)
 }
 
 func (s *SessionService) negotiateCapabilities(ctx context.Context, offered Capabilities) Capabilities {

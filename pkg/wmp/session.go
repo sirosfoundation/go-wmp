@@ -20,6 +20,9 @@ var (
 	// equal to the presented token (which would leave the old token usable
 	// and break single-use).
 	ErrInvalidNewToken = errors.New("wmp: invalid replacement resumption token")
+	// ErrSessionExists is returned by SessionCreator.CreateIfAbsent when a
+	// session with the same ID is already stored.
+	ErrSessionExists = errors.New("wmp: session already exists")
 	// ErrTokenExpired is returned when the presented token is the session's
 	// current token but its ResumptionTokenExpiresAt has passed.
 	ErrTokenExpired = errors.New("wmp: resumption token expired")
@@ -230,6 +233,27 @@ func (s *MemorySessionStore) UpdateIfPresent(session *Session) error {
 	defer s.mu.Unlock()
 	if _, ok := s.sessions[session.ID]; !ok {
 		return ErrNoSuchSession
+	}
+	s.sessions[session.ID] = session
+	return nil
+}
+
+// SessionCreator is an optional SessionStore extension: CreateIfAbsent stores
+// the session only if its ID is not taken, atomically, and returns
+// ErrSessionExists otherwise. Create alone overwrites, so a colliding ID would
+// silently replace another session's owner and token.
+type SessionCreator interface {
+	CreateIfAbsent(session *Session) error
+}
+
+var _ SessionCreator = (*MemorySessionStore)(nil)
+
+// CreateIfAbsent implements SessionCreator.
+func (s *MemorySessionStore) CreateIfAbsent(session *Session) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sessions[session.ID]; ok {
+		return ErrSessionExists
 	}
 	s.sessions[session.ID] = session
 	return nil

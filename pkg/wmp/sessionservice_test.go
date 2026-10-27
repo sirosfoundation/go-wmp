@@ -1628,3 +1628,59 @@ func TestStampResumeUsesTargetSessionVersion(t *testing.T) {
 		t.Fatalf("resume stamped %+v, want the target session ses-t at 0.2", meta)
 	}
 }
+
+func TestCloneSessionIsDeep(t *testing.T) {
+	suite := 1
+	orig := &Session{
+		ID: "ses-x", Participants: []string{"p"},
+		Capabilities: Capabilities{"a": json.RawMessage(`{"k":1}`)},
+		Security:     SecurityMode{Mode: "mls", CipherSuites: []int{1, 2}, CipherSuite: &suite, EncryptedCapabilities: []string{"a"}},
+		Metadata:     map[string]string{"k": "v"},
+	}
+	c := cloneSession(orig)
+	c.Participants[0] = "q"
+	c.Capabilities["a"][2] = 'z'
+	c.Capabilities["b"] = json.RawMessage(`1`)
+	c.Security.CipherSuites[0] = 9
+	*c.Security.CipherSuite = 9
+	c.Security.EncryptedCapabilities[0] = "z"
+	c.Metadata["k"] = "w"
+	if orig.Participants[0] != "p" || string(orig.Capabilities["a"]) != `{"k":1}` || len(orig.Capabilities) != 1 ||
+		orig.Security.CipherSuites[0] != 1 || *orig.Security.CipherSuite != 1 || orig.Security.EncryptedCapabilities[0] != "a" || orig.Metadata["k"] != "v" {
+		t.Fatalf("clone shares state with the original: %+v", orig)
+	}
+}
+
+// All creates collide on the same session ID; only one may win.
+func TestSessionServiceConcurrentIDCollisionKeepsFirstSession(t *testing.T) {
+	for name, wrap := range map[string]func(*MemorySessionStore) SessionStore{
+		"atomic store":  func(m *MemorySessionStore) SessionStore { return m },
+		"lock fallback": func(m *MemorySessionStore) SessionStore { return slowStore{plainStore{m}} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			inner := NewMemorySessionStore()
+			s := newTestService(t, func(c *SessionServiceConfig) {
+				c.Store = wrap(inner)
+				c.NewSessionID = func() string { return "ses-fixed" }
+			})
+			var wins atomic.Int32
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			for _, who := range []Principal{alice, bob, alice, bob} {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					if _, err := s.SessionCreate(ctxFor(who), createParams()); err == nil {
+						wins.Add(1)
+					}
+				}()
+			}
+			close(start)
+			wg.Wait()
+			if wins.Load() != 1 {
+				t.Fatalf("%d creates succeeded for one session ID, want exactly 1", wins.Load())
+			}
+		})
+	}
+}

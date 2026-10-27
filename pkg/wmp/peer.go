@@ -850,6 +850,11 @@ func cloneSession(s *Session) *Session {
 	c := *s
 	c.Participants = append([]string(nil), s.Participants...)
 	c.Security.EncryptedCapabilities = append([]string(nil), s.Security.EncryptedCapabilities...)
+	c.Security.CipherSuites = append([]int(nil), s.Security.CipherSuites...)
+	if s.Security.CipherSuite != nil {
+		suite := *s.Security.CipherSuite
+		c.Security.CipherSuite = &suite
+	}
 	if s.Capabilities != nil {
 		c.Capabilities = make(Capabilities, len(s.Capabilities))
 		for k, v := range s.Capabilities {
