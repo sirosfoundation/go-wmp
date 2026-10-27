@@ -1199,8 +1199,9 @@ func TestPeerOutboundDeclinedResumeKeepsVersion(t *testing.T) {
 // failingStore fails Create and Update.
 type failingStore struct{ *MemorySessionStore }
 
-func (failingStore) Create(*Session) error { return errors.New("boom") }
-func (failingStore) Update(*Session) error { return errors.New("boom") }
+func (failingStore) Create(*Session) error          { return errors.New("boom") }
+func (failingStore) Update(*Session) error          { return errors.New("boom") }
+func (failingStore) UpdateIfPresent(*Session) error { return errors.New("boom") }
 
 func TestPeerCreateHookPersistenceFailureRollsBack(t *testing.T) {
 	inner := NewMemorySessionStore()
@@ -1332,4 +1333,69 @@ func TestPeerOutboundCloseForgetsVersion(t *testing.T) {
 	if v := peer.versionFor("ses-a"); v != Version {
 		t.Fatalf("version kept after outbound close: %q", v)
 	}
+}
+
+// A non-owner must get the same answer whatever version it offers, so the
+// Peer's version handling cannot reveal that a session exists.
+func TestPeerResumeVersionErrorIsNotAnExistenceOracle(t *testing.T) {
+	old := SupportedVersions
+	SupportedVersions = []string{"0.1", "0.2"}
+	defer func() { SupportedVersions = old }()
+	store := NewMemorySessionStore()
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Store = store; c.Versions = []string{"0.1", "0.2"} })
+	peer := NewPeer(nil, NewSessionHandler(svc))
+	p := createParams()
+	p.WMP.Version = "0.2"
+	created, err := svc.SessionCreate(ctxFor(alice), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer.recordVersion(created.WMP.SessionID, "0.2")
+
+	existing := resumeParams(created, "x")
+	existing.WMP.Version = "0.1"
+	unknown := resumeParams(created, "x")
+	unknown.WMP.Version = "0.1"
+	unknown.SessionID = "ses-nope"
+	a := peerCall(t, peer, ctxFor(bob), MethodSessionResume, existing)
+	b := peerCall(t, peer, ctxFor(bob), MethodSessionResume, unknown)
+	if a.Error == nil || b.Error == nil || a.Error.Code != ErrSessionNotFound || a.Error.Code != b.Error.Code || string(a.Error.Data) != string(b.Error.Data) {
+		t.Fatalf("existing %+v vs unknown %+v", a.Error, b.Error)
+	}
+}
+
+type deletingCreateProfile struct{ store SessionStore }
+
+func (deletingCreateProfile) Name() string           { return "delete-on-create" }
+func (deletingCreateProfile) Capabilities() []string { return nil }
+func (deletingCreateProfile) Init(PeerContext) error { return nil }
+func (p deletingCreateProfile) OnSessionCreate(_ context.Context, s *Session, _ *SessionCreateParams) error {
+	return p.store.Delete(s.ID) // a sweep removes the session while the hook runs
+}
+func (deletingCreateProfile) OnSessionClose(context.Context, *Session, *SessionCloseParams) {}
+
+func TestPeerCreateFinalisationDoesNotResurrectRemovedSession(t *testing.T) {
+	store := NewMemorySessionStore()
+	svc := newTestService(t, func(c *SessionServiceConfig) { c.Store = store })
+	peer := NewPeer(nil, NewSessionHandler(svc))
+	if err := peer.Use(deletingCreateProfile{store}); err != nil {
+		t.Fatal(err)
+	}
+	msg := peerCall(t, peer, ctxFor(alice), MethodSessionCreate, createParams())
+	if msg.Error == nil || msg.Error.Code != ErrSessionExpired {
+		t.Fatalf("want -31001, got %+v", msg.Error)
+	}
+	if all, _ := listAll(store); len(all) != 0 {
+		t.Fatalf("removed session was written back: %d records", len(all))
+	}
+}
+
+func listAll(s *MemorySessionStore) ([]*Session, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []*Session
+	for _, sess := range s.sessions {
+		out = append(out, sess)
+	}
+	return out, nil
 }

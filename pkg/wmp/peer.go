@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -813,9 +814,14 @@ func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, resu
 	}
 	var err error
 	if existing {
-		err = p.store().Update(sess)
+		err = updateIfPresent(p.store(), sess)
 	} else {
 		err = p.store().Create(sess)
+	}
+	if errors.Is(err, ErrNoSuchSession) {
+		// The session was removed (expired and swept) while the hooks ran:
+		// writing it back would resurrect it.
+		return NewRPCError(ErrSessionExpired, nil)
 	}
 	if err != nil {
 		// The hook's changes (or the record itself) were not persisted and
@@ -826,19 +832,32 @@ func (p *Peer) runCreateHooks(ctx context.Context, ps *SessionCreateParams, resu
 	return nil
 }
 
+// SessionUpdater is an optional SessionStore extension: UpdateIfPresent
+// replaces the stored session only if it still exists, atomically, and
+// returns ErrNoSuchSession otherwise. Plain Update is an upsert on some stores
+// and would resurrect a session removed in the meantime.
+type SessionUpdater interface {
+	UpdateIfPresent(session *Session) error
+}
+
+// updateIfPresent uses SessionUpdater when the store has it, else a
+// non-atomic Get followed by Update.
+func updateIfPresent(st SessionStore, sess *Session) error {
+	if u, ok := st.(SessionUpdater); ok {
+		return u.UpdateIfPresent(sess)
+	}
+	if _, ok := st.Get(sess.ID); !ok {
+		return ErrNoSuchSession
+	}
+	return st.Update(sess)
+}
+
 // dispatchSessionResume negotiates the version, calls the handler, runs the
 // resume hooks and commits the version only for a successful resume.
 func (p *Peer) dispatchSessionResume(ctx context.Context, ps *SessionResumeParams) (*SessionResumeResult, error) {
 	selected, vErr := negotiateOrReject(ps.WMP.Version)
 	if vErr != nil {
 		return nil, vErr
-	}
-	// A session keeps the version negotiated at create (core section 2.2.3):
-	// when one is on record, that is what this resume must use.
-	if rec, ok := p.recordedVersion(p.versionKey(ps.SessionID)); ok {
-		if selected, ok = NegotiateVersion(ps.WMP.Version, []string{rec}); !ok {
-			return nil, versionError([]string{rec})
-		}
 	}
 	result, err := p.handler.SessionResume(ctx, ps)
 	if err != nil {
@@ -847,11 +866,21 @@ func (p *Peer) dispatchSessionResume(ctx context.Context, ps *SessionResumeParam
 	if result == nil {
 		return nil, nil
 	}
-	if result.WMP.Version == "" {
-		result.WMP.Version = selected
-	}
 	if !result.Resumed {
+		if result.WMP.Version == "" {
+			result.WMP.Version = selected
+		}
 		return result, nil
+	}
+	if result.WMP.Version == "" {
+		// A session keeps the version negotiated at create (core section
+		// 2.2.3). Checked only after the handler authorised the resume, so a
+		// version error cannot reveal that a session exists.
+		version, vErr := p.resumeVersion(ps, selected)
+		if vErr != nil {
+			return nil, vErr
+		}
+		result.WMP.Version = version
 	}
 	if p.registry.hasResumers() {
 		// Resume authorization hooks must not be bypassed: without a session
@@ -872,6 +901,20 @@ func (p *Peer) dispatchSessionResume(ctx context.Context, ps *SessionResumeParam
 	}
 	p.recordVersion(ps.SessionID, result.WMP.Version)
 	return result, nil
+}
+
+// resumeVersion is the version for a resume whose handler named none: the
+// session's recorded one if the client still offers at least that, else the
+// freshly negotiated one.
+func (p *Peer) resumeVersion(ps *SessionResumeParams, negotiated string) (string, *RPCError) {
+	rec, ok := p.recordedVersion(p.versionKey(ps.SessionID))
+	if !ok {
+		return negotiated, nil
+	}
+	if v, ok := NegotiateVersion(ps.WMP.Version, []string{rec}); ok {
+		return v, nil
+	}
+	return "", versionError([]string{rec})
 }
 
 // versionKey maps a message's session ID to the key under which its

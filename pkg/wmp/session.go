@@ -221,3 +221,16 @@ func (s *MemorySessionStore) ListExpired() ([]*Session, error) {
 	}
 	return result, nil
 }
+
+var _ SessionUpdater = (*MemorySessionStore)(nil)
+
+// UpdateIfPresent implements SessionUpdater.
+func (s *MemorySessionStore) UpdateIfPresent(session *Session) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sessions[session.ID]; !ok {
+		return ErrNoSuchSession
+	}
+	s.sessions[session.ID] = session
+	return nil
+}
