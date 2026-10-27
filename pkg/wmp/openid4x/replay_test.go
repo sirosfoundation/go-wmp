@@ -1,6 +1,7 @@
 package openid4x
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"testing"
@@ -81,11 +82,14 @@ func TestSplitReplaySecrets(t *testing.T) {
 
 func TestSplitReplaySecrets_FailClosed(t *testing.T) {
 	for name, in := range map[string][]byte{
-		"not json":          []byte(`{"refresh_token"`),
-		"params not object": []byte(`{"method":"wmp.flow.complete","params":"refresh_token"}`),
-		"result not object": []byte(`{"method":"wmp.flow.complete","params":{"result":"refresh_token"}}`),
-		"result null":       []byte(`{"method":"wmp.flow.complete","params":{"result":null,"x":"refresh_token"}}`),
-		"already redacted":  completeMsg(`{"refresh_token":"r","redacted_members":["dpop_jwk"]}`),
+		"not json":             []byte(`{"refresh_token"`),
+		"params not object":    []byte(`{"method":"wmp.flow.complete","params":"refresh_token"}`),
+		"result not object":    []byte(`{"method":"wmp.flow.complete","params":{"result":"refresh_token"}}`),
+		"result null":          []byte(`{"method":"wmp.flow.complete","params":{"result":null,"x":"refresh_token"}}`),
+		"already redacted":     completeMsg(`{"refresh_token":"r","redacted_members":["dpop_jwk"]}`),
+		"redacted, no secrets": completeMsg(`{"redacted_members":["refresh_token"]}`),
+		"redacted, empty list": completeMsg(`{"redacted_members":[]}`),
+		"escaped dpop":         completeMsg(`{"dpop_\u006awk":{"kty":"EC"},"redacted_members":["x"]}`),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if replay, live, ok := SplitReplaySecrets(in); ok || replay != nil || live != nil {
@@ -111,5 +115,19 @@ func TestReplaySecretMembersConsistent(t *testing.T) {
 		if replaySecretMembers[i] != m || !isReplaySecretMember(m) {
 			t.Fatalf("mismatch at %d", i)
 		}
+	}
+}
+
+func TestSplitReplaySecrets_EscapedKeysRedacted(t *testing.T) {
+	in := completeMsg(`{"credentials":[],"\u0072efresh_token":"r","dpop_\u006awk":{"kty":"EC"}}`)
+	replay, live, ok := SplitReplaySecrets(in)
+	if !ok || live == nil {
+		t.Fatalf("ok=%v live=%s", ok, live)
+	}
+	if bytes.Contains(replay, []byte(`"r"`)) || bytes.Contains(replay, []byte("kty")) {
+		t.Fatalf("secret leaked: %s", replay)
+	}
+	if err := ValidateCompletionResult(resultOf(t, replay)); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -22,11 +22,14 @@ const (
 // replay is data and live is nil.
 //
 // ok is false when the message mentions a secret member but cannot be parsed
-// as such a completion (or its result already carries redacted_members): the
+// as such a completion (or its result already carries redacted_members, with or without secret members): the
 // caller must then not retain it. The replay copy of a conforming input
 // satisfies ValidateCompletionResult.
 func SplitReplaySecrets(data []byte) (replay, live []byte, ok bool) {
-	mentioned := false
+	// A JSON key may be spelled with escapes ("\u0072efresh_token"), so any
+	// escape forces a parse; redacted_members is looked for too, because a
+	// live completion never carries it.
+	mentioned := bytes.Contains(data, []byte(`\u`)) || bytes.Contains(data, []byte(`"`+redactedMembersKey+`"`))
 	for _, k := range replaySecretMembers {
 		if bytes.Contains(data, []byte(`"`+k+`"`)) {
 			mentioned = true
@@ -52,6 +55,9 @@ func SplitReplaySecrets(data []byte) (replay, live []byte, ok bool) {
 	if json.Unmarshal(params["result"], &result) != nil || result == nil {
 		return nil, nil, false
 	}
+	if _, has := result[redactedMembersKey]; has {
+		return nil, nil, false
+	}
 	var withheld []string // replaySecretMembers is sorted
 	for _, k := range replaySecretMembers {
 		if _, has := result[k]; has {
@@ -61,9 +67,6 @@ func SplitReplaySecrets(data []byte) (replay, live []byte, ok bool) {
 	}
 	if len(withheld) == 0 {
 		return data, nil, true
-	}
-	if _, has := result[redactedMembersKey]; has {
-		return nil, nil, false
 	}
 	var err error
 	if result[redactedMembersKey], err = json.Marshal(withheld); err != nil {
