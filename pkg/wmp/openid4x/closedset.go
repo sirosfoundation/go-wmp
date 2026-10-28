@@ -11,6 +11,11 @@ func isNotNull(raw json.RawMessage) bool { return !bytes.Equal(bytes.TrimSpace(r
 // closedObject decodes raw as a JSON object and refuses duplicate member
 // names, which a map decode would silently collapse.
 func closedObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	// Valid first: the decoder below would take a stray closing delimiter or
+	// other garbage after the object for the end of the input.
+	if !json.Valid(raw) {
+		return nil, errors.New("not valid JSON")
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	tok, err := dec.Token()
 	if d, ok := tok.(json.Delim); err != nil || !ok || d != '{' {

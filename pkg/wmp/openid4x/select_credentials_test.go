@@ -52,6 +52,9 @@ func TestParseSelectCredentials(t *testing.T) {
 		"query id BOM":             {`{"consent":true,"selections":[` + sel(`a\ufeffb`, h1) + `]}`, false},
 		"query id C1":              {`{"consent":true,"selections":[` + sel(`a\u0085b`, h1) + `]}`, false},
 		"query id too long":        {`{"consent":true,"selections":[` + sel(strings.Repeat("a", 257), h1) + `]}`, false},
+		"trailing brace":           {`{"consent":false}}`, false},
+		"trailing bracket":         {`{"consent":false}]`, false},
+		"two objects":              {`{"consent":false} {"consent":false}`, false},
 		"not an object":            {`[]`, false},
 		"empty":                    {``, false},
 	} {
