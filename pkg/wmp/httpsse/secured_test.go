@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -910,4 +911,86 @@ func TestSecuredFactoryPanicDoesNotWedgeTheSession(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("a failed build left later requests waiting forever")
 	}
+}
+
+func TestSecuredRefusesCaseFoldedRoutingMembers(t *testing.T) {
+	f := newSecuredFixture(t, nil)
+	mine, _ := f.create("Bearer alice")
+	victim, _ := f.create("Bearer bob")
+	_ = victim
+	hdr := map[string]string{"Authorization": "Bearer alice", "Wmp-Session-Id": mine}
+	for name, body := range map[string]string{
+		// "ſ" is read as "s" by encoding/json's case folding.
+		"params": `{"jsonrpc":"2.0","id":"1","method":"wmp.session.close","paramſ":{"wmp":{"session_id":"` + victim + `"}},"params":{"wmp":{"session_id":""}}}`,
+		"wmp":    `{"jsonrpc":"2.0","id":"1","method":"wmp.session.close","params":{"WMP":{"session_id":"` + victim + `"},"wmp":{"session_id":""}}}`,
+	} {
+		req, _ := http.NewRequest(http.MethodPost, f.ts.URL, strings.NewReader(body))
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		e, _ := out["error"].(map[string]any)
+		if e == nil || int(e["code"].(float64)) != wmp.ErrInvalidRequest {
+			t.Errorf("%s: %v", name, out)
+		}
+	}
+	if _, ok := f.store.Get(victim); !ok {
+		t.Fatal("the victim's session was closed through a folded member name")
+	}
+}
+
+func TestSecuredExpiredResumeEndsTheLiveSession(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) { c.SweepInterval = -1 })
+	id, token := f.create("Bearer alice")
+	f.post("Bearer alice", nil, rpc("0", wmp.MethodMessageDeliver, id, nil)) // live
+	rec, _ := f.store.Get(id)
+	upd := *rec
+	upd.ExpiresAt = time.Now().Add(-time.Second)
+	_ = f.store.Update(&upd)
+	f.h.mu.RLock()
+	live := f.h.sessions[id]
+	f.h.mu.RUnlock()
+	r := f.post("Bearer alice", nil, rpc("1", wmp.MethodSessionResume, id, map[string]any{"session_id": id, "resumption_token": token}))
+	if rpcCode(r) != wmp.ErrSessionExpired {
+		t.Fatalf("%s", r.Raw)
+	}
+	select {
+	case <-live.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the live session outlived the record the resume deleted")
+	}
+}
+
+func broadcastLoops() int {
+	var b strings.Builder
+	_ = pprof.Lookup("goroutine").WriteTo(&b, 2)
+	return strings.Count(b.String(), "(*serverSession).broadcastLoop")
+}
+
+func TestSecuredCreatePanicDoesNotLeakTheTemporarySession(t *testing.T) {
+	f := newSecuredFixture(t, nil)
+	before := broadcastLoops()
+	f.h.secured.cfg.NewHandler = func(_ context.Context, _ wmp.Principal, id string) (wmp.Handler, []wmp.PeerOption) {
+		return panicOnCreate{wmp.NewSessionHandler(f.svc)}, nil
+	}
+	_ = f.postRaw("Bearer alice", createBody("c1")) // the connection is aborted
+	deadline := time.Now().Add(2 * time.Second)
+	for broadcastLoops() > before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := broadcastLoops(); n > before {
+		t.Fatalf("%d broadcast loops left running", n-before)
+	}
+}
+
+type panicOnCreate struct{ wmp.SessionHandler }
+
+func (panicOnCreate) SessionCreate(context.Context, *wmp.SessionCreateParams) (*wmp.SessionCreateResult, error) {
+	panic("create failed")
 }

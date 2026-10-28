@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -209,6 +210,12 @@ func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wm
 		writeRPCError(w, nil, wmp.ErrParseError, nil)
 		return
 	}
+	if ambiguousRouting(body) {
+		// Ownership is decided on one reading of the message and dispatch
+		// uses another if a member name can be read two ways.
+		writeRPCError(w, env.ID, wmp.ErrInvalidRequest, map[string]string{"reason": "ambiguous member names"})
+		return
+	}
 
 	// The session may be named in the header, in wmp metadata and, for
 	// resume, in the params; the values must agree (transport section 4.5).
@@ -263,9 +270,9 @@ func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wm
 		http.Error(w, "dispatch error", http.StatusInternalServerError)
 		return
 	}
-	if env.Method == wmp.MethodSessionClose {
-		// The service deleted the record when the owner closed the session;
-		// end its in-memory state with it.
+	if env.Method == wmp.MethodSessionClose || env.Method == wmp.MethodSessionResume {
+		// The service deletes the record when the owner closes the session or
+		// a resume finds it expired; end its in-memory state with it.
 		if _, ok := h.secured.store.Get(id); !ok {
 			h.forget(id)
 		}
@@ -289,6 +296,46 @@ func (h *ServerHandler) dispatchContext(ctx context.Context, done <-chan struct{
 		}
 	}()
 	return ctx, cancel
+}
+
+// ambiguousRouting reports whether a member the transport routes on appears
+// under a name that differs from the canonical one only by case folding
+// ("paramſ" is read as "params" by encoding/json, which the peer uses, but is
+// a different key to a map). Such a message is refused rather than read two
+// ways.
+func ambiguousRouting(body []byte) bool {
+	var top map[string]json.RawMessage
+	if json.Unmarshal(body, &top) != nil {
+		return false
+	}
+	if hasFoldedKey(top, "id", "method", "params") {
+		return true
+	}
+	var params map[string]json.RawMessage
+	if json.Unmarshal(top["params"], &params) != nil {
+		return false
+	}
+	if hasFoldedKey(params, "wmp", "session_id") {
+		return true
+	}
+	var meta map[string]json.RawMessage
+	if json.Unmarshal(params["wmp"], &meta) != nil {
+		return false
+	}
+	return hasFoldedKey(meta, "session_id")
+}
+
+// hasFoldedKey reports whether m has a key that equals one of names under case
+// folding without being exactly that name.
+func hasFoldedKey(m map[string]json.RawMessage, names ...string) bool {
+	for k := range m {
+		for _, n := range names {
+			if k != n && strings.EqualFold(k, n) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // withSessionID returns body with params.wmp.session_id set to id, or body
@@ -333,7 +380,9 @@ func (h *ServerHandler) createSession(ctx context.Context, w http.ResponseWriter
 	hctx := context.WithoutCancel(ctx)
 	handler, opts := h.secured.cfg.NewHandler(hctx, p, "")
 	tmp := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.MaxEvents)
+	defer tmp.close() // a panicking handler or hook must not leave its goroutine behind
 	dctx, cancel := h.dispatchContext(ctx, tmp.done)
+	defer cancel()
 	resp, err := tmp.peer.HandleRequestSync(dctx, body)
 	cancel()
 	tmp.close()
