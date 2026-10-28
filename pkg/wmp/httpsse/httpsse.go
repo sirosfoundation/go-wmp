@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 )
@@ -301,6 +303,9 @@ type ServerHandler struct {
 	sessions    map[string]*serverSession
 	handler     wmp.Handler
 	peerOptions []wmp.PeerOption
+
+	// secured is non-nil for a handler made by NewSecuredServerHandler.
+	secured *securedState
 }
 
 type serverEvent struct {
@@ -309,13 +314,21 @@ type serverEvent struct {
 }
 
 type serverSession struct {
-	outgoing chan []byte // server → broadcast loop
+	outgoing chan []byte // server -> broadcast loop
 	peer     *wmp.Peer
+	owner    string // Principal.Key of the owner; empty for legacy sessions
+
+	// done is closed by close. Writers and the broadcast loop stop on it.
+	done      chan struct{}
+	closeOnce sync.Once
+	// lastActive is the unix-nano time of the last request or stream activity.
+	lastActive atomic.Int64
 
 	// Active SSE clients for this session. Each channel carries the event
 	// ID assigned by the broadcast loop and the raw data.
 	clientsMu sync.Mutex
 	clients   map[chan serverEvent]struct{}
+	isClosed  bool
 
 	// Event buffer for Last-Event-ID replay.
 	bufMu     sync.Mutex
@@ -330,22 +343,47 @@ func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int)
 	}
 	sess := &serverSession{
 		outgoing:  make(chan []byte, 64),
+		done:      make(chan struct{}),
 		clients:   make(map[chan serverEvent]struct{}),
 		maxEvents: maxEvents,
 	}
+	sess.touch()
 	// The peer writes outbound messages to the session's outgoing channel.
 	// A dedicated goroutine fans each message out to every attached SSE client
 	// so that multiple listeners on the same session each receive every event.
-	sess.peer = wmp.NewPeer(&serverTransport{outgoing: sess.outgoing}, handler, opts...)
+	sess.peer = wmp.NewPeer(&serverTransport{outgoing: sess.outgoing, done: sess.done}, handler, opts...)
 	go sess.broadcastLoop()
 	return sess
 }
 
-// registerClient adds a new SSE client and returns its dedicated channel.
-// The caller must call unregisterClient when the client disconnects.
+// touch records activity for the idle timeout.
+func (s *serverSession) touch() { s.lastActive.Store(time.Now().UnixNano()) }
+
+// close ends the session: it closes the peer, stops the broadcast loop and
+// ends every attached event stream. It is safe to call more than once.
+func (s *serverSession) close() {
+	s.closeOnce.Do(func() {
+		close(s.done)
+		_ = s.peer.Close()
+		s.clientsMu.Lock()
+		s.isClosed = true
+		for ch := range s.clients {
+			delete(s.clients, ch)
+			close(ch)
+		}
+		s.clientsMu.Unlock()
+	})
+}
+
+// registerClient adds a new SSE client and returns its dedicated channel, or
+// nil when the session is closed. The caller must call unregisterClient when
+// the client disconnects.
 func (s *serverSession) registerClient() chan serverEvent {
 	s.clientsMu.Lock()
 	defer s.clientsMu.Unlock()
+	if s.isClosed {
+		return nil
+	}
 	ch := make(chan serverEvent, 64)
 	s.clients[ch] = struct{}{}
 	return ch
@@ -361,24 +399,34 @@ func (s *serverSession) unregisterClient(ch chan serverEvent) {
 	}
 }
 
+// clientCount returns the number of attached event streams.
+func (s *serverSession) clientCount() int {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	return len(s.clients)
+}
+
 // broadcastLoop reads messages from the outgoing channel and fans them out to
 // every registered SSE client, buffering each event for Last-Event-ID replay.
 func (s *serverSession) broadcastLoop() {
-	for data := range s.outgoing {
+	for {
+		var data []byte
+		select {
+		case <-s.done:
+			return
+		case data = <-s.outgoing:
+		}
 		s.bufMu.Lock()
 		id := s.bufferEventLocked(data)
 		s.bufMu.Unlock()
 
 		ev := serverEvent{ID: id, Data: data}
 
+		// The sends are non-blocking, so holding the lock across them is
+		// cheap, and it keeps unregisterClient and close from closing a
+		// channel that is about to be sent on.
 		s.clientsMu.Lock()
-		clients := make([]chan serverEvent, 0, len(s.clients))
 		for ch := range s.clients {
-			clients = append(clients, ch)
-		}
-		s.clientsMu.Unlock()
-
-		for _, ch := range clients {
 			select {
 			case ch <- ev:
 			default:
@@ -386,6 +434,7 @@ func (s *serverSession) broadcastLoop() {
 				// with Last-Event-ID to replay missed events.
 			}
 		}
+		s.clientsMu.Unlock()
 	}
 }
 
@@ -393,6 +442,7 @@ func (s *serverSession) broadcastLoop() {
 // send outbound notifications/messages via WriteMessage.
 type serverTransport struct {
 	outgoing chan []byte
+	done     <-chan struct{}
 }
 
 func (t *serverTransport) ReadMessage(ctx context.Context) ([]byte, error) {
@@ -404,12 +454,16 @@ func (t *serverTransport) WriteMessage(ctx context.Context, data []byte) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-t.done:
+		return errSessionClosed
 	case t.outgoing <- data:
 		return nil
 	}
 }
 
 func (t *serverTransport) Close() error { return nil }
+
+var errSessionClosed = errors.New("httpsse: session closed")
 
 // bufferEvent stores an event with a monotonic ID for replay.
 func (s *serverSession) bufferEvent(data []byte) string {
@@ -446,7 +500,12 @@ func (s *serverSession) replayAfter(lastEventID string) []serverEvent {
 	return nil
 }
 
-// NewServerHandler creates a server-side HTTPS handler.
+// NewServerHandler creates a legacy server-side HTTPS handler: it shares one
+// Handler across all sessions, creates a session for any ID a client names and
+// does no authentication, ownership check or expiry.
+//
+// Deprecated: it is a relay/demo handler. Use NewSecuredServerHandler for a
+// server that holds real sessions.
 func NewServerHandler(handler wmp.Handler, opts ...wmp.PeerOption) *ServerHandler {
 	return &ServerHandler{
 		sessions:    make(map[string]*serverSession),
@@ -479,6 +538,10 @@ func (h *ServerHandler) Transport(sessionID string) wmp.Transport {
 
 // ServeHTTP handles both POST (JSON-RPC) and GET (SSE) requests.
 func (h *ServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.secured != nil {
+		h.serveSecured(w, r)
+		return
+	}
 	switch r.Method {
 	case http.MethodPost:
 		h.handlePost(w, r)
@@ -540,8 +603,12 @@ func (h *ServerHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess := h.session(sessionID)
+	h.stream(w, r, h.session(sessionID))
+}
 
+// stream serves the event stream of sess to one client: replay from the
+// Last-Event-ID header, then live events until the client or the session goes.
+func (h *ServerHandler) stream(w http.ResponseWriter, r *http.Request, sess *serverSession) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -568,13 +635,18 @@ func (h *ServerHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// event written right after ConnectSSE returns could otherwise be
 	// dropped because the server hadn't finished subscribing this client.
 	clientCh := sess.registerClient()
+	if clientCh == nil {
+		http.Error(w, "session closed", http.StatusNotFound)
+		return
+	}
 	defer sess.unregisterClient(clientCh)
+	sess.touch()
 
 	flusher.Flush()
 
 	if len(replay) > 0 {
 		for _, ev := range replay {
-			fmt.Fprintf(w, "id: %s\nevent: wmp\ndata: %s\n\n", ev.ID, ev.Data)
+			fmt.Fprintf(w, "id: %s\nevent: wmp\ndata: %s\n\n", ev.ID, sseEscape(ev.Data))
 		}
 		flusher.Flush()
 	}
@@ -600,10 +672,13 @@ type ServerTransport struct {
 }
 
 func newServerTransport(sess *serverSession) *ServerTransport {
-	return &ServerTransport{
-		sess:   sess,
-		client: sess.registerClient(),
+	client := sess.registerClient()
+	if client == nil {
+		// The session is closed: reads report EOF, writes fail.
+		client = make(chan serverEvent)
+		close(client)
 	}
+	return &ServerTransport{sess: sess, client: client}
 }
 
 // sseEscape escapes data so it cannot inject new SSE fields. It replaces
@@ -635,9 +710,15 @@ func (t *ServerTransport) ReadMessage(ctx context.Context) ([]byte, error) {
 	}
 }
 
-func (t *ServerTransport) WriteMessage(_ context.Context, data []byte) error {
-	t.sess.outgoing <- data
-	return nil
+func (t *ServerTransport) WriteMessage(ctx context.Context, data []byte) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.sess.done:
+		return errSessionClosed
+	case t.sess.outgoing <- data:
+		return nil
+	}
 }
 
 func (t *ServerTransport) Close() error {
