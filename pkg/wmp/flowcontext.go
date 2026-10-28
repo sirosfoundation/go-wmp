@@ -209,8 +209,25 @@ type AsyncFlowProfile struct {
 
 	// children holds the sub-flows this profile started (RequestSubFlow),
 	// keyed by child flow ID, and childSeq orders them.
-	children map[string]*subFlow
+	children map[flowKey]*subFlow
 	childSeq uint64
+
+	// self is the FlowHandler the peer registered for this profile when it
+	// differs from p (a type that embeds an AsyncFlowProfile): flow routes are
+	// released under that identity. Nil means p.
+	self FlowHandler
+
+	// afterStart, when set, runs at the end of StartFlow, just before it
+	// returns (a seam for tests of workers that end first).
+	afterStart func()
+}
+
+// owner is the FlowHandler flow routes are held under.
+func (p *AsyncFlowProfile) owner() FlowHandler {
+	if p.self != nil {
+		return p.self
+	}
+	return p
 }
 
 // flowKey identifies a flow of a profile shared by several peers (an HTTP+SSE
@@ -254,7 +271,7 @@ func NewAsyncFlowProfile(name string) *AsyncFlowProfile {
 		name:     name,
 		handlers: make(map[string]FlowFunc),
 		flows:    make(map[flowKey]*FlowContext),
-		children: make(map[string]*subFlow),
+		children: make(map[flowKey]*subFlow),
 	}
 }
 
@@ -326,14 +343,18 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 		defer func() {
 			unlink()
 			p.mu.Lock()
-			if p.flows[key] == fc {
+			own := p.flows[key] == fc
+			if own {
 				delete(p.flows, key)
 			}
 			p.mu.Unlock()
 			fc.cancel()
-			// The flow is over: the peer stops routing to it.
-			if router, ok := peer.(FlowRouter); ok {
-				router.ReleaseFlow(params.FlowID, p)
+			// The flow is over: the peer stops routing to it. Only if the
+			// profile still held this very flow: one that was cancelled or
+			// completed from outside was unrouted then, and its ID may by
+			// now belong to a new flow.
+			if router, ok := peer.(FlowRouter); ok && own {
+				router.ReleaseFlow(params.FlowID, p.owner())
 			}
 		}()
 
@@ -345,6 +366,9 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 		}
 	}()
 
+	if p.afterStart != nil {
+		p.afterStart()
+	}
 	return &FlowStartResult{
 		WMP:      Metadata{Version: fc.meta().Version, SessionID: sessionID},
 		FlowID:   params.FlowID,
@@ -376,7 +400,7 @@ func (p *AsyncFlowProfile) HandleProgress(_ context.Context, params *FlowProgres
 }
 
 func (p *AsyncFlowProfile) HandleComplete(ctx context.Context, params *FlowCompleteParams) {
-	if p.deliverSubFlow(params.FlowID, subFlowOutcome{result: params.Result}) {
+	if p.deliverSubFlow(p.keyFor(ctx, params.FlowID), subFlowOutcome{result: params.Result}) {
 		return
 	}
 	key := p.keyFor(ctx, params.FlowID)
@@ -393,7 +417,7 @@ func (p *AsyncFlowProfile) HandleComplete(ctx context.Context, params *FlowCompl
 
 func (p *AsyncFlowProfile) HandleError(ctx context.Context, params *FlowErrorParams) {
 	failure := &SubFlowError{Code: params.Code, Message: params.Message, Data: params.Data}
-	if p.deliverSubFlow(params.FlowID, subFlowOutcome{err: failure}) {
+	if p.deliverSubFlow(p.keyFor(ctx, params.FlowID), subFlowOutcome{err: failure}) {
 		return
 	}
 	key := p.keyFor(ctx, params.FlowID)
@@ -436,7 +460,9 @@ func (p *AsyncFlowProfile) CancelFlow(flowID string) {
 	}
 }
 
-// cancelFlowKey cancels one flow, reporting whether this profile was running it.
+// cancelFlowKey cancels one flow, reporting whether this profile was running
+// it, and unroutes it: the flow is over, and its worker's own cleanup will
+// not (it no longer holds the flow).
 func (p *AsyncFlowProfile) cancelFlowKey(key flowKey) bool {
 	p.mu.Lock()
 	fc, ok := p.flows[key]
@@ -446,6 +472,9 @@ func (p *AsyncFlowProfile) cancelFlowKey(key flowKey) bool {
 	p.mu.Unlock()
 	if ok {
 		fc.cancel()
+		if router, isRouter := fc.peer.(FlowRouter); isRouter {
+			router.ReleaseFlow(key.id, p.owner())
+		}
 	}
 	return ok
 }

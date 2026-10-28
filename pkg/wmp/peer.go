@@ -478,9 +478,13 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			if err := checkFlowCapability(ctx, fh, ps.FlowType); err != nil {
 				return nil, err
 			}
+			// Route the flow's messages before its worker can run: a worker
+			// that finishes (and releases the route) before StartFlow
+			// returns must not find the route installed afterwards.
+			p.registry.trackFlow(ps.FlowID, p.flowSession(ctx, ps.WMP.SessionID), fh)
 			result, err := fh.StartFlow(ctx, &ps)
-			if err == nil && result != nil {
-				p.registry.trackFlow(ps.FlowID, p.flowSession(ctx, ps.WMP.SessionID), fh)
+			if err != nil || result == nil {
+				p.registry.releaseFlow(ps.FlowID, fh)
 			}
 			return result, err
 		}
@@ -563,7 +567,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			if !p.registry.flowSessionAllowed(ps.FlowID, ps.WMP.SessionID) {
 				return nil, NewRPCError(ErrNotAuthorized, nil)
 			}
-			p.registry.untrackFlow(ps.FlowID)
+			// The flow's ID stays reserved while it is cancelled: a canceller
+			// releases the route itself, once, so a start of the same ID
+			// cannot slip in and be cancelled (or unrouted) instead.
 			if fc, ok := fh.(FlowCanceller); ok && fc.HandleCancel(ctx, &ps) {
 				// The profile stopped the flow: that is the answer, whatever
 				// the Handler would say about a flow it never saw.
@@ -572,6 +578,7 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 					FlowID: ps.FlowID, Status: "cancelled",
 				}, nil
 			}
+			p.registry.untrackFlow(ps.FlowID)
 		}
 		return p.handler.FlowCancel(ctx, &ps)
 

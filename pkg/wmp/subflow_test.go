@@ -235,7 +235,7 @@ func TestRequestSubFlowRoundTrip(t *testing.T) {
 	if string(o.result) != `{"vp_token":"abc"}` {
 		t.Errorf("result = %s", o.result)
 	}
-	if left := r.profile.PendingSubFlows("flow-vp-001"); len(left) != 0 {
+	if left := r.profile.PendingSubFlows(r.ctx, "flow-vp-001"); len(left) != 0 {
 		t.Errorf("pending after completion: %+v", left)
 	}
 	if _, owned := r.orch.registry.lookupFlowOwner(start.FlowID); owned {
@@ -375,7 +375,7 @@ func TestRequestSubFlowTimeout(t *testing.T) {
 	if c := recvCancel(t, r.handler); c.FlowID != start.FlowID {
 		t.Errorf("cancelled %q, want the timed-out sub-flow %q", c.FlowID, start.FlowID)
 	}
-	if left := r.profile.PendingSubFlows("flow-p"); len(left) != 0 {
+	if left := r.profile.PendingSubFlows(r.ctx, "flow-p"); len(left) != 0 {
 		t.Errorf("pending after timeout: %+v", left)
 	}
 	if _, owned := r.orch.registry.lookupFlowOwner(start.FlowID); owned {
@@ -416,7 +416,7 @@ func TestParentCancelCancelsChild(t *testing.T) {
 	out := make(chan parentOutcome, 1)
 	r.runParent(t, "flow-p", requestingParent("sign", map[string]any{}, 10*time.Second, out))
 	start := recvStart(t, r.handler)
-	if left := r.profile.PendingSubFlows("flow-p"); len(left) != 1 || left[0].FlowID != start.FlowID {
+	if left := r.profile.PendingSubFlows(r.ctx, "flow-p"); len(left) != 1 || left[0].FlowID != start.FlowID {
 		t.Fatalf("pending = %+v, want the one outstanding sub-flow", left)
 	}
 
@@ -522,7 +522,7 @@ func TestSubFlowOutcomeFromOtherFlowIDOrSessionIsIgnored(t *testing.T) {
 func TestSubFlowFirstOutcomeWins(t *testing.T) {
 	profile := NewAsyncFlowProfile("p")
 	sub := &subFlow{id: "c", outcome: make(chan subFlowOutcome, 1)}
-	profile.children["c"] = sub
+	profile.children[flowKey{id: "c"}] = sub
 	// Delivery is in the order the Peer dispatched them: the first outcome
 	// is kept, later completions and errors are dropped without blocking.
 	profile.HandleComplete(context.Background(), &FlowCompleteParams{FlowID: "c", Result: json.RawMessage(`{"n":1}`)})
@@ -535,7 +535,7 @@ func TestSubFlowFirstOutcomeWins(t *testing.T) {
 	if len(sub.outcome) != 0 {
 		t.Error("a later outcome was queued")
 	}
-	if len(profile.PendingSubFlows("")) != 0 {
+	if len(profile.PendingSubFlows(context.Background(), "")) != 0 {
 		t.Error("a sub-flow with an outcome is still listed as pending")
 	}
 }
@@ -614,7 +614,7 @@ func TestPendingSubFlowsListsOutstandingInOrder(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	var pending []PendingSubFlow
 	for time.Now().Before(deadline) {
-		if pending = r.profile.PendingSubFlows("flow-p"); len(pending) == 2 {
+		if pending = r.profile.PendingSubFlows(r.ctx, "flow-p"); len(pending) == 2 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -629,7 +629,7 @@ func TestPendingSubFlowsListsOutstandingInOrder(t *testing.T) {
 			t.Errorf("pending entry = %+v (params %s)", p, p.Params)
 		}
 	}
-	if other := r.profile.PendingSubFlows("flow-other"); len(other) != 0 {
+	if other := r.profile.PendingSubFlows(r.ctx, "flow-other"); len(other) != 0 {
 		t.Errorf("another parent's pending = %+v", other)
 	}
 	close(release)
@@ -1472,6 +1472,275 @@ func TestNoStartForARequestThatIsAlreadyOver(t *testing.T) {
 	for _, m := range peer.calls() {
 		if m == MethodFlowStart {
 			t.Fatalf("a start went out for a request that was already cancelled: %v", peer.calls())
+		}
+	}
+}
+
+// --- third review round ---
+
+func TestShortLivedFlowLeavesNoStaleRoute(t *testing.T) {
+	r := newSubFlowRig(t)
+	quick := NewAsyncFlowProfile("quick")
+	quick.Handle("quick", func(ctx context.Context, fc *FlowContext) error { return nil })
+	// The worker has ended and released its route before StartFlow returns.
+	quick.afterStart = func() {
+		for i := 0; i < 400 && quick.ActiveFlows() > 0; i++ {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if err := r.orch.Use(quick); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ { // the second start proves the ID was not left owned
+		if err := r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "quick", FlowID: "q1"}, nil); err != nil {
+			t.Fatalf("start %d: %v", i, err)
+		}
+		if _, owned := r.orch.registry.lookupFlowOwner("q1"); owned {
+			t.Fatalf("start %d left a stale route to an ended flow", i)
+		}
+	}
+}
+
+func TestWorkerCleanupDoesNotUnrouteAReplacement(t *testing.T) {
+	r := newSubFlowRig(t)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	runs := 0
+	r.setParent(func(ctx context.Context, fc *FlowContext) error {
+		mu.Lock()
+		runs++
+		first := runs == 1
+		mu.Unlock()
+		if first {
+			<-release // the first flow ignores its cancellation for a while
+			return nil
+		}
+		<-ctx.Done()
+		return nil
+	})
+	r.startParent(t, "flow-p")
+	r.profile.CancelFlow("flow-p")
+	r.startParent(t, "flow-p") // the replacement
+	close(release)             // the old worker now exits
+	time.Sleep(150 * time.Millisecond)
+	if h, owned := r.orch.registry.lookupFlowOwner("flow-p"); !owned || h != FlowHandler(r.profile) {
+		t.Fatal("the old worker's cleanup unrouted the replacement flow")
+	}
+	if r.profile.ActiveFlows() != 1 {
+		t.Errorf("active = %d, want the replacement only", r.profile.ActiveFlows())
+	}
+	r.profile.CancelFlow("flow-p")
+}
+
+// slowCancelProfile blocks inside HandleCancel, the window in which the flow's
+// ID must stay reserved.
+type slowCancelProfile struct {
+	*AsyncFlowProfile
+	in      chan struct{}
+	release chan struct{}
+}
+
+func (s *slowCancelProfile) HandleCancel(ctx context.Context, p *FlowCancelParams) bool {
+	close(s.in)
+	<-s.release
+	return s.AsyncFlowProfile.HandleCancel(ctx, p)
+}
+
+func TestCancelKeepsTheFlowIDReservedWhileItIsStopped(t *testing.T) {
+	r := newSubFlowRig(t)
+	r.setParent(func(ctx context.Context, fc *FlowContext) error { <-ctx.Done(); return nil })
+	slow := &slowCancelProfile{AsyncFlowProfile: r.profile, in: make(chan struct{}), release: make(chan struct{})}
+	r.profile.self = slow
+	// Re-register the route owner as the wrapper so the Peer calls its
+	// HandleCancel for flows started through it.
+	r.orch.registry.mu.Lock()
+	r.orch.registry.flowHandlers["parent"] = slow
+	r.orch.registry.mu.Unlock()
+	r.startParent(t, "flow-p")
+
+	cancelDone := make(chan error, 1)
+	go func() {
+		cancelDone <- r.wallet.Call(r.ctx, MethodFlowCancel, &FlowCancelParams{FlowID: "flow-p"}, nil)
+	}()
+	<-slow.in
+	// Mid-cancel a start of the same ID must be refused, not slip in and be
+	// the flow the cancel then stops.
+	var rpcErr *RPCError
+	if err := r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "parent", FlowID: "flow-p"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError {
+		t.Fatalf("start during cancel: err = %v, want -31006", err)
+	}
+	close(slow.release)
+	if err := <-cancelDone; err != nil {
+		t.Fatal(err)
+	}
+	// Now the ID is free and a new flow is not touched by the finished cancel.
+	r.startParent(t, "flow-p")
+	time.Sleep(100 * time.Millisecond)
+	if r.profile.ActiveFlows() != 1 {
+		t.Fatalf("active = %d, want the new flow", r.profile.ActiveFlows())
+	}
+	r.profile.CancelFlow("flow-p")
+}
+
+func TestChildRoutingIsPerPeer(t *testing.T) {
+	shared := NewAsyncFlowProfile("shared")
+	var fnMu sync.Mutex
+	var fn FlowFunc
+	shared.Handle("parent", func(ctx context.Context, fc *FlowContext) error {
+		fnMu.Lock()
+		f := fn
+		fnMu.Unlock()
+		return f(ctx, fc)
+	})
+	a := newSubFlowRigProfile(t, shared)
+	b := newSubFlowRigProfile(t, shared)
+	out := make(chan parentOutcome, 1)
+	fnMu.Lock()
+	fn = func(ctx context.Context, fc *FlowContext) error {
+		if fc.FlowID != "flow-a" {
+			<-ctx.Done() // B's flow just waits
+			return nil
+		}
+		res, err := fc.RequestSubFlow(ctx, "sign", map[string]any{}, 10*time.Second)
+		out <- parentOutcome{res, err}
+		return nil
+	}
+	fnMu.Unlock()
+	a.startParent(t, "flow-a")
+	child := recvStart(t, a.handler).FlowID
+	// B runs a flow whose ID equals A's child's, and its wallet completes it.
+	b.startParent(t, child)
+	if err := b.wallet.Notify(b.ctx, MethodFlowComplete, &FlowCompleteParams{FlowID: child, Result: json.RawMessage(`{"leak":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case o := <-out:
+		t.Fatalf("a completion on another peer resolved A's sub-flow: %+v", o)
+	case <-time.After(250 * time.Millisecond):
+	}
+	a.profile.CancelFlow("flow-a")
+	awaitOutcome(t, out)
+}
+
+func TestPendingSubFlowsAreScopedToThePeer(t *testing.T) {
+	shared := NewAsyncFlowProfile("shared")
+	own := make(chan []PendingSubFlow, 2)
+	shared.Handle("parent", func(ctx context.Context, fc *FlowContext) error {
+		go fc.RequestSubFlow(ctx, "sign", map[string]any{"verifier": fc.sessionID}, 10*time.Second)
+		for len(fc.PendingSubFlows()) == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		own <- fc.PendingSubFlows()
+		<-ctx.Done()
+		return nil
+	})
+	a := newSubFlowRigProfile(t, shared)
+	b := newSubFlowRigProfile(t, shared)
+	a.startParent(t, "flow-1")
+	b.startParent(t, "flow-1") // the same parent ID on the other peer
+	recvStart(t, a.handler)
+	recvStart(t, b.handler)
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-own:
+			if len(got) != 1 {
+				t.Fatalf("a flow sees %d sub-flows, want its own 1", len(got))
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("no pending list")
+		}
+	}
+	// The profile-level lookup is scoped by the dispatching peer in ctx.
+	for _, rig := range []*subFlowRig{a, b} {
+		got := shared.PendingSubFlows(contextWithPeer(context.Background(), rig.orch), "flow-1")
+		if len(got) != 1 {
+			t.Fatalf("peer-scoped pending = %d, want 1", len(got))
+		}
+	}
+	shared.CancelFlow("flow-1")
+}
+
+func TestRejectedReadsTheExactReasonMember(t *testing.T) {
+	for data, want := range map[string]bool{
+		`{"reason":"failed","Reason":"rejected"}`: false,
+		`{"Reason":"rejected"}`:                   false,
+		`{"REASON":"rejected"}`:                   false,
+		`{"Reason":"x","reason":"rejected"}`:      true,
+	} {
+		if got := (&SubFlowError{Code: ErrFlowError, Data: json.RawMessage(data)}).Rejected(); got != want {
+			t.Errorf("Rejected(%s) = %v, want %v", data, got, want)
+		}
+	}
+}
+
+func TestEndedParentStartsNoChildEvenWithALiveContext(t *testing.T) {
+	r := newSubFlowRig(t)
+	got := make(chan error, 1)
+	r.setParent(func(ctx context.Context, fc *FlowContext) error {
+		if err := fc.Complete(ctx, map[string]string{"ok": "y"}); err != nil {
+			return err
+		}
+		_, err := fc.RequestSubFlow(context.Background(), "sign", map[string]any{}, time.Second)
+		got <- err
+		return nil
+	})
+	r.startParent(t, "flow-p")
+	if err := <-got; !errors.Is(err, ErrSubFlowCancelled) {
+		t.Fatalf("err = %v, want ErrSubFlowCancelled", err)
+	}
+	select {
+	case p := <-r.handler.started:
+		t.Fatalf("a child was started by an ended parent: %+v", p)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// outcomeThenFailPeer delivers the sub-flow's completion and then fails the
+// start's call, as a lost start response does.
+type outcomeThenFailPeer struct {
+	orderPeer
+	profile *AsyncFlowProfile
+}
+
+func (p *outcomeThenFailPeer) Call(ctx context.Context, method string, params interface{}, _ interface{}) error {
+	p.mu.Lock()
+	p.order = append(p.order, method)
+	p.mu.Unlock()
+	if sp, ok := params.(*FlowStartParams); ok && method == MethodFlowStart {
+		p.profile.HandleComplete(ctx, &FlowCompleteParams{FlowID: sp.FlowID, Result: json.RawMessage(`{"done":true}`)})
+		return errors.New("start response lost")
+	}
+	return nil
+}
+
+func TestQueuedOutcomeBeatsAFailedStartAnswer(t *testing.T) {
+	for i := 0; i < 50; i++ { // both select cases are ready: it must not be luck
+		peer := &outcomeThenFailPeer{}
+		profile := NewAsyncFlowProfile("p")
+		peer.profile = profile
+		type res struct {
+			r   json.RawMessage
+			err error
+		}
+		done := make(chan res, 1)
+		profile.Handle("parent", func(ctx context.Context, fc *FlowContext) error {
+			r, err := fc.RequestSubFlow(ctx, "sign", map[string]any{}, time.Second)
+			done <- res{r, err}
+			return nil
+		})
+		_ = profile.Init(peer)
+		if _, err := profile.StartFlow(context.Background(), &FlowStartParams{FlowType: "parent", FlowID: "flow-p", WMP: Metadata{SessionID: "ses-1"}}); err != nil {
+			t.Fatal(err)
+		}
+		got := <-done
+		if got.err != nil || string(got.r) != `{"done":true}` {
+			t.Fatalf("iteration %d: result = %s, err = %v", i, got.r, got.err)
+		}
+		time.Sleep(5 * time.Millisecond)
+		for _, m := range peer.calls() {
+			if m == MethodFlowCancel {
+				t.Fatalf("iteration %d: a completed sub-flow was cancelled", i)
+			}
 		}
 	}
 }

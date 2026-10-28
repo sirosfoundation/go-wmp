@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"time"
 )
@@ -50,13 +51,13 @@ func (e *SubFlowError) Rejected() bool {
 	if e.Code != ErrFlowError {
 		return false
 	}
-	var d struct {
-		Reason string `json:"reason"`
-	}
+	// The exact member name: a struct decode would also match "Reason".
+	var d map[string]json.RawMessage
 	if json.Unmarshal(e.Data, &d) != nil {
 		return false
 	}
-	return d.Reason == "rejected"
+	var reason string
+	return json.Unmarshal(d["reason"], &reason) == nil && reason == "rejected"
 }
 
 // PendingSubFlow describes a sub-flow whose wmp.flow.start was sent and whose
@@ -163,6 +164,13 @@ func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, para
 	if session == "" {
 		return nil, errors.New("wmp: cannot determine the session of the sub-flow")
 	}
+	// A parent that is already over starts no child, whatever caller context
+	// is live: the watcher below only covers what happens later.
+	select {
+	case <-fc.doneCh:
+		return nil, ErrSubFlowCancelled
+	default:
+	}
 	body, err := subFlowParams(params, fc.FlowID)
 	if err != nil {
 		return nil, err
@@ -179,10 +187,11 @@ func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, para
 	}
 	// Register before sending: the peer may complete before it has answered
 	// the start.
-	if err := fc.profile.addSubFlow(router, sub); err != nil {
+	key := fc.profile.subFlowKey(fc.peer, childID)
+	if err := fc.profile.addSubFlow(router, key, sub); err != nil {
 		return nil, err
 	}
-	defer fc.profile.removeSubFlow(router, childID)
+	defer fc.profile.removeSubFlow(router, key)
 
 	sctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -242,6 +251,12 @@ func (fc *FlowContext) runSubFlow(sctx context.Context, sub *subFlow, flowType s
 			ack <- err
 			return
 		}
+		select {
+		case <-fc.doneCh:
+			ack <- ErrSubFlowCancelled
+			return
+		default:
+		}
 		ack <- fc.peer.Call(sctx, MethodFlowStart, start, nil)
 	}()
 	for {
@@ -252,6 +267,13 @@ func (fc *FlowContext) runSubFlow(sctx context.Context, sub *subFlow, flowType s
 			if err == nil {
 				ack = nil // accepted: now only the outcome matters
 				continue
+			}
+			// An outcome already in is the answer, whatever became of the
+			// acknowledgement of the start.
+			select {
+			case out := <-sub.outcome:
+				return out, true, nil
+			default:
 			}
 			var rpcErr *RPCError
 			if errors.As(err, &rpcErr) {
@@ -342,17 +364,25 @@ func newSubFlowID(parentID, flowType string) (string, error) {
 	return parentID + "-" + flowType + "-" + hex.EncodeToString(b), nil
 }
 
+// subFlowKey is the key of sub-flow id on the peer it runs on.
+func (p *AsyncFlowProfile) subFlowKey(peer PeerContext, id string) flowKey {
+	if peer != nil && reflect.TypeOf(peer).Comparable() {
+		return flowKey{peer: peer, id: id}
+	}
+	return flowKey{id: id}
+}
+
 // addSubFlow registers sub and has the router (the Peer the flow runs on)
 // route its messages here.
-func (p *AsyncFlowProfile) addSubFlow(router FlowRouter, sub *subFlow) error {
+func (p *AsyncFlowProfile) addSubFlow(router FlowRouter, key flowKey, sub *subFlow) error {
 	p.mu.Lock()
 	p.childSeq++
 	sub.seq = p.childSeq
-	p.children[sub.id] = sub
+	p.children[key] = sub
 	p.mu.Unlock()
 	if !router.ClaimFlow(sub.id, sub.sessionID, p) {
 		p.mu.Lock()
-		delete(p.children, sub.id)
+		delete(p.children, key)
 		p.mu.Unlock()
 		return errors.New("wmp: sub-flow id is already in use")
 	}
@@ -360,19 +390,19 @@ func (p *AsyncFlowProfile) addSubFlow(router FlowRouter, sub *subFlow) error {
 }
 
 // removeSubFlow forgets a sub-flow and stops routing its messages.
-func (p *AsyncFlowProfile) removeSubFlow(router FlowRouter, id string) {
+func (p *AsyncFlowProfile) removeSubFlow(router FlowRouter, key flowKey) {
 	p.mu.Lock()
-	delete(p.children, id)
+	delete(p.children, key)
 	p.mu.Unlock()
-	router.ReleaseFlow(id, p)
+	router.ReleaseFlow(key.id, p)
 }
 
-// deliverSubFlow hands an outcome to the goroutine waiting for sub-flow id. It
-// reports whether id is a sub-flow of this profile; only the first outcome of
-// a sub-flow is kept.
-func (p *AsyncFlowProfile) deliverSubFlow(id string, out subFlowOutcome) bool {
+// deliverSubFlow hands an outcome to the goroutine waiting for sub-flow key
+// (a flow ID on the peer the message arrived on). It reports whether key is a
+// sub-flow of this profile; only the first outcome of a sub-flow is kept.
+func (p *AsyncFlowProfile) deliverSubFlow(key flowKey, out subFlowOutcome) bool {
 	p.mu.Lock()
-	sub, ok := p.children[id]
+	sub, ok := p.children[key]
 	if ok && !sub.delivered {
 		sub.delivered = true
 		sub.outcome <- out // capacity 1 and nothing else sends: never blocks
@@ -385,13 +415,42 @@ func (p *AsyncFlowProfile) deliverSubFlow(id string, out subFlowOutcome) bool {
 // started and have not yet completed or failed, oldest first. After a
 // session resume a flow function can use it to re-issue the sub-flows whose
 // start or result the interrupted connection may have lost.
-func (p *AsyncFlowProfile) PendingSubFlows(parentID string) []PendingSubFlow {
+//
+// ctx scopes the answer: only sub-flows of the peer ctx was dispatched on (as
+// in a resume hook) and, when ctx carries a session, of that session, are
+// returned, so a profile shared by several peers never shows one session's
+// sub-flows (and the verifier data in their params) to another. A flow
+// function can use FlowContext.PendingSubFlows instead.
+func (p *AsyncFlowProfile) PendingSubFlows(ctx context.Context, parentID string) []PendingSubFlow {
+	peer := p.peerFor(ctx)
+	session := ""
+	if sess := SessionFromContext(ctx); sess != nil {
+		session = sess.ID
+	}
+	return p.pendingSubFlows(peer, session, parentID)
+}
+
+// PendingSubFlows returns this flow's own sub-flows that have not completed or
+// failed, oldest first.
+func (fc *FlowContext) PendingSubFlows() []PendingSubFlow {
+	if fc.profile == nil {
+		return nil
+	}
+	return fc.profile.pendingSubFlows(fc.peer, fc.effectiveSession(), fc.FlowID)
+}
+
+func (p *AsyncFlowProfile) pendingSubFlows(peer PeerContext, session, parentID string) []PendingSubFlow {
+	want := p.subFlowKey(peer, "").peer
 	p.mu.RLock()
 	subs := make([]*subFlow, 0, len(p.children))
-	for _, sub := range p.children {
-		if sub.parentID == parentID && !sub.delivered {
-			subs = append(subs, sub)
+	for key, sub := range p.children {
+		if sub.parentID != parentID || sub.delivered || key.peer != want {
+			continue
 		}
+		if session != "" && sub.sessionID != session {
+			continue
+		}
+		subs = append(subs, sub)
 	}
 	p.mu.RUnlock()
 	sort.Slice(subs, func(i, j int) bool { return subs[i].seq < subs[j].seq })
