@@ -436,6 +436,11 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
+		// A flow_id this peer claimed for a sub-flow of its own is not
+		// available to the remote peer's wmp.flow.start.
+		if p.registry.flowClaimed(ps.FlowID) {
+			return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow_id in use"})
+		}
 		// Check if a profile handles this flow type.
 		if fh, ok := p.registry.lookupFlowHandler(ps.FlowType); ok {
 			// Core §10.3: a flow type whose capability was not negotiated
@@ -463,7 +468,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
 		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
-			fh.HandleProgress(ctx, &ps)
+			if p.registry.flowSessionAllowed(ps.FlowID, ps.WMP.SessionID) {
+				fh.HandleProgress(ctx, &ps)
+			}
 			return nil, nil
 		}
 		p.handler.FlowProgress(ctx, &ps)
@@ -475,6 +482,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
 		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
+			if !p.registry.flowSessionAllowed(ps.FlowID, ps.WMP.SessionID) {
+				return nil, NewRPCError(ErrNotAuthorized, nil)
+			}
 			return fh.HandleAction(ctx, &ps)
 		}
 		return p.handler.FlowAction(ctx, &ps)
@@ -485,8 +495,13 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
 		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
-			fh.HandleComplete(ctx, &ps)
-			p.registry.untrackFlow(ps.FlowID)
+			// A claimed (sub-)flow answers only to its own session: a
+			// message from another session is dropped and leaves the
+			// routing in place for the real one.
+			if p.registry.flowSessionAllowed(ps.FlowID, ps.WMP.SessionID) {
+				fh.HandleComplete(ctx, &ps)
+				p.registry.untrackFlow(ps.FlowID)
+			}
 			return nil, nil
 		}
 		p.handler.FlowComplete(ctx, &ps)
@@ -498,8 +513,10 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
 		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
-			fh.HandleError(ctx, &ps)
-			p.registry.untrackFlow(ps.FlowID)
+			if p.registry.flowSessionAllowed(ps.FlowID, ps.WMP.SessionID) {
+				fh.HandleError(ctx, &ps)
+				p.registry.untrackFlow(ps.FlowID)
+			}
 			return nil, nil
 		}
 		p.handler.FlowError(ctx, &ps)
@@ -510,9 +527,16 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		// Untrack the flow if it's managed by a profile.
-		if _, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
+		// Untrack the flow if it's managed by a profile, and let the profile
+		// stop it (and the sub-flows it waits for).
+		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
+			if !p.registry.flowSessionAllowed(ps.FlowID, ps.WMP.SessionID) {
+				return nil, NewRPCError(ErrNotAuthorized, nil)
+			}
 			p.registry.untrackFlow(ps.FlowID)
+			if fc, ok := fh.(FlowCanceller); ok {
+				fc.HandleCancel(ctx, &ps)
+			}
 		}
 		return p.handler.FlowCancel(ctx, &ps)
 
@@ -557,6 +581,18 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		}
 		return nil, NewRPCError(ErrMethodNotFound, nil)
 	}
+}
+
+// ClaimFlow implements FlowRouter: the messages of flowID that name sessionID
+// (any session when empty) go to h. The Peer is the PeerContext its profiles
+// receive in Init.
+func (p *Peer) ClaimFlow(flowID, sessionID string, h FlowHandler) bool {
+	return p.registry.claimFlow(flowID, sessionID, h)
+}
+
+// ReleaseFlow implements FlowRouter.
+func (p *Peer) ReleaseFlow(flowID string) {
+	p.registry.untrackFlow(flowID)
 }
 
 // Notify sends a JSON-RPC 2.0 notification (no response expected).

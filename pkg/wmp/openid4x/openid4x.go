@@ -489,6 +489,8 @@ func (p *Profile) RequiredCapability(flowType string) string {
 		return CapabilityOID4VCI
 	case FlowTypeOID4VP:
 		return CapabilityOID4VP
+	case FlowTypeMatch:
+		return CapabilityOID4VP
 	}
 	return ""
 }
@@ -553,7 +555,7 @@ func (p *Profile) StartFlow(ctx context.Context, params *wmp.FlowStartParams) (*
 		}, nil
 
 	default:
-		return nil, wmp.NewRPCError(wmp.ErrFlowError, nil)
+		return nil, wmp.NewUnsupportedError(params.FlowType, nil)
 	}
 }
 
@@ -618,9 +620,7 @@ func (p *Profile) validateFlowStartParams(flowType string, rawParams json.RawMes
 	case FlowTypeOID4VP:
 		return validateVPStartParams(params)
 	default:
-		return wmp.NewRPCError(wmp.ErrFlowError, map[string]string{
-			"reason": "unknown flow type: " + flowType,
-		})
+		return wmp.NewUnsupportedError(flowType, nil)
 	}
 }
 

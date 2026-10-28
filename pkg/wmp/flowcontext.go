@@ -33,6 +33,12 @@ type FlowContext struct {
 	doneCh   chan struct{}
 	mu       sync.Mutex
 	err      error
+
+	// profile is the AsyncFlowProfile that runs the flow; sub-flows are
+	// routed through it. Nil for a FlowContext built outside a profile.
+	profile *AsyncFlowProfile
+	// stop cancels the context the flow function runs under (see StartFlow).
+	stop context.CancelFunc
 }
 
 // newFlowContext creates a FlowContext for a specific flow.
@@ -47,8 +53,8 @@ func newSessionFlowContext(flowID, flowType string, params json.RawMessage, peer
 		Params:    params,
 		sessionID: sessionID,
 		peer:      peer,
-		actionCh: make(chan *FlowActionParams, 10),
-		doneCh:   make(chan struct{}),
+		actionCh:  make(chan *FlowActionParams, 10),
+		doneCh:    make(chan struct{}),
 	}
 }
 
@@ -133,20 +139,35 @@ func (fc *FlowContext) Error(ctx context.Context, code int, message string, data
 	})
 }
 
-// meta is the wmp object for the flow's notifications: just the originating
-// session. The Peer fills version and sender (WithSessionIdentity).
+// meta is the wmp object for the flow's messages: the version negotiated for
+// the flow's session (Version when the peer does not track one) and the
+// originating session. The Peer fills the sender (WithSessionIdentity).
+//
+// The version is set here, not only by the Peer's stamping, because a Peer
+// without WithSessionIdentity does not stamp: the message would then carry an
+// empty wmp.version, which core section 2.2.3 forbids.
 func (fc *FlowContext) meta() Metadata {
-	return Metadata{SessionID: fc.sessionID}
+	version := Version
+	if vf, ok := fc.peer.(interface{ versionFor(string) string }); ok {
+		version = vf.versionFor(fc.sessionID)
+	}
+	return Metadata{Version: version, SessionID: fc.sessionID}
 }
 
-// cancel signals the flow goroutine to stop.
+// cancel signals the flow goroutine to stop: it closes the done channel (which
+// ends WaitForAction and any pending sub-flow request) and cancels the
+// context the flow function runs under.
 func (fc *FlowContext) cancel() {
 	fc.mu.Lock()
-	defer fc.mu.Unlock()
 	select {
 	case <-fc.doneCh:
 	default:
 		close(fc.doneCh)
+	}
+	stop := fc.stop
+	fc.mu.Unlock()
+	if stop != nil {
+		stop()
 	}
 }
 
@@ -168,6 +189,11 @@ type AsyncFlowProfile struct {
 
 	mu    sync.RWMutex
 	flows map[string]*FlowContext // keyed by flow ID
+
+	// children holds the sub-flows this profile started (RequestSubFlow),
+	// keyed by child flow ID, and childSeq orders them.
+	children map[string]*subFlow
+	childSeq uint64
 }
 
 // NewAsyncFlowProfile creates a profile that manages async flow goroutines.
@@ -176,6 +202,7 @@ func NewAsyncFlowProfile(name string) *AsyncFlowProfile {
 		name:     name,
 		handlers: make(map[string]FlowFunc),
 		flows:    make(map[string]*FlowContext),
+		children: make(map[string]*subFlow),
 	}
 }
 
@@ -186,8 +213,8 @@ func (p *AsyncFlowProfile) Handle(flowType string, fn FlowFunc) {
 
 // --- Profile interface ---
 
-func (p *AsyncFlowProfile) Name() string            { return p.name }
-func (p *AsyncFlowProfile) Capabilities() []string   { return nil }
+func (p *AsyncFlowProfile) Name() string           { return p.name }
+func (p *AsyncFlowProfile) Capabilities() []string { return nil }
 func (p *AsyncFlowProfile) Init(ctx PeerContext) error {
 	p.peer = ctx
 	return nil
@@ -206,9 +233,7 @@ func (p *AsyncFlowProfile) FlowTypes() []string {
 func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParams) (*FlowStartResult, error) {
 	fn, ok := p.handlers[params.FlowType]
 	if !ok {
-		return nil, NewRPCError(ErrFlowError, map[string]string{
-			"reason": "unknown flow type: " + params.FlowType,
-		})
+		return nil, NewUnsupportedError(params.FlowType, nil)
 	}
 
 	// The session the request arrived in: the store-resolved one if known,
@@ -218,6 +243,17 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 		sessionID = sess.ID
 	}
 	fc := newSessionFlowContext(params.FlowID, params.FlowType, params.Params, p.peer, sessionID)
+	fc.profile = p
+
+	// The flow outlives the request that started it. ctx is the request's
+	// context: an HTTP transport cancels it when the response is written,
+	// which would end every flow the moment wmp.flow.start returned. Keep its
+	// values (session, sender, principal) but not its cancellation, and give
+	// the flow its own cancel, which CancelFlow, a remote wmp.flow.cancel and
+	// the end of the flow trigger.
+	flowCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+	fc.stop = stop
+
 	p.mu.Lock()
 	p.flows[params.FlowID] = fc
 	p.mu.Unlock()
@@ -231,12 +267,15 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 			fc.cancel()
 		}()
 
-		if err := fn(ctx, fc); err != nil {
-			fc.Error(ctx, ErrFlowError, err.Error(), nil)
+		if err := fn(flowCtx, fc); err != nil {
+			// The flow's own context may already be cancelled (that is why
+			// fn returned): the error must still reach the peer.
+			fc.Error(context.WithoutCancel(flowCtx), ErrFlowError, err.Error(), nil)
 		}
 	}()
 
 	return &FlowStartResult{
+		WMP:      Metadata{Version: fc.meta().Version, SessionID: sessionID},
 		FlowID:   params.FlowID,
 		FlowType: params.FlowType,
 	}, nil
@@ -266,6 +305,9 @@ func (p *AsyncFlowProfile) HandleProgress(_ context.Context, params *FlowProgres
 }
 
 func (p *AsyncFlowProfile) HandleComplete(_ context.Context, params *FlowCompleteParams) {
+	if p.deliverSubFlow(params.FlowID, subFlowOutcome{result: params.Result}) {
+		return
+	}
 	p.mu.Lock()
 	fc, ok := p.flows[params.FlowID]
 	if ok {
@@ -278,6 +320,10 @@ func (p *AsyncFlowProfile) HandleComplete(_ context.Context, params *FlowComplet
 }
 
 func (p *AsyncFlowProfile) HandleError(_ context.Context, params *FlowErrorParams) {
+	failure := &SubFlowError{Code: params.Code, Message: params.Message, Data: params.Data}
+	if p.deliverSubFlow(params.FlowID, subFlowOutcome{err: failure}) {
+		return
+	}
 	p.mu.Lock()
 	fc, ok := p.flows[params.FlowID]
 	if ok {
@@ -287,6 +333,12 @@ func (p *AsyncFlowProfile) HandleError(_ context.Context, params *FlowErrorParam
 	if ok {
 		fc.cancel()
 	}
+}
+
+// HandleCancel implements FlowCanceller: a remote wmp.flow.cancel ends the
+// flow, and with it the sub-flows it is waiting for.
+func (p *AsyncFlowProfile) HandleCancel(_ context.Context, params *FlowCancelParams) {
+	p.CancelFlow(params.FlowID)
 }
 
 // ActiveFlows returns the number of currently active flows.

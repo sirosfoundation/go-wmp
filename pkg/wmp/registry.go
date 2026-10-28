@@ -22,6 +22,9 @@ type registry struct {
 
 	// flowOwners tracks which FlowHandler owns each active flow_id.
 	flowOwners map[string]FlowHandler
+	// flowSessions has an entry for every claimed flow_id (ClaimFlow): the
+	// one session whose messages may be routed to its owner, or "" for any.
+	flowSessions map[string]string
 }
 
 func newRegistry() *registry {
@@ -30,6 +33,7 @@ func newRegistry() *registry {
 		methods:      make(map[string]MethodHandler),
 		resolvers:    make(map[string]ResolveHandler),
 		flowOwners:   make(map[string]FlowHandler),
+		flowSessions: make(map[string]string),
 	}
 }
 
@@ -112,11 +116,44 @@ func (r *registry) trackFlow(flowID string, h FlowHandler) {
 	r.flowOwners[flowID] = h
 }
 
+// claimFlow routes flowID to h for messages of sessionID (any session when
+// empty), unless flowID already has an owner.
+func (r *registry) claimFlow(flowID, sessionID string, h FlowHandler) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, taken := r.flowOwners[flowID]; taken {
+		return false
+	}
+	r.flowOwners[flowID] = h
+	r.flowSessions[flowID] = sessionID
+	return true
+}
+
+// flowClaimed reports whether flowID was claimed with ClaimFlow, which makes
+// it unavailable to a wmp.flow.start from the peer.
+func (r *registry) flowClaimed(flowID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.flowSessions[flowID]
+	return ok
+}
+
+// flowSessionAllowed reports whether a message naming sessionID may be
+// routed to the owner of flowID: always for an unbound flow, otherwise only
+// from the bound session.
+func (r *registry) flowSessionAllowed(flowID, sessionID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	bound, ok := r.flowSessions[flowID]
+	return !ok || bound == "" || bound == sessionID
+}
+
 // untrackFlow removes a flow_id from tracking.
 func (r *registry) untrackFlow(flowID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.flowOwners, flowID)
+	delete(r.flowSessions, flowID)
 }
 
 // lookupMethod returns the method handler for a custom method.

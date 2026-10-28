@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
@@ -278,7 +279,7 @@ var engineBlindSignMembers = []string{
 // assertFlowMessage applies the flow-specific conformance checks to a single
 // message of a flow-lifecycle vector. A must_refuse vector has to be reported
 // as a violation by the check; every other vector has to pass it.
-func assertFlowMessage(t *testing.T, raw json.RawMessage, v TestVector, id string) {
+func assertFlowMessage(t *testing.T, raw json.RawMessage, v TestVector, id string, seen flowRecord) {
 	t.Helper()
 	var msg genericRPC
 	if err := json.Unmarshal(raw, &msg); err != nil {
@@ -294,10 +295,21 @@ func assertFlowMessage(t *testing.T, raw json.RawMessage, v TestVector, id strin
 		if err := json.Unmarshal(msg.Params, &p); err != nil || len(p.Result) == 0 {
 			break
 		}
+		var fid struct {
+			FlowID string `json:"flow_id"`
+		}
+		_ = json.Unmarshal(msg.Params, &fid)
 		checked = true
-		violation = openid4x.ValidateCompletionResult(p.Result)
+		if seen.isMatch(fid.FlowID, v.ID) {
+			// A match result is validated as one (Section 3.3.2), selected
+			// by the flow type recorded at the start, never by its members.
+			violation = openid4x.ValidateMatchResult(p.Result, seen.queryIDs(fid.FlowID, p.Result))
+		} else {
+			violation = openid4x.ValidateCompletionResult(p.Result)
+		}
 	case wmp.MethodFlowStart:
 		checked = true
+		seen.record(msg.Params)
 		violation = checkSignParamsRoundTrip(msg.Params)
 	}
 	if !checked {
@@ -312,6 +324,54 @@ func assertFlowMessage(t *testing.T, raw json.RawMessage, v TestVector, id strin
 	if violation != nil {
 		t.Errorf("%s: %v", id, violation)
 	}
+}
+
+// flowRecord remembers, within one vector, the type and DCQL query ids of the
+// flows its wmp.flow.start messages began.
+type flowRecord map[string]struct {
+	flowType string
+	ids      []string
+}
+
+func (r flowRecord) record(params json.RawMessage) {
+	var p struct {
+		FlowType string `json:"flow_type"`
+		FlowID   string `json:"flow_id"`
+		Params   struct {
+			DCQL json.RawMessage `json:"dcql_query"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(params, &p) != nil {
+		return
+	}
+	e := r[p.FlowID]
+	e.flowType = p.FlowType
+	if len(p.Params.DCQL) > 0 {
+		e.ids, _ = openid4x.DCQLQueryIDs(p.Params.DCQL)
+	}
+	r[p.FlowID] = e
+}
+
+// isMatch reports whether the flow is a match flow: recorded as one at its
+// start or, for a vector that is a lone completion, named flow-match-*.
+func (r flowRecord) isMatch(flowID, vectorID string) bool {
+	if e, ok := r[flowID]; ok {
+		return e.flowType == openid4x.FlowTypeMatch
+	}
+	return strings.HasPrefix(vectorID, "flow-match-")
+}
+
+// queryIDs is the query the result is checked against: the recorded one, or
+// (a lone completion) the ids the result itself names.
+func (r flowRecord) queryIDs(flowID string, result json.RawMessage) []string {
+	if e, ok := r[flowID]; ok && e.ids != nil {
+		return e.ids
+	}
+	var m struct {
+		IDs []string `json:"satisfiable_query_ids"`
+	}
+	_ = json.Unmarshal(result, &m)
+	return m.IDs
 }
 
 // checkSignParamsRoundTrip verifies, for a sign flow.start, that every
@@ -359,17 +419,18 @@ func TestConformanceFlowLifecycle(t *testing.T) {
 				Step    string          `json:"step"`
 				Message json.RawMessage `json:"message"`
 			}
+			seen := flowRecord{}
 			if err := json.Unmarshal(v.Input, &steps); err == nil && len(steps) > 0 {
 				// Multi-step sequence
 				for i, step := range steps {
 					sid := fmt.Sprintf("%s/step-%d-%s", v.ID, i, step.Step)
 					assertValidRequest(t, step.Message, sid)
-					assertFlowMessage(t, step.Message, v, sid)
+					assertFlowMessage(t, step.Message, v, sid, seen)
 				}
 			} else {
 				// Single input
 				assertValidRequest(t, v.Input, v.ID)
-				assertFlowMessage(t, v.Input, v, v.ID)
+				assertFlowMessage(t, v.Input, v, v.ID, seen)
 			}
 			if hasJSONValue(v.ExpectedResponse) {
 				assertValidResponse(t, v.ExpectedResponse, v.ID)
