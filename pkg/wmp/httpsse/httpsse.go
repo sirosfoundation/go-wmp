@@ -321,6 +321,9 @@ type outMsg struct {
 	// resend marks a message the server re-sends on resume (already in its
 	// retained form): it is neither filtered nor tracked again.
 	resend bool
+	// resendFlows is a command, not a message: re-send the flow notifications
+	// a resume needs (see handle).
+	resendFlows bool
 }
 
 type serverSession struct {
@@ -330,6 +333,7 @@ type serverSession struct {
 
 	// done is closed by close. Writers and the broadcast loop stop on it.
 	done      chan struct{}
+	stopped   chan struct{} // closed when the broadcast loop has exited
 	closeOnce sync.Once
 	// lastActive is the unix-nano time of the last request or stream activity.
 	lastActive atomic.Int64
@@ -339,7 +343,7 @@ type serverSession struct {
 	// Active SSE clients for this session. Each channel carries the event
 	// ID assigned by the broadcast loop and the raw data.
 	clientsMu sync.Mutex
-	clients   map[chan serverEvent]struct{}
+	clients   map[chan serverEvent]func() // value: aborts the stream (nil for the legacy handler)
 	isClosed  bool
 
 	// Secured sessions only (nil/zero for the legacy handler): the event log
@@ -367,7 +371,8 @@ func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int)
 	sess := &serverSession{
 		outgoing:  make(chan outMsg, 64),
 		done:      make(chan struct{}),
-		clients:   make(map[chan serverEvent]struct{}),
+		clients:   make(map[chan serverEvent]func()),
+		stopped:   make(chan struct{}),
 		maxEvents: maxEvents,
 	}
 	sess.touch()
@@ -395,9 +400,12 @@ func (s *serverSession) close() {
 		_ = s.peer.Close()
 		s.clientsMu.Lock()
 		s.isClosed = true
-		for ch := range s.clients {
+		for ch, kill := range s.clients {
 			delete(s.clients, ch)
 			close(ch)
+			if kill != nil {
+				kill()
+			}
 		}
 		s.clientsMu.Unlock()
 	})
@@ -413,7 +421,7 @@ func (s *serverSession) registerClient(buffer int) chan serverEvent {
 		return nil
 	}
 	ch := make(chan serverEvent, buffer)
-	s.clients[ch] = struct{}{}
+	s.clients[ch] = nil
 	return ch
 }
 
@@ -427,6 +435,15 @@ func (s *serverSession) unregisterClient(ch chan serverEvent) {
 	}
 }
 
+// setKill sets the function that aborts the stream of client ch.
+func (s *serverSession) setKill(ch chan serverEvent, kill func()) {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	if _, ok := s.clients[ch]; ok {
+		s.clients[ch] = kill
+	}
+}
+
 // clientCount returns the number of attached event streams.
 func (s *serverSession) clientCount() int {
 	s.clientsMu.Lock()
@@ -437,6 +454,7 @@ func (s *serverSession) clientCount() int {
 // broadcastLoop reads messages from the outgoing channel and fans them out to
 // every registered SSE client, buffering each event for Last-Event-ID replay.
 func (s *serverSession) broadcastLoop() {
+	defer close(s.stopped)
 	for {
 		var msg outMsg
 		select {
@@ -445,7 +463,7 @@ func (s *serverSession) broadcastLoop() {
 		case msg = <-s.outgoing:
 		}
 		if s.log != nil {
-			s.emit(msg)
+			s.handle(msg)
 			continue
 		}
 		data := msg.data

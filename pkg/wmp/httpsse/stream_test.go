@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -665,4 +666,199 @@ func (h *hookLog) Append(sid string, d []byte) (string, error) {
 		<-h.release
 	}
 	return id, err
+}
+
+// The write deadline bounds a write, not the idle time after it. HTTP/2 arms
+// a timer for the deadline and resets the stream when it passes, so this is
+// run over HTTP/2.
+func TestStreamWriteDeadlineDoesNotKillAnIdleStream(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		c.Stream.WriteTimeout = 100 * time.Millisecond
+		c.Stream.Heartbeat = -1
+	})
+	sid, _ := f.create("Bearer alice")
+	ts := httptest.NewUnstartedServer(f.h)
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	client := ts.Client()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events?session_id="+sid, nil)
+	req.Header.Set("Authorization", "Bearer alice")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.ProtoMajor != 2 {
+		t.Skipf("not HTTP/2 (%s)", resp.Proto)
+	}
+	c := &tvConn{resp: resp, cancel: func() {}}
+	go c.read()
+	f.emit(sid, progress(sid, "f", "s1"))
+	c.waitEvents(t, 1)
+	time.Sleep(400 * time.Millisecond) // well past the write timeout
+	f.emit(sid, progress(sid, "f", "s2"))
+	c.waitEvents(t, 2)
+}
+
+type failNthLog struct {
+	EventLog
+	mu   sync.Mutex
+	n    int
+	fail int
+}
+
+func (l *failNthLog) Append(sid string, d []byte) (string, error) {
+	l.mu.Lock()
+	l.n++
+	fail := l.n == l.fail
+	l.mu.Unlock()
+	if fail {
+		return "", errors.New("transient")
+	}
+	return l.EventLog.Append(sid, d)
+}
+
+// After a failed append the cursor of an event already delivered must not be
+// accepted: replaying from it would silently skip the lost event.
+func TestAppendFailureTurnsEarlierCursorsIntoGaps(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) { c.Stream.Log = &failNthLog{EventLog: NewMemoryEventLog(10, 0), fail: 2} })
+	sid, _ := f.create("Bearer alice")
+	c, _ := f.open(sid, nil, "")
+	f.emit(sid, progress(sid, "f", "a"))
+	cursor := c.waitEvents(t, 1)[0].ID
+	f.emit(sid, progress(sid, "f", "b")) // the append fails
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		f.h.mu.RLock()
+		s := f.h.sessions[sid]
+		f.h.mu.RUnlock()
+		if s.clientCount() == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	resp := f.get("Bearer alice", "session_id="+sid, map[string]string{"Last-Event-ID": cursor})
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("status %d, want 410", resp.StatusCode)
+	}
+}
+
+// The stream of a client that does not read really ends when its queue
+// overflows, even though its write is blocked and has no deadline to run out.
+func TestStreamOverflowAbortsTheBlockedWrite(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		c.Stream.ClientBuffer = 2
+		c.Stream.WriteTimeout = -1
+		c.Stream.Heartbeat = -1
+		c.Stream.MaxEventBytes = 1 << 30
+	})
+	sid, _ := f.create("Bearer alice")
+	_ = f.get("Bearer alice", "session_id="+sid, nil) // never read
+	f.h.mu.RLock()
+	sess := f.h.sessions[sid]
+	f.h.mu.RUnlock()
+	big := strings.Repeat("x", 256<<10)
+	for i := 0; i < 120 && sess.active.Load() > 0; i++ {
+		f.emit(sid, progress(sid, "f", big))
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for sess.active.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := sess.active.Load(); n != 0 {
+		t.Fatalf("the handler of the abandoned stream is still running (%d references)", n)
+	}
+}
+
+// Forgetting a session waits for its broadcaster: nothing may be appended to
+// the log after the log was dropped.
+func TestForgetWaitsForTheBroadcaster(t *testing.T) {
+	var spy *hookLog
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		spy = &hookLog{EventLog: NewMemoryEventLog(10, 0), appended: make(chan struct{}, 1), release: make(chan struct{})}
+		c.Stream.Log = spy
+	})
+	sid, _ := f.create("Bearer alice")
+	spy.arm()
+	f.emit(sid, progress(sid, "f", "s1"))
+	<-spy.appended // the broadcaster is inside Append
+	done := make(chan struct{})
+	go func() { f.h.forget(sid); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("forget returned while the broadcaster was still appending")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(spy.release)
+	<-done
+	if _, found, _ := spy.EventLog.After(sid, ""); found {
+		t.Fatal("the log kept events of a forgotten session")
+	}
+}
+
+// A replacement session cannot be built while the old one is shutting down.
+func TestReplacementWaitsForRetiringSession(t *testing.T) {
+	var spy *hookLog
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		spy = &hookLog{EventLog: NewMemoryEventLog(10, 0), appended: make(chan struct{}, 1), release: make(chan struct{})}
+		c.Stream.Log = spy
+	})
+	sid, _ := f.create("Bearer alice")
+	spy.arm()
+	f.emit(sid, progress(sid, "f", "s1"))
+	<-spy.appended
+	go f.h.Drop(sid)
+	time.Sleep(50 * time.Millisecond)
+	built := make(chan struct{})
+	go func() {
+		s, _ := f.h.lookup(context.Background(), wmp.Principal{Subject: "alice"}, sid, false)
+		if s != nil {
+			s.release()
+		}
+		close(built)
+	}()
+	select {
+	case <-built:
+		t.Fatal("a replacement was built while the old broadcaster was running")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(spy.release)
+	select {
+	case <-built:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the replacement never became available")
+	}
+}
+
+// What a resume re-sends is decided after everything queued before it: a
+// completion still in the queue is not followed by the progress it replaced.
+func TestResumeSnapshotFollowsQueuedNotifications(t *testing.T) {
+	var spy *hookLog
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		spy = &hookLog{EventLog: NewMemoryEventLog(50, 0), appended: make(chan struct{}, 1), release: make(chan struct{})}
+		c.Stream.Log = spy
+	})
+	sid, token := f.create("Bearer alice")
+	c, _ := f.open(sid, nil, "")
+	spy.arm()
+	f.emit(sid, progress(sid, "f", "p1")) // the broadcaster pauses inside Append
+	<-spy.appended
+	f.emit(sid, map[string]any{"method": wmp.MethodFlowError, "params": map[string]any{
+		"wmp": map[string]any{"version": wmp.Version, "session_id": sid}, "flow_id": "f", "code": -31006, "message": "declined"}})
+	go f.post("Bearer alice", nil, rpc("r1", wmp.MethodSessionResume, sid, map[string]any{"session_id": sid, "resumption_token": token}))
+	time.Sleep(150 * time.Millisecond) // the resume is queued behind the error
+	close(spy.release)
+	evs := c.waitEvents(t, 3) // p1, the error, and the re-sent error
+	time.Sleep(150 * time.Millisecond)
+	evs = c.waitEvents(t, 3)
+	if len(evs) != 3 {
+		t.Fatalf("got %d events, want 3 (p1, error, re-sent error): %s", len(evs), tvEventsString(evs))
+	}
+	if !strings.Contains(string(evs[2].Data), wmp.MethodFlowError) {
+		t.Fatalf("the re-send after the terminal notification is %s", evs[2].Data)
+	}
 }

@@ -514,7 +514,7 @@ func resumed(resp []byte) bool {
 // forget ends a session for good: its live state, its event log and the flow
 // notifications kept for resume. Use it when the stored session is gone.
 func (h *ServerHandler) forget(id string) {
-	h.Drop(id)
+	h.Drop(id) // waits for the broadcaster: nothing appends after the log is dropped
 	h.mu.Lock()
 	delete(h.trackers, id)
 	h.mu.Unlock()
@@ -526,11 +526,42 @@ func (h *ServerHandler) forget(id string) {
 // be resumed. Use it when the engine closes a session itself.
 func (h *ServerHandler) Drop(sessionID string) {
 	h.mu.Lock()
-	sess := h.sessions[sessionID]
-	delete(h.sessions, sessionID)
+	sess, b := h.detachLocked(sessionID)
 	h.mu.Unlock()
-	if sess != nil {
-		sess.close()
+	h.finishRetire(sessionID, sess, b)
+}
+
+// detachLocked removes the session from the live map. While it is being shut
+// down no replacement can be built under the same ID (the placeholder makes a
+// builder wait), so the old broadcaster cannot append to the log after the new
+// session attached. h.mu must be held; the result goes to finishRetire.
+func (h *ServerHandler) detachLocked(id string) (*serverSession, *build) {
+	sess := h.sessions[id]
+	if sess == nil {
+		return nil, nil
+	}
+	delete(h.sessions, id)
+	if h.secured == nil {
+		return sess, nil
+	}
+	b := &build{done: make(chan struct{})}
+	h.secured.building[id] = b
+	return sess, b
+}
+
+// finishRetire closes a detached session, waits for its broadcaster to stop and
+// only then lets a replacement be built.
+func (h *ServerHandler) finishRetire(id string, sess *serverSession, b *build) {
+	if sess == nil {
+		return
+	}
+	sess.close()
+	<-sess.stopped
+	if b != nil {
+		h.mu.Lock()
+		delete(h.secured.building, id)
+		h.mu.Unlock()
+		close(b.done)
 	}
 }
 
@@ -619,12 +650,13 @@ func (h *ServerHandler) Sweep(ctx context.Context) {
 		sess := h.sessions[id]
 		idle := sess != nil && sess.active.Load() == 0 &&
 			now.Sub(time.Unix(0, sess.lastActive.Load())) > st.cfg.IdleTimeout
+		var b *build
 		if idle {
-			delete(h.sessions, id)
+			sess, b = h.detachLocked(id)
 		}
 		h.mu.Unlock()
 		if idle {
-			sess.close()
+			h.finishRetire(id, sess, b)
 		}
 	}
 }

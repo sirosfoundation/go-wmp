@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
@@ -332,6 +333,20 @@ func removeString(list []string, s string) []string {
 
 // --- emission and streaming ----------------------------------------------------
 
+// handle processes one item of the outbound queue in order.
+func (s *serverSession) handle(msg outMsg) {
+	if msg.resendFlows {
+		// Snapshot here, after everything queued before the resume has been
+		// processed: a completion that is still queued is not overtaken by
+		// the progress it replaces.
+		for _, data := range s.flows.resendable() {
+			s.emit(outMsg{data: data, resend: true})
+		}
+		return
+	}
+	s.emit(msg)
+}
+
 // emit gives one outbound message an event ID, retains its replay copy and
 // delivers the live copy to every attached stream.
 func (s *serverSession) emit(msg outMsg) {
@@ -356,19 +371,27 @@ func (s *serverSession) emit(msg outMsg) {
 		// Without an ID the event cannot be sent. Ending the streams makes the
 		// clients reconnect, find a gap and resume.
 		s.logger.Error("httpsse: event log append failed", "error", err)
+		// The events already sent are no longer a valid cursor: this one is
+		// missing from the log, so a reconnect with an earlier cursor would
+		// silently skip it. Forgetting the history makes that a gap (410).
+		s.log.Drop(s.sid)
 		s.dropClients()
 		return
 	}
 	ev := serverEvent{ID: id, Data: live}
 	s.clientsMu.Lock()
-	for ch := range s.clients {
+	for ch, kill := range s.clients {
 		select {
 		case ch <- ev:
 		default:
 			// The client does not keep up: end its stream rather than lose an
-			// event silently; it reconnects with its cursor.
+			// event silently; it reconnects with its cursor. The stream may be
+			// blocked in a write, so abort that too.
 			delete(s.clients, ch)
 			close(ch)
+			if kill != nil {
+				kill()
+			}
 		}
 	}
 	s.clientsMu.Unlock()
@@ -377,20 +400,21 @@ func (s *serverSession) emit(msg outMsg) {
 func (s *serverSession) dropClients() {
 	s.clientsMu.Lock()
 	defer s.clientsMu.Unlock()
-	for ch := range s.clients {
+	for ch, kill := range s.clients {
 		delete(s.clients, ch)
 		close(ch)
+		if kill != nil {
+			kill()
+		}
 	}
 }
 
-// resend queues the flow notifications a resume re-sends, as new events.
+// resend asks the broadcast loop to re-send the flow notifications a resume
+// needs, as new events.
 func (s *serverSession) resend() {
-	for _, data := range s.flows.resendable() {
-		select {
-		case s.outgoing <- outMsg{data: data, resend: true}:
-		case <-s.done:
-			return
-		}
+	select {
+	case s.outgoing <- outMsg{resendFlows: true}:
+	case <-s.done:
 	}
 }
 
@@ -437,6 +461,7 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 	}
 	defer sess.unregisterClient(ch)
 	sess.touch()
+	var killed atomic.Bool
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -457,8 +482,18 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 			}
 			flusher.Flush()
 		}
+		if cfg.WriteTimeout > 0 {
+			// The deadline bounds the write, not the idle time after it.
+			_ = rc.SetWriteDeadline(time.Time{})
+		}
 		return true
 	}
+	// Aborts the stream when the emitter gives up on it: a write blocked on a
+	// client that does not read fails at once instead of at its deadline.
+	sess.setKill(ch, func() {
+		killed.Store(true)
+		_ = rc.SetWriteDeadline(time.Now())
+	})
 	if !write("") { // headers
 		return
 	}
@@ -481,7 +516,7 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 	for {
 		select {
 		case ev, open := <-ch:
-			if !open {
+			if !open || killed.Load() {
 				return
 			}
 			if !write(formatEvent(ev.ID, ev.Data)) {
