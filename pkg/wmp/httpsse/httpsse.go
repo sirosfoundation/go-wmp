@@ -41,6 +41,11 @@ type Transport struct {
 
 	// Last received event ID for reconnection.
 	lastEventID string
+
+	// sessionID is the session of the event stream (see ConnectSSE); the
+	// replies this client posts to server-initiated calls name it in the
+	// Wmp-Session-Id header, since a response has no wmp metadata.
+	sessionID string
 }
 
 // ClientOption configures a client-side HTTPS transport.
@@ -154,6 +159,7 @@ func (t *Transport) ConnectSSE(ctx context.Context, sessionID string) error {
 		resp.Body.Close()
 		return errors.New("sse: transport closed")
 	}
+	t.sessionID = sessionID
 	// A reconnect supersedes the stream it replaces. Close only knows the latest
 	// response, so an earlier one still being read would stay open forever, and
 	// two readers would feed the same channel.
@@ -252,6 +258,15 @@ func (t *Transport) WriteMessage(ctx context.Context, data []byte) error {
 		}
 	}
 
+	if isResponse(data) {
+		t.mu.Lock()
+		sid := t.sessionID
+		t.mu.Unlock()
+		if sid != "" && req.Header.Get("Wmp-Session-Id") == "" {
+			req.Header.Set("Wmp-Session-Id", sid)
+		}
+	}
+
 	resp, err := t.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("http post: %w", err)
@@ -276,6 +291,15 @@ func (t *Transport) WriteMessage(ctx context.Context, data []byte) error {
 	}
 
 	return nil
+}
+
+// isResponse reports whether data is a JSON-RPC message without a method: a
+// response, which carries no wmp metadata to name its session.
+func isResponse(data []byte) bool {
+	var m struct {
+		Method *string `json:"method"`
+	}
+	return json.Unmarshal(data, &m) == nil && m.Method == nil
 }
 
 // Close closes the transport.
@@ -502,6 +526,13 @@ func (t *serverTransport) ReadMessage(ctx context.Context) ([]byte, error) {
 }
 
 func (t *serverTransport) WriteMessage(ctx context.Context, data []byte) error {
+	// A closed session fails every write: with both done and the buffered
+	// queue ready, select alone could accept a message nobody will send.
+	select {
+	case <-t.done:
+		return errSessionClosed
+	default:
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -776,6 +807,11 @@ func (t *ServerTransport) ReadMessage(ctx context.Context) ([]byte, error) {
 }
 
 func (t *ServerTransport) WriteMessage(ctx context.Context, data []byte) error {
+	select {
+	case <-t.sess.done:
+		return errSessionClosed
+	default:
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
