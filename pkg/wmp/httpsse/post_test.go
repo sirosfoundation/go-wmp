@@ -319,7 +319,7 @@ func mustMarshal(t *testing.T, v interface{}) []byte {
 
 func TestServerTransport(t *testing.T) {
 	out := make(chan outMsg, 1)
-	tr := &serverTransport{outgoing: out}
+	tr := &serverTransport{sess: &serverSession{outgoing: out, done: make(chan struct{})}}
 
 	// Close is a no-op.
 	if err := tr.Close(); err != nil {
@@ -343,7 +343,7 @@ func TestServerTransport(t *testing.T) {
 
 	// WriteMessage returns context error when channel is full and context is canceled.
 	full := make(chan outMsg) // unbuffered, no reader
-	trFull := &serverTransport{outgoing: full}
+	trFull := &serverTransport{sess: &serverSession{outgoing: full, done: make(chan struct{})}}
 	cctx, ccancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(50 * time.Millisecond)

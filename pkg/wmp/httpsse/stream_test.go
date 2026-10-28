@@ -1250,3 +1250,61 @@ func TestDeadlineGuardKeepsTheAbortDeadline(t *testing.T) {
 		t.Fatal("isKilled")
 	}
 }
+
+// A writer that passed its closed-check before the session closed either has
+// its message processed or is refused: never accepted and then left unseen.
+func TestEnqueueRacingCloseIsNeverAcceptedAndLost(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		var seen atomic.Int32
+		sess := newServerSession(wmp.BaseHandler{}, nil, 0, func(s *serverSession) {
+			s.sid = "s"
+			s.log = countingLog{EventLog: NewMemoryEventLog(10, 0), n: &seen}
+			s.filter = func(d []byte) ([]byte, []byte, bool) { return d, nil, true }
+			s.flows = newFlowTracker(0, nil)
+			s.logger = slog.Default()
+		})
+		accepted := make(chan bool, 1)
+		go func() {
+			accepted <- sess.enqueue(context.Background(), outMsg{data: []byte(`{"method":"wmp.flow.progress","params":{"flow_id":"f"}}`)}) == nil
+		}()
+		sess.close()
+		<-sess.stopped
+		if <-accepted && seen.Load() != 1 {
+			t.Fatalf("iteration %d: a message was accepted but never processed", i)
+		}
+	}
+}
+
+type countingLog struct {
+	EventLog
+	n *atomic.Int32
+}
+
+func (c countingLog) Append(sid string, d []byte) (string, error) {
+	c.n.Add(1)
+	return c.EventLog.Append(sid, d)
+}
+
+// Close returns only after the broadcasters have processed what they accepted.
+func TestServerCloseWaitsForBroadcasters(t *testing.T) {
+	var spy *hookLog
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		spy = &hookLog{EventLog: NewMemoryEventLog(10, 0), appended: make(chan struct{}, 1), release: make(chan struct{})}
+		c.Stream.Log = spy
+	})
+	sid, _ := f.create("Bearer alice")
+	spy.arm()
+	f.emit(sid, progress(sid, "f", "s1"))
+	<-spy.appended
+	done := make(chan error, 1)
+	go func() { done <- f.h.Close(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("Close returned (%v) while a broadcaster was still appending", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(spy.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

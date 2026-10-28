@@ -739,6 +739,11 @@ func (h *ServerHandler) Close(ctx context.Context) error {
 			for _, s := range sessions {
 				s.close()
 			}
+			// Their broadcasters finish appending what they accepted before the
+			// shutdown counts as done.
+			for _, s := range sessions {
+				<-s.stopped
+			}
 			st.sweepWG.Wait()
 			st.inflight.Wait()
 			close(st.drained)

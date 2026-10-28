@@ -355,8 +355,14 @@ type outMsg struct {
 
 type serverSession struct {
 	outgoing chan outMsg // server -> broadcast loop
-	peer     *wmp.Peer
-	owner    string // Principal.Key of the owner; empty for legacy sessions
+	// enqMu makes enqueueing and the final drain exclusive: writers hold it
+	// shared while they enqueue, the broadcaster takes it exclusively to seal
+	// the queue once the session is closed, so nothing is accepted after the
+	// drain looked.
+	enqMu  sync.RWMutex
+	sealed bool
+	peer   *wmp.Peer
+	owner  string // Principal.Key of the owner; empty for legacy sessions
 
 	// done is closed by close. Writers and the broadcast loop stop on it.
 	done      chan struct{}
@@ -413,7 +419,7 @@ func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int,
 	// The peer writes outbound messages to the session's outgoing channel.
 	// A dedicated goroutine fans each message out to every attached SSE client
 	// so that multiple listeners on the same session each receive every event.
-	sess.peer = wmp.NewPeer(&serverTransport{outgoing: sess.outgoing, done: sess.done}, handler, opts...)
+	sess.peer = wmp.NewPeer(&serverTransport{sess: sess}, handler, opts...)
 	go sess.broadcastLoop()
 	return sess
 }
@@ -519,6 +525,10 @@ func (s *serverSession) broadcastLoop() {
 // session was closed (writes after that fail): a secured session must not lose
 // a notification it accepted, or the log and the flow tracker would miss it.
 func (s *serverSession) drain() {
+	// Wait for the writers that are enqueueing and refuse any later ones.
+	s.enqMu.Lock()
+	s.sealed = true
+	s.enqMu.Unlock()
 	if s.log == nil {
 		return
 	}
@@ -534,10 +544,7 @@ func (s *serverSession) drain() {
 
 // serverTransport is a no-op transport used only so the per-session Peer can
 // send outbound notifications/messages via WriteMessage.
-type serverTransport struct {
-	outgoing chan outMsg
-	done     <-chan struct{}
-}
+type serverTransport struct{ sess *serverSession }
 
 func (t *serverTransport) ReadMessage(ctx context.Context) ([]byte, error) {
 	<-ctx.Done()
@@ -545,21 +552,7 @@ func (t *serverTransport) ReadMessage(ctx context.Context) ([]byte, error) {
 }
 
 func (t *serverTransport) WriteMessage(ctx context.Context, data []byte) error {
-	// A closed session fails every write: with both done and the buffered
-	// queue ready, select alone could accept a message nobody will send.
-	select {
-	case <-t.done:
-		return errSessionClosed
-	default:
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.done:
-		return errSessionClosed
-	case t.outgoing <- outMsg{data: data}:
-		return nil
-	}
+	return t.sess.enqueue(ctx, outMsg{data: data})
 }
 
 func (t *serverTransport) Close() error { return nil }
@@ -826,17 +819,30 @@ func (t *ServerTransport) ReadMessage(ctx context.Context) ([]byte, error) {
 }
 
 func (t *ServerTransport) WriteMessage(ctx context.Context, data []byte) error {
+	return t.sess.enqueue(ctx, outMsg{data: data})
+}
+
+// enqueue puts msg on the queue to the broadcast loop. A closed session fails
+// every write: with both done and the buffered queue ready, a select alone
+// could accept a message nobody will send. Enqueueing is shared with other
+// writers and exclusive with the final drain (see enqMu).
+func (s *serverSession) enqueue(ctx context.Context, msg outMsg) error {
+	s.enqMu.RLock()
+	defer s.enqMu.RUnlock()
+	if s.sealed {
+		return errSessionClosed
+	}
 	select {
-	case <-t.sess.done:
+	case <-s.done:
 		return errSessionClosed
 	default:
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-t.sess.done:
+	case <-s.done:
 		return errSessionClosed
-	case t.sess.outgoing <- outMsg{data: data}:
+	case s.outgoing <- msg:
 		return nil
 	}
 }

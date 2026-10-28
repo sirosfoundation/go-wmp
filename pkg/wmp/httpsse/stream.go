@@ -1,6 +1,7 @@
 package httpsse
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -504,19 +505,13 @@ func (s *serverSession) dropClients() {
 
 // endFlow queues the news that an inbound cancel ended a flow.
 func (s *serverSession) endFlow(id string) {
-	select {
-	case s.outgoing <- outMsg{endFlow: id}:
-	case <-s.done:
-	}
+	_ = s.enqueue(context.Background(), outMsg{endFlow: id})
 }
 
 // resend asks the broadcast loop to re-send the flow notifications a resume
 // needs, as new events.
 func (s *serverSession) resend() {
-	select {
-	case s.outgoing <- outMsg{resendFlows: true}:
-	case <-s.done:
-	}
+	_ = s.enqueue(context.Background(), outMsg{resendFlows: true})
 }
 
 // cursor returns the replay cursor of a GET: the Last-Event-ID header, else
