@@ -133,7 +133,6 @@ type tvConn struct {
 	events   []tvEvent
 	consumed int
 	comments []string // comment lines, with their own `id:` if any (must be none)
-	sawID    bool
 }
 
 type tvEvent struct {
@@ -179,7 +178,6 @@ type tvRun struct {
 	vars   map[string]string
 	conns  map[string]*tvConn
 	labels map[string]rpcReply
-	hb     time.Duration
 }
 
 func runTransportVector(t *testing.T, v tvVector) {
