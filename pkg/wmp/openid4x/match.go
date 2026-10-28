@@ -166,14 +166,16 @@ func DCQLQueryIDs(dcql json.RawMessage) ([]string, error) {
 // sub-flow is a *wmp.SubFlowError whose Rejected is true, handled as a
 // rejected sign sub-flow (Section 3.2.6).
 //
-// When the session in ctx did not negotiate the oid4vp capability no match
-// flow is sent: the error is a -31005 *wmp.SubFlowError.
+// When the session in ctx did not negotiate the oid4vp capability, or ctx has
+// no session, no match flow is sent: the error is a -31005 *wmp.SubFlowError.
 func RequestMatch(ctx context.Context, fc *wmp.FlowContext, p MatchSubFlowParams, timeout time.Duration) (json.RawMessage, error) {
 	ids, err := DCQLQueryIDs(p.DCQLQuery)
 	if err != nil {
 		return nil, err
 	}
-	if sess := wmp.SessionFromContext(ctx); sess != nil && !sess.HasCapability(CapabilityOID4VP) {
+	// Fail closed: with no session in ctx there is no evidence that oid4vp
+	// was negotiated (wmp.Peer fills the session from its SessionStore).
+	if sess := wmp.SessionFromContext(ctx); sess == nil || !sess.HasCapability(CapabilityOID4VP) {
 		return nil, &wmp.SubFlowError{
 			Code:    wmp.ErrCapabilityNotSupported,
 			Message: wmp.ErrorMessage(wmp.ErrCapabilityNotSupported),

@@ -22,9 +22,13 @@ type registry struct {
 
 	// flowOwners tracks which FlowHandler owns each active flow_id.
 	flowOwners map[string]FlowHandler
-	// flowSessions has an entry for every claimed flow_id (ClaimFlow): the
-	// one session whose messages may be routed to its owner, or "" for any.
+	// flowSessions binds a tracked flow_id to the one session whose messages
+	// may be routed to its owner; "" or no entry accepts any session.
 	flowSessions map[string]string
+	// claimed holds the flow_ids claimed with ClaimFlow; starting the
+	// flow_ids of wmp.flow.start requests whose handler is running.
+	claimed  map[string]struct{}
+	starting map[string]struct{}
 }
 
 func newRegistry() *registry {
@@ -34,6 +38,8 @@ func newRegistry() *registry {
 		resolvers:    make(map[string]ResolveHandler),
 		flowOwners:   make(map[string]FlowHandler),
 		flowSessions: make(map[string]string),
+		claimed:      make(map[string]struct{}),
+		starting:     make(map[string]struct{}),
 	}
 }
 
@@ -109,49 +115,105 @@ func (r *registry) lookupFlowOwner(flowID string) (FlowHandler, bool) {
 	return h, ok
 }
 
-// trackFlow records which handler owns a flow_id.
-func (r *registry) trackFlow(flowID string, h FlowHandler) {
+// trackFlow records which handler owns a flow_id, for messages of sessionID
+// (any session when empty). It never replaces an existing owner: a flow_id
+// claimed by ClaimFlow, or tracked for another flow, stays with its owner.
+func (r *registry) trackFlow(flowID, sessionID string, h FlowHandler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, taken := r.flowOwners[flowID]; taken && !r.restartable(flowID, h) {
+		return
+	}
 	r.flowOwners[flowID] = h
+	r.flowSessions[flowID] = sessionID
 }
 
-// claimFlow routes flowID to h for messages of sessionID (any session when
-// empty), unless flowID already has an owner.
+// restartable reports whether flowID, already tracked, may be started again by
+// h: only by the handler that owns it and only when it is not a claim.
+func (r *registry) restartable(flowID string, h FlowHandler) bool {
+	_, claimed := r.claimed[flowID]
+	return !claimed && r.flowOwners[flowID] == h
+}
+
+// beginStart reserves flowID for a wmp.flow.start about to run a handler. It
+// fails when the flow_id is claimed (ClaimFlow) or another start of it is in
+// progress, so a claim made while the handler runs cannot be overwritten by
+// the start's trackFlow. endStart releases the reservation.
+func (r *registry) beginStart(flowID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, claimed := r.claimed[flowID]; claimed {
+		return false
+	}
+	if _, busy := r.starting[flowID]; busy {
+		return false
+	}
+	r.starting[flowID] = struct{}{}
+	return true
+}
+
+func (r *registry) endStart(flowID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.starting, flowID)
+}
+
+// claimFlow routes flowID to h for messages of sessionID, unless flowID
+// already has an owner or a start of it is in progress. A claim stays until
+// releaseFlow: a completion or error does not end it, so the claimant's
+// request is the only one to give the id up.
 func (r *registry) claimFlow(flowID, sessionID string, h FlowHandler) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, taken := r.flowOwners[flowID]; taken {
 		return false
 	}
+	if _, busy := r.starting[flowID]; busy {
+		return false
+	}
 	r.flowOwners[flowID] = h
 	r.flowSessions[flowID] = sessionID
+	r.claimed[flowID] = struct{}{}
 	return true
 }
 
-// flowClaimed reports whether flowID was claimed with ClaimFlow, which makes
-// it unavailable to a wmp.flow.start from the peer.
-func (r *registry) flowClaimed(flowID string) bool {
+// releaseFlow ends a claim, but only for the handler that made it.
+func (r *registry) releaseFlow(flowID string, h FlowHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, claimed := r.claimed[flowID]; claimed && r.flowOwners[flowID] == h {
+		delete(r.flowOwners, flowID)
+		delete(r.flowSessions, flowID)
+		delete(r.claimed, flowID)
+	}
+}
+
+// isClaimed reports whether flowID is held by ClaimFlow.
+func (r *registry) isClaimed(flowID string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	_, ok := r.flowSessions[flowID]
+	_, ok := r.claimed[flowID]
 	return ok
 }
 
 // flowSessionAllowed reports whether a message naming sessionID may be
-// routed to the owner of flowID: always for an unbound flow, otherwise only
-// from the bound session.
+// routed to the owner of flowID: always for a flow bound to no session,
+// otherwise only from the bound session.
 func (r *registry) flowSessionAllowed(flowID, sessionID string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	bound, ok := r.flowSessions[flowID]
-	return !ok || bound == "" || bound == sessionID
+	bound := r.flowSessions[flowID]
+	return bound == "" || bound == sessionID
 }
 
-// untrackFlow removes a flow_id from tracking.
+// untrackFlow removes a flow_id from tracking unless it is a claim, which
+// only releaseFlow ends.
 func (r *registry) untrackFlow(flowID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, claimed := r.claimed[flowID]; claimed {
+		return
+	}
 	delete(r.flowOwners, flowID)
 	delete(r.flowSessions, flowID)
 }

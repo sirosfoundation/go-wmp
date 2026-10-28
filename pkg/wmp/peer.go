@@ -94,6 +94,12 @@ type Peer struct {
 	versions       versionCache     // fallback per-session versions (see versionFor)
 	orchestrator   *OrchestratorMessageOptions
 
+	// life ends when the Peer is closed or Serve returns: flows started by
+	// a profile (AsyncFlowProfile) end with it, though not with the request
+	// that started them.
+	life    context.Context
+	endLife context.CancelFunc
+
 	mu      sync.Mutex
 	pending map[string]chan *Response // keyed by request ID
 	closed  atomic.Bool
@@ -121,10 +127,24 @@ func NewPeer(transport Transport, handler Handler, opts ...PeerOption) *Peer {
 		logger:         slog.Default(),
 		maxMessageSize: 1 << 20, // 1MB default
 	}
+	p.life, p.endLife = context.WithCancel(context.Background())
 	for _, opt := range opts {
 		opt(p)
 	}
 	return p
+}
+
+// Lifetime returns a context that ends when the Peer is closed or Serve
+// returns. AsyncFlowProfile ties the flows it runs to it.
+func (p *Peer) Lifetime() context.Context { return p.life }
+
+// defaultSessionID is the session the Peer's own identity names, which stamps
+// the messages that name none (WithSessionIdentity).
+func (p *Peer) defaultSessionID() string {
+	if p.identity == nil {
+		return ""
+	}
+	return p.identity.sessionID
 }
 
 // Use registers a profile with this Peer. Profiles are initialized immediately.
@@ -188,6 +208,7 @@ func (p *Peer) ResolveIdentifier(ctx context.Context, identifier string) (*Disco
 // Serve reads messages from the transport and dispatches them to the handler.
 // It blocks until the context is cancelled or the transport is closed.
 func (p *Peer) Serve(ctx context.Context) error {
+	defer p.endLife()
 	for {
 		data, err := p.transport.ReadMessage(ctx)
 		if err != nil {
@@ -436,11 +457,14 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		// A flow_id this peer claimed for a sub-flow of its own is not
-		// available to the remote peer's wmp.flow.start.
-		if p.registry.flowClaimed(ps.FlowID) {
+		// A flow_id this peer claimed for a sub-flow of its own, or that
+		// another start is still running, is not available to the remote
+		// peer's wmp.flow.start. Reserving it here, before the handler
+		// runs, keeps a claim made meanwhile from being overwritten.
+		if !p.registry.beginStart(ps.FlowID) {
 			return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow_id in use"})
 		}
+		defer p.registry.endStart(ps.FlowID)
 		// Check if a profile handles this flow type.
 		if fh, ok := p.registry.lookupFlowHandler(ps.FlowType); ok {
 			// Core §10.3: a flow type whose capability was not negotiated
@@ -450,7 +474,7 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			}
 			result, err := fh.StartFlow(ctx, &ps)
 			if err == nil && result != nil {
-				p.registry.trackFlow(ps.FlowID, fh)
+				p.registry.trackFlow(ps.FlowID, p.flowSession(ctx, ps.WMP.SessionID), fh)
 			}
 			return result, err
 		}
@@ -534,8 +558,13 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 				return nil, NewRPCError(ErrNotAuthorized, nil)
 			}
 			p.registry.untrackFlow(ps.FlowID)
-			if fc, ok := fh.(FlowCanceller); ok {
-				fc.HandleCancel(ctx, &ps)
+			if fc, ok := fh.(FlowCanceller); ok && fc.HandleCancel(ctx, &ps) {
+				// The profile stopped the flow: that is the answer, whatever
+				// the Handler would say about a flow it never saw.
+				return &FlowCancelResult{
+					WMP:    Metadata{Version: p.versionFor(ps.WMP.SessionID), SessionID: ps.WMP.SessionID},
+					FlowID: ps.FlowID, Status: "cancelled",
+				}, nil
 			}
 		}
 		return p.handler.FlowCancel(ctx, &ps)
@@ -583,6 +612,15 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 	}
 }
 
+// flowSession is the session a flow started by this request belongs to: the
+// store-resolved one when there is one, else the one the request names.
+func (p *Peer) flowSession(ctx context.Context, named string) string {
+	if sess := SessionFromContext(ctx); sess != nil {
+		return sess.ID
+	}
+	return named
+}
+
 // ClaimFlow implements FlowRouter: the messages of flowID that name sessionID
 // (any session when empty) go to h. The Peer is the PeerContext its profiles
 // receive in Init.
@@ -591,8 +629,8 @@ func (p *Peer) ClaimFlow(flowID, sessionID string, h FlowHandler) bool {
 }
 
 // ReleaseFlow implements FlowRouter.
-func (p *Peer) ReleaseFlow(flowID string) {
-	p.registry.untrackFlow(flowID)
+func (p *Peer) ReleaseFlow(flowID string, h FlowHandler) {
+	p.registry.releaseFlow(flowID, h)
 }
 
 // Notify sends a JSON-RPC 2.0 notification (no response expected).
@@ -766,6 +804,7 @@ func (p *Peer) HandleRequestSync(ctx context.Context, data []byte) ([]byte, erro
 // Close closes the peer and its underlying transport.
 func (p *Peer) Close() error {
 	if p.closed.CompareAndSwap(false, true) {
+		p.endLife()
 		return p.transport.Close()
 	}
 	return nil

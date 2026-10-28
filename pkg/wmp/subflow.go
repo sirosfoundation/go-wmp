@@ -80,17 +80,22 @@ type FlowRouter interface {
 	// wmp.flow.error of flowID to h, but only when they name sessionID in
 	// their wmp metadata (when sessionID is empty any session is accepted).
 	// It returns false, and routes nothing, when flowID is already routed
-	// to a handler.
+	// to a handler or a wmp.flow.start of it is running. A claim is not ended
+	// by a completion or error, nor taken by a wmp.flow.start of the peer:
+	// only ReleaseFlow ends it.
 	ClaimFlow(flowID, sessionID string, h FlowHandler) bool
 
-	// ReleaseFlow ends the routing set up by ClaimFlow.
-	ReleaseFlow(flowID string)
+	// ReleaseFlow ends the routing set up by ClaimFlow, if h made it.
+	ReleaseFlow(flowID string, h FlowHandler)
 }
 
 // FlowCanceller is an optional interface for a FlowHandler. The Peer calls
-// HandleCancel for a wmp.flow.cancel that names a flow the handler owns.
+// HandleCancel for a wmp.flow.cancel that names a flow the handler owns, and
+// answers the cancel itself (status "cancelled") when it returns true, that is
+// when the handler stopped a flow of its own. On false the Handler's FlowCancel
+// answers.
 type FlowCanceller interface {
-	HandleCancel(ctx context.Context, params *FlowCancelParams)
+	HandleCancel(ctx context.Context, params *FlowCancelParams) bool
 }
 
 // subFlow is a sub-flow in flight.
@@ -139,11 +144,20 @@ type subFlowOutcome struct {
 // session, is accepted as the outcome. It needs no HTTP request: it works
 // over any Transport.
 func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, params any, timeout time.Duration) (json.RawMessage, error) {
-	if fc.profile == nil {
-		return nil, errors.New("wmp: flow context is not run by an AsyncFlowProfile")
+	// The claim and the release go through the peer this flow runs on, which a
+	// profile shared by several peers may no longer be the profile's own.
+	router, ok := fc.peer.(FlowRouter)
+	if fc.profile == nil || !ok {
+		return nil, errors.New("wmp: flow context cannot route sub-flow messages (not run by an AsyncFlowProfile on a Peer)")
 	}
 	if timeout <= 0 {
 		return nil, errors.New("wmp: sub-flow timeout must be positive")
+	}
+	// The sub-flow's messages are accepted from one session only: the one
+	// the start goes out under. Without one the claim would be open to any.
+	session := fc.effectiveSession()
+	if session == "" {
+		return nil, errors.New("wmp: cannot determine the session of the sub-flow")
 	}
 	body, err := subFlowParams(params, fc.FlowID)
 	if err != nil {
@@ -155,15 +169,15 @@ func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, para
 	}
 	sub := &subFlow{
 		id: childID, parentID: fc.FlowID, flowType: flowType,
-		sessionID: fc.sessionID, params: body,
+		sessionID: session, params: body,
 		outcome: make(chan subFlowOutcome, 1),
 	}
 	// Register before sending: the peer may complete before it has answered
 	// the start.
-	if err := fc.profile.addSubFlow(sub); err != nil {
+	if err := fc.profile.addSubFlow(router, sub); err != nil {
 		return nil, err
 	}
-	defer fc.profile.removeSubFlow(childID)
+	defer fc.profile.removeSubFlow(router, childID)
 
 	sctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -180,7 +194,7 @@ func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, para
 	outcome, started, err := fc.runSubFlow(sctx, sub, flowType)
 	if err != nil {
 		if started {
-			fc.cancelSubFlow(ctx, childID)
+			fc.cancelSubFlow(ctx, childID, session)
 		}
 		return nil, err
 	}
@@ -190,25 +204,60 @@ func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, para
 	return outcome.result, nil
 }
 
-// runSubFlow sends the start and waits for the outcome. started reports that
-// the start may have reached the peer (so a cancel is due when it fails).
+// effectiveSession is the session the flow's outgoing messages go out under:
+// the flow's own, else the one the Peer's identity names.
+func (fc *FlowContext) effectiveSession() string {
+	if fc.sessionID != "" {
+		return fc.sessionID
+	}
+	if d, ok := fc.peer.(interface{ defaultSessionID() string }); ok {
+		return d.defaultSessionID()
+	}
+	return ""
+}
+
+// runSubFlow sends the start and waits for the outcome. It waits for the
+// peer's answer to the start and for the sub-flow's outcome at the same time,
+// so a completion or error resolves the request even when the answer to the
+// start is delayed or lost. started reports that the start may have reached
+// the peer (so a cancel is due when the request fails): true unless the peer
+// itself refused it.
 func (fc *FlowContext) runSubFlow(sctx context.Context, sub *subFlow, flowType string) (outcome subFlowOutcome, started bool, err error) {
-	start := &FlowStartParams{WMP: fc.meta(), FlowType: flowType, FlowID: sub.id, Params: sub.params}
-	if err := fc.peer.Call(sctx, MethodFlowStart, start, nil); err != nil {
-		var rpcErr *RPCError
-		if errors.As(err, &rpcErr) {
-			return outcome, false, &SubFlowError{Code: rpcErr.Code, Message: rpcErr.Message, Data: rpcErr.Data}
-		}
-		if sctx.Err() != nil {
+	meta := fc.meta()
+	meta.SessionID = sub.sessionID
+	start := &FlowStartParams{WMP: meta, FlowType: flowType, FlowID: sub.id, Params: sub.params}
+	ack := make(chan error, 1)
+	// The send runs apart from the wait: a transport write that ignores its
+	// context (a stalled socket) cannot hold the request past its timeout.
+	go func() { ack <- fc.peer.Call(sctx, MethodFlowStart, start, nil) }()
+	for {
+		select {
+		case out := <-sub.outcome:
+			return out, true, nil
+		case err := <-ack:
+			if err == nil {
+				ack = nil // accepted: now only the outcome matters
+				continue
+			}
+			var rpcErr *RPCError
+			if errors.As(err, &rpcErr) {
+				return outcome, false, &SubFlowError{Code: rpcErr.Code, Message: rpcErr.Message, Data: rpcErr.Data}
+			}
+			if sctx.Err() != nil {
+				return outcome, true, fc.subFlowCause(sctx)
+			}
+			// A transport failure does not say the start was not delivered.
+			return outcome, true, fmt.Errorf("wmp: send sub-flow start: %w", err)
+		case <-sctx.Done():
+			// An outcome that arrived together with the end of the context
+			// still counts.
+			select {
+			case out := <-sub.outcome:
+				return out, true, nil
+			default:
+			}
 			return outcome, true, fc.subFlowCause(sctx)
 		}
-		return outcome, false, fmt.Errorf("wmp: send sub-flow start: %w", err)
-	}
-	select {
-	case out := <-sub.outcome:
-		return out, true, nil
-	case <-sctx.Done():
-		return outcome, true, fc.subFlowCause(sctx)
 	}
 }
 
@@ -233,9 +282,10 @@ func (fc *FlowContext) subFlowCause(sctx context.Context) error {
 // cancelSubFlow asks the peer to cancel a sub-flow, in the background and
 // best effort: the peer may be gone, and a sub-flow that already reached a
 // terminal state answers -31006 already_terminal.
-func (fc *FlowContext) cancelSubFlow(ctx context.Context, childID string) {
+func (fc *FlowContext) cancelSubFlow(ctx context.Context, childID, session string) {
 	bg := context.WithoutCancel(ctx)
 	meta := fc.meta()
+	meta.SessionID = session
 	go func() {
 		cctx, cancel := context.WithTimeout(bg, 5*time.Second)
 		defer cancel()
@@ -272,12 +322,9 @@ func newSubFlowID(parentID, flowType string) (string, error) {
 	return parentID + "-" + flowType + "-" + hex.EncodeToString(b), nil
 }
 
-// addSubFlow registers sub and has the Peer route its messages here.
-func (p *AsyncFlowProfile) addSubFlow(sub *subFlow) error {
-	router, ok := p.peer.(FlowRouter)
-	if !ok {
-		return errors.New("wmp: peer cannot route sub-flow messages (no FlowRouter)")
-	}
+// addSubFlow registers sub and has the router (the Peer the flow runs on)
+// route its messages here.
+func (p *AsyncFlowProfile) addSubFlow(router FlowRouter, sub *subFlow) error {
 	p.mu.Lock()
 	p.childSeq++
 	sub.seq = p.childSeq
@@ -293,13 +340,11 @@ func (p *AsyncFlowProfile) addSubFlow(sub *subFlow) error {
 }
 
 // removeSubFlow forgets a sub-flow and stops routing its messages.
-func (p *AsyncFlowProfile) removeSubFlow(id string) {
+func (p *AsyncFlowProfile) removeSubFlow(router FlowRouter, id string) {
 	p.mu.Lock()
 	delete(p.children, id)
 	p.mu.Unlock()
-	if router, ok := p.peer.(FlowRouter); ok {
-		router.ReleaseFlow(id)
-	}
+	router.ReleaseFlow(id, p)
 }
 
 // deliverSubFlow hands an outcome to the goroutine waiting for sub-flow id. It

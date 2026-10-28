@@ -52,6 +52,8 @@ func TestValidateMatchResult(t *testing.T) {
 		"null":                       {`null`, false},
 		"empty":                      {``, false},
 		"trailing data":              {`{"satisfiable":true} {}`, false},
+		"trailing brace":             {`{"satisfiable":true}}`, false},
+		"trailing bracket":           {`{"satisfiable":true}]`, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := ValidateMatchResult(json.RawMessage(tc.in), ids)
@@ -172,7 +174,11 @@ func runOrchestrator(t *testing.T, w *walletSide, fn func(ctx context.Context, f
 		res <- fn(ctx, fc)
 		return nil
 	})
-	orch := wmp.NewPeer(tA, &wmp.BaseHandler{}, wmp.WithSessionIdentity("ses-1", "orchestrator"))
+	store := wmp.NewMemorySessionStore()
+	if err := store.Create(&wmp.Session{ID: "ses-1", Capabilities: wmp.Capabilities{CapabilityOID4VP: json.RawMessage(`{}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	orch := wmp.NewPeer(tA, &wmp.BaseHandler{}, wmp.WithSessionIdentity("ses-1", "orchestrator"), wmp.WithSessionStore(store))
 	if err := orch.Use(profile); err != nil {
 		t.Fatal(err)
 	}
@@ -293,22 +299,43 @@ func TestRequestMatchRejectedIsARejection(t *testing.T) {
 }
 
 func TestRequestMatchNeedsOID4VPCapabilityAndAQuery(t *testing.T) {
-	w := newWalletSide()
-	o := runOrchestrator(t, w, func(ctx context.Context, fc *wmp.FlowContext) outcome {
-		if _, err := RequestMatch(ctx, fc, MatchSubFlowParams{DCQLQuery: json.RawMessage(`{}`)}, time.Second); err == nil {
-			return outcome{err: errors.New("query without credential ids accepted")}
-		}
-		sess := &wmp.Session{ID: "ses-1", Capabilities: wmp.Capabilities{}}
-		_, err := RequestMatch(wmp.ContextWithSession(ctx, sess), fc, MatchSubFlowParams{DCQLQuery: json.RawMessage(`{"credentials":[{"id":"pid"}]}`)}, time.Second)
-		return outcome{err: err}
-	})
-	var se *wmp.SubFlowError
-	if !errors.As(o.err, &se) || se.Code != wmp.ErrCapabilityNotSupported || string(se.Data) != `{"unsupported":"match"}` {
-		t.Fatalf("err = %v", o.err)
-	}
-	select {
-	case p := <-w.started:
-		t.Fatalf("a match flow was sent to a wallet without oid4vp: %+v", p)
-	default:
+	q := MatchSubFlowParams{DCQLQuery: json.RawMessage(`{"credentials":[{"id":"pid"}]}`)}
+	for name, run := range map[string]func(ctx context.Context, fc *wmp.FlowContext) error{
+		"query without ids": func(ctx context.Context, fc *wmp.FlowContext) error {
+			_, err := RequestMatch(ctx, fc, MatchSubFlowParams{DCQLQuery: json.RawMessage(`{}`)}, time.Second)
+			return err
+		},
+		"session without oid4vp": func(ctx context.Context, fc *wmp.FlowContext) error {
+			sess := &wmp.Session{ID: "ses-1", Capabilities: wmp.Capabilities{}}
+			_, err := RequestMatch(wmp.ContextWithSession(ctx, sess), fc, q, time.Second)
+			return err
+		},
+		"no session in ctx": func(ctx context.Context, fc *wmp.FlowContext) error {
+			// A context that carries no session (a flow driven without a
+			// session store) is no evidence of the capability.
+			_, err := RequestMatch(context.WithValue(context.Background(), struct{}{}, nil), fc, q, time.Second)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newWalletSide()
+			o := runOrchestrator(t, w, func(ctx context.Context, fc *wmp.FlowContext) outcome {
+				return outcome{err: run(ctx, fc)}
+			})
+			if o.err == nil {
+				t.Fatal("accepted")
+			}
+			if name != "query without ids" {
+				var se *wmp.SubFlowError
+				if !errors.As(o.err, &se) || se.Code != wmp.ErrCapabilityNotSupported || string(se.Data) != `{"unsupported":"match"}` {
+					t.Fatalf("err = %v", o.err)
+				}
+			}
+			select {
+			case p := <-w.started:
+				t.Fatalf("a match flow was sent: %+v", p)
+			default:
+			}
+		})
 	}
 }

@@ -113,11 +113,15 @@ func (fc *FlowContext) Complete(ctx context.Context, result interface{}) error {
 			return fmt.Errorf("marshal complete result: %w", err)
 		}
 	}
-	return fc.peer.Notify(ctx, MethodFlowComplete, &FlowCompleteParams{
+	err := fc.peer.Notify(ctx, MethodFlowComplete, &FlowCompleteParams{
 		WMP:    fc.meta(),
 		FlowID: fc.FlowID,
 		Result: raw,
 	})
+	if err == nil {
+		fc.terminate() // sub-flows still outstanding end with their parent
+	}
+	return err
 }
 
 // Error sends a wmp.flow.error notification and marks the flow as failed.
@@ -130,13 +134,17 @@ func (fc *FlowContext) Error(ctx context.Context, code int, message string, data
 			return fmt.Errorf("marshal error data: %w", err)
 		}
 	}
-	return fc.peer.Notify(ctx, MethodFlowError, &FlowErrorParams{
+	err := fc.peer.Notify(ctx, MethodFlowError, &FlowErrorParams{
 		WMP:     fc.meta(),
 		FlowID:  fc.FlowID,
 		Code:    code,
 		Message: message,
 		Data:    raw,
 	})
+	if err == nil {
+		fc.terminate()
+	}
+	return err
 }
 
 // meta is the wmp object for the flow's messages: the version negotiated for
@@ -154,16 +162,24 @@ func (fc *FlowContext) meta() Metadata {
 	return Metadata{Version: version, SessionID: fc.sessionID}
 }
 
-// cancel signals the flow goroutine to stop: it closes the done channel (which
-// ends WaitForAction and any pending sub-flow request) and cancels the
-// context the flow function runs under.
-func (fc *FlowContext) cancel() {
+// terminate closes the done channel, which ends WaitForAction and any
+// pending sub-flow request. The flow is terminal: Complete and Error call it
+// once their notification went out.
+func (fc *FlowContext) terminate() {
 	fc.mu.Lock()
+	defer fc.mu.Unlock()
 	select {
 	case <-fc.doneCh:
 	default:
 		close(fc.doneCh)
 	}
+}
+
+// cancel signals the flow goroutine to stop: it ends the flow (terminate) and
+// cancels the context the flow function runs under.
+func (fc *FlowContext) cancel() {
+	fc.terminate()
+	fc.mu.Lock()
 	stop := fc.stop
 	fc.mu.Unlock()
 	if stop != nil {
@@ -253,6 +269,11 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	// the end of the flow trigger.
 	flowCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
 	fc.stop = stop
+	// ...but not the peer: closing the Peer, or the end of Serve, ends it.
+	unlink := func() bool { return true }
+	if lt, ok := p.peer.(interface{ Lifetime() context.Context }); ok {
+		unlink = context.AfterFunc(lt.Lifetime(), stop)
+	}
 
 	p.mu.Lock()
 	p.flows[params.FlowID] = fc
@@ -261,16 +282,18 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	// Run the flow handler in a goroutine.
 	go func() {
 		defer func() {
+			unlink()
 			p.mu.Lock()
 			delete(p.flows, params.FlowID)
 			p.mu.Unlock()
 			fc.cancel()
 		}()
 
-		if err := fn(flowCtx, fc); err != nil {
-			// The flow's own context may already be cancelled (that is why
-			// fn returned): the error must still reach the peer.
-			fc.Error(context.WithoutCancel(flowCtx), ErrFlowError, err.Error(), nil)
+		// A flow that was cancelled (by the remote peer, CancelFlow or the
+		// peer's end) is already over: its function returning an error
+		// because of that is not a failure to report.
+		if err := fn(flowCtx, fc); err != nil && flowCtx.Err() == nil {
+			fc.Error(flowCtx, ErrFlowError, err.Error(), nil)
 		}
 	}()
 
@@ -337,8 +360,8 @@ func (p *AsyncFlowProfile) HandleError(_ context.Context, params *FlowErrorParam
 
 // HandleCancel implements FlowCanceller: a remote wmp.flow.cancel ends the
 // flow, and with it the sub-flows it is waiting for.
-func (p *AsyncFlowProfile) HandleCancel(_ context.Context, params *FlowCancelParams) {
-	p.CancelFlow(params.FlowID)
+func (p *AsyncFlowProfile) HandleCancel(_ context.Context, params *FlowCancelParams) bool {
+	return p.cancelFlow(params.FlowID)
 }
 
 // ActiveFlows returns the number of currently active flows.
@@ -349,7 +372,10 @@ func (p *AsyncFlowProfile) ActiveFlows() int {
 }
 
 // CancelFlow cancels a specific flow by ID.
-func (p *AsyncFlowProfile) CancelFlow(flowID string) {
+func (p *AsyncFlowProfile) CancelFlow(flowID string) { p.cancelFlow(flowID) }
+
+// cancelFlow cancels a flow, reporting whether this profile was running it.
+func (p *AsyncFlowProfile) cancelFlow(flowID string) bool {
 	p.mu.Lock()
 	fc, ok := p.flows[flowID]
 	if ok {
@@ -359,4 +385,5 @@ func (p *AsyncFlowProfile) CancelFlow(flowID string) {
 	if ok {
 		fc.cancel()
 	}
+	return ok
 }
