@@ -74,7 +74,12 @@ type securedState struct {
 
 // build is a session under construction: concurrent requests for the same ID
 // wait for it instead of each calling NewHandler.
-type build struct{ done chan struct{} }
+type build struct {
+	done chan struct{}
+	// cancelled is set (under ServerHandler.mu) when the session was deleted
+	// while it was being built: the result must not be published.
+	cancelled bool
+}
 
 // NewSecuredServerHandler returns the production server handler: every
 // request is authenticated, sessions are created by cfg.Service with
@@ -262,7 +267,7 @@ func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wm
 		// The service deleted the record when the owner closed the session;
 		// end its in-memory state with it.
 		if _, ok := h.secured.store.Get(id); !ok {
-			h.Drop(id)
+			h.forget(id)
 		}
 	}
 	writeResponse(w, resp)
@@ -367,36 +372,33 @@ func (h *ServerHandler) lookup(ctx context.Context, p wmp.Principal, id string, 
 	rec, ok := h.secured.store.Get(id)
 	if !ok || !rec.OwnedBy(p.Key()) {
 		if !ok {
-			h.Drop(id) // a closed or expired session must not linger in memory
+			h.forget(id) // a closed or expired session must not linger in memory
 		}
 		return nil, wmp.ErrSessionNotFound
 	}
 	if rec.IsExpired() && !allowExpired {
 		return nil, wmp.ErrSessionExpired
 	}
-	sess := h.liveSession(ctx, p, id)
-	if sess == nil {
-		return nil, lookupClosing
-	}
-	return sess, 0
+	return h.liveSession(ctx, p, id)
 }
 
 // liveSession returns the in-memory session id with a reference held, building
 // it with a fresh Handler and Peer when this process has none (first request
 // after a create, a restart, an idle drop or a request that landed on another
 // replica). Construction is serialised per ID, so NewHandler runs once per
-// session. It returns nil when the handler is closed.
-func (h *ServerHandler) liveSession(ctx context.Context, p wmp.Principal, id string) *serverSession {
+// session. It returns nil and the code to answer when the handler is closed
+// (lookupClosing) or the session was deleted while it was being built.
+func (h *ServerHandler) liveSession(ctx context.Context, p wmp.Principal, id string) (*serverSession, int) {
 	for {
 		h.mu.Lock()
 		if h.secured.closed {
 			h.mu.Unlock()
-			return nil
+			return nil, lookupClosing
 		}
 		if sess := h.sessions[id]; sess != nil {
 			sess.acquire() // under h.mu: the idle sweep cannot drop it in between
 			h.mu.Unlock()
-			return sess
+			return sess, 0
 		}
 		if b := h.secured.building[id]; b != nil {
 			h.mu.Unlock()
@@ -406,24 +408,51 @@ func (h *ServerHandler) liveSession(ctx context.Context, p wmp.Principal, id str
 		b := &build{done: make(chan struct{})}
 		h.secured.building[id] = b
 		h.mu.Unlock()
+		return h.finishBuild(ctx, p, id, b)
+	}
+}
 
-		handler, opts := h.secured.cfg.NewHandler(context.WithoutCancel(ctx), p, id)
-		built := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.MaxEvents)
-		built.owner = p.Key()
-
+// finishBuild runs the factory for the session b stands for and publishes the
+// result unless the session was deleted or the handler closed meanwhile. It
+// always removes b and wakes its waiters, a panic in the factory included
+// (the panic goes on to the HTTP server, which recovers the request).
+func (h *ServerHandler) finishBuild(ctx context.Context, p wmp.Principal, id string, b *build) (*serverSession, int) {
+	published := false
+	defer func() {
+		if published {
+			return
+		}
 		h.mu.Lock()
 		delete(h.secured.building, id)
-		close(b.done)
-		if h.secured.closed {
-			h.mu.Unlock()
-			built.close()
-			return nil
-		}
-		h.sessions[id] = built
-		built.acquire()
 		h.mu.Unlock()
-		return built
+		close(b.done)
+	}()
+
+	handler, opts := h.secured.cfg.NewHandler(context.WithoutCancel(ctx), p, id)
+	built := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.MaxEvents)
+	built.owner = p.Key()
+
+	// The stored session may have gone while the factory ran (closed, expired,
+	// deleted by another replica): check again before publishing.
+	rec, stored := h.secured.store.Get(id)
+	h.mu.Lock()
+	switch {
+	case h.secured.closed:
+		h.mu.Unlock()
+		built.close()
+		return nil, lookupClosing
+	case b.cancelled || !stored || !rec.OwnedBy(p.Key()):
+		h.mu.Unlock()
+		built.close()
+		return nil, wmp.ErrSessionNotFound
 	}
+	published = true
+	delete(h.secured.building, id)
+	h.sessions[id] = built
+	built.acquire()
+	h.mu.Unlock()
+	close(b.done)
+	return built, 0
 }
 
 // sessionPeerOptions prepends the options the handler itself needs to the session's.
@@ -485,6 +514,17 @@ func writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, data int
 		return
 	}
 	writeResponse(w, b)
+}
+
+// forget ends a session whose stored record is gone: like Drop, and a build
+// of it that is still in progress is not published.
+func (h *ServerHandler) forget(id string) {
+	h.mu.Lock()
+	if b := h.secured.building[id]; b != nil {
+		b.cancelled = true
+	}
+	h.mu.Unlock()
+	h.Drop(id)
 }
 
 // Drop ends the in-memory state of a session: its peer is closed and its event
@@ -572,7 +612,7 @@ func (h *ServerHandler) Sweep(ctx context.Context) {
 	for _, id := range ids {
 		rec, ok := st.store.Get(id)
 		if !ok || rec.IsExpired() {
-			h.Drop(id)
+			h.forget(id)
 			continue
 		}
 		if st.cfg.IdleTimeout <= 0 {

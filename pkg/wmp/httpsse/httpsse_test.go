@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -941,5 +942,61 @@ func TestConnectSSEReconnectClosesThePreviousStream(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Close left the latest stream open")
+	}
+}
+
+// A client that only has an Authorization header must be able to answer a
+// call the server makes: the response names its session in the header.
+func TestClientAnswersServerCallsWithSessionHeader(t *testing.T) {
+	f := newSecuredFixture(t, nil)
+	sid, _ := f.create("Bearer alice")
+	tr, err := NewClientTransport(f.ts.URL, WithInsecure(true), WithHeaders(http.Header{"Authorization": {"Bearer alice"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tr.ConnectSSE(ctx, sid); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var sess *serverSession
+	for sess == nil && time.Now().Before(deadline) {
+		f.h.mu.RLock()
+		sess = f.h.sessions[sid]
+		f.h.mu.RUnlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if sess == nil {
+		t.Fatal("no live session")
+	}
+
+	callErr := make(chan error, 1)
+	go func() {
+		var out map[string]any
+		callErr <- sess.peer.Call(ctx, "wmp.test.ping", map[string]any{}, &out)
+	}()
+	req, err := tr.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(req, &m); err != nil {
+		t.Fatal(err)
+	}
+	resp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{}}`, m.ID)
+	if err := tr.WriteMessage(ctx, []byte(resp)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-callErr:
+		if err != nil {
+			t.Fatalf("Call: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the server's call never completed: its response was refused")
 	}
 }

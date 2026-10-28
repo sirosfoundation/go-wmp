@@ -83,6 +83,21 @@ type rpcReply struct {
 	Raw    []byte
 }
 
+// postRaw is post without t.Fatal, for goroutines other than the test's.
+func (f *securedFixture) postRaw(auth string, body any) error {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, _ := http.NewRequest(http.MethodPost, f.ts.URL, bytes.NewReader(b))
+	req.Header.Set("Authorization", auth)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
 func (f *securedFixture) post(auth string, headers map[string]string, body any) rpcReply {
 	f.t.Helper()
 	b, err := json.Marshal(body)
@@ -811,5 +826,88 @@ func TestSecuredLookupWhileClosingIsNotAnError(t *testing.T) {
 	sess, code := f.h.lookup(context.Background(), wmp.Principal{Subject: "alice"}, id, false)
 	if sess != nil || code != lookupClosing {
 		t.Fatalf("lookup after Close: %v, %d", sess, code)
+	}
+}
+
+func TestFirstWriteAfterCloseFails(t *testing.T) {
+	sess := newServerSession(wmp.BaseHandler{}, nil, 0)
+	tr := newServerTransport(sess)
+	sess.close()
+	// The queue has room and done is closed: a select alone may take either.
+	for i := 0; i < 50; i++ {
+		if err := tr.WriteMessage(context.Background(), []byte(`{}`)); !errors.Is(err, errSessionClosed) {
+			t.Fatalf("write %d after close: %v", i, err)
+		}
+		if err := sess.peer.Notify(context.Background(), wmp.MethodMessageDeliver, map[string]any{}); err == nil {
+			t.Fatalf("notify %d after close succeeded", i)
+		}
+	}
+}
+
+func TestSecuredSessionDeletedDuringBuildIsNotPublished(t *testing.T) {
+	for _, viaForget := range []bool{true, false} {
+		name := "recheck"
+		if viaForget {
+			name = "forget"
+		}
+		t.Run(name, func(t *testing.T) {
+			entered := make(chan struct{}, 4)
+			release := make(chan struct{})
+			f := newSecuredFixture(t, nil)
+			id, _ := f.create("Bearer alice")
+			f.h.Drop(id)
+			inner := f.h.secured.cfg.NewHandler
+			f.h.secured.cfg.NewHandler = func(ctx context.Context, p wmp.Principal, sid string) (wmp.Handler, []wmp.PeerOption) {
+				if sid != "" {
+					entered <- struct{}{}
+					<-release
+				}
+				return inner(ctx, p, sid)
+			}
+			reply := f.postAsync("Bearer alice", rpc("1", wmp.MethodMessageDeliver, id, nil))
+			<-entered
+			if viaForget {
+				f.h.forget(id) // the stored record is still there: only the build is cancelled
+			} else {
+				_ = f.store.Delete(id)
+			}
+			close(release)
+			r := <-reply
+			if rpcCode(r) != wmp.ErrSessionNotFound {
+				t.Fatalf("reply: %s", r.Raw)
+			}
+			f.h.mu.RLock()
+			_, held := f.h.sessions[id]
+			f.h.mu.RUnlock()
+			if held {
+				t.Fatal("a session deleted during its build was published")
+			}
+		})
+	}
+}
+
+func TestSecuredFactoryPanicDoesNotWedgeTheSession(t *testing.T) {
+	var panicNext atomic.Bool
+	f := newSecuredFixture(t, nil)
+	id, _ := f.create("Bearer alice")
+	f.h.Drop(id)
+	inner := f.h.secured.cfg.NewHandler
+	f.h.secured.cfg.NewHandler = func(ctx context.Context, p wmp.Principal, sid string) (wmp.Handler, []wmp.PeerOption) {
+		if sid != "" && panicNext.CompareAndSwap(true, false) {
+			panic("factory failed")
+		}
+		return inner(ctx, p, sid)
+	}
+	panicNext.Store(true)
+	_ = f.postRaw("Bearer alice", rpc("1", wmp.MethodMessageDeliver, id, nil)) // the connection is aborted
+	done := make(chan rpcReply, 1)
+	go func() { done <- f.post("Bearer alice", nil, rpc("2", wmp.MethodMessageDeliver, id, nil)) }()
+	select {
+	case r := <-done:
+		if rpcCode(r) != 0 {
+			t.Fatalf("%s", r.Raw)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a failed build left later requests waiting forever")
 	}
 }
