@@ -867,12 +867,18 @@ func TestSecuredSessionDeletedDuringBuildIsNotPublished(t *testing.T) {
 			}
 			reply := f.postAsync("Bearer alice", rpc("1", wmp.MethodMessageDeliver, id, nil))
 			<-entered
+			forgotten := make(chan struct{})
 			if viaForget {
-				f.h.forget(id) // the stored record is still there: only the build is cancelled
+				// The stored record is still there: only the build is cancelled.
+				// forget waits for the build to end, so it runs on the side.
+				go func() { f.h.forget(id); close(forgotten) }()
+				time.Sleep(50 * time.Millisecond)
 			} else {
+				close(forgotten)
 				_ = f.store.Delete(id)
 			}
 			close(release)
+			<-forgotten
 			r := <-reply
 			if rpcCode(r) != wmp.ErrSessionNotFound {
 				t.Fatalf("reply: %s", r.Raw)
