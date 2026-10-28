@@ -153,6 +153,16 @@ func (r *registry) beginStart(flowID string) bool {
 	return true
 }
 
+// isStarting reports whether a wmp.flow.start of flowID is still running its
+// handler: the flow is routed but not yet registered with its profile, so a
+// cancel of it cannot be honoured (or answered) yet.
+func (r *registry) isStarting(flowID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.starting[flowID]
+	return ok
+}
+
 func (r *registry) endStart(flowID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

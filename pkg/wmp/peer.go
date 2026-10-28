@@ -567,6 +567,12 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 			if !p.registry.flowSessionAllowed(ps.FlowID, ps.WMP.SessionID) {
 				return nil, NewRPCError(ErrNotAuthorized, nil)
 			}
+			// Between the route going in and the profile registering the
+			// flow a cancel would find nothing to stop and unroute the
+			// flow that is about to exist: it is refused, to be repeated.
+			if p.registry.isStarting(ps.FlowID) {
+				return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow is still starting"})
+			}
 			// The flow's ID stays reserved while it is cancelled: a canceller
 			// releases the route itself, once, so a start of the same ID
 			// cannot slip in and be cancelled (or unrouted) instead.

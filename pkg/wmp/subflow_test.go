@@ -1744,3 +1744,37 @@ func TestQueuedOutcomeBeatsAFailedStartAnswer(t *testing.T) {
 		}
 	}
 }
+
+func TestCancelDuringStartIsRefusedAndDoesNotUnrouteTheFlow(t *testing.T) {
+	r := newSubFlowRig(t)
+	inStart := make(chan struct{})
+	release := make(chan struct{})
+	slow := NewAsyncFlowProfile("slow")
+	slow.Handle("slow", func(ctx context.Context, fc *FlowContext) error { <-ctx.Done(); return nil })
+	if err := r.orch.Use(&blockingStartProfile{AsyncFlowProfile: slow, in: inStart, release: release}); err != nil {
+		t.Fatal(err)
+	}
+	slow.self = nil
+	started := make(chan error, 1)
+	go func() {
+		started <- r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "slow", FlowID: "s1"}, nil)
+	}()
+	<-inStart
+	var rpcErr *RPCError
+	err := r.wallet.Call(r.ctx, MethodFlowCancel, &FlowCancelParams{FlowID: "s1"}, nil)
+	if !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError {
+		t.Fatalf("cancel during start: err = %v, want -31006", err)
+	}
+	close(release)
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	if _, owned := r.orch.registry.lookupFlowOwner("s1"); !owned {
+		t.Fatal("the cancel unrouted the flow that was starting")
+	}
+	// The flow is routable and cancellable once started.
+	var res FlowCancelResult
+	if err := r.wallet.Call(r.ctx, MethodFlowCancel, &FlowCancelParams{FlowID: "s1"}, &res); err != nil || res.Status != "cancelled" {
+		t.Fatalf("cancel after start: %+v, %v", res, err)
+	}
+}
