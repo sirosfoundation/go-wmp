@@ -317,7 +317,9 @@ func (t *flowTracker) observe(data, retained []byte) {
 		return
 	}
 	switch env.Method {
-	case wmp.MethodFlowProgress, wmp.MethodFlowComplete, wmp.MethodFlowError, wmp.MethodFlowCancel:
+	// wmp.flow.cancel is a request whose outcome is not known when it is sent:
+	// it is not a terminal notification (an inbound one is handled by end).
+	case wmp.MethodFlowProgress, wmp.MethodFlowComplete, wmp.MethodFlowError:
 	default:
 		return
 	}

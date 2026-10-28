@@ -1031,3 +1031,16 @@ func TestFlowTrackerOverflowIsExplicit(t *testing.T) {
 		t.Fatal("default limit")
 	}
 }
+
+// An outbound wmp.flow.cancel is a request with an outcome still to come: it
+// must not end the flow in the tracker.
+func TestOutboundCancelRequestDoesNotEndTheFlow(t *testing.T) {
+	tr := newFlowTracker(0, nil)
+	tr.observe([]byte(`{"method":"wmp.flow.progress","params":{"flow_id":"f"}}`), []byte("P1"))
+	tr.observe([]byte(`{"jsonrpc":"2.0","id":"9","method":"wmp.flow.cancel","params":{"flow_id":"f"}}`), []byte("CANCEL"))
+	tr.observe([]byte(`{"method":"wmp.flow.progress","params":{"flow_id":"f"}}`), []byte("P2"))
+	got := tr.resendable()
+	if len(got) != 1 || string(got[0]) != "P2" {
+		t.Fatalf("resendable = %q, want the latest progress only", got)
+	}
+}
