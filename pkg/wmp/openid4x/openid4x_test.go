@@ -116,7 +116,8 @@ func TestValidateAction(t *testing.T) {
 		{FlowTypeOID4VCI, "sign_response", false},
 		{FlowTypeOID4VCI, "trust_result", false},
 		{FlowTypeOID4VP, "match_response", false},
-		{FlowTypeOID4VP, "consent", false},
+		// The pre-redesign action name is not accepted (Section 3.2.3.1).
+		{FlowTypeOID4VP, "consent", true},
 		// Unknown
 		{FlowTypeOID4VCI, "unknown_action", true},
 		{FlowTypeOID4VP, "unknown_action", true},

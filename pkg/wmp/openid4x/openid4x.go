@@ -307,13 +307,17 @@ type SignSubFlowParams struct {
 	// EC TS12 requires the key binding JWT of an SCA presentation to carry it.
 	// Empty for OID4VCI sign_proof.
 	ResponseMode string `json:"response_mode,omitempty"`
-	// CredentialsToInclude selects which of the client's credentials (and
-	// which claims from each) go into an OID4VP presentation, when the
-	// server already resolved the selection - e.g. a single-match query
-	// that skipped the interactive selection sub-flow. Empty when the
-	// client made its own selection (accept_offer/select_credentials) or
-	// for OID4VCI sign_proof, where it doesn't apply.
-	CredentialsToInclude []CredentialSelection `json:"credentials_to_include,omitempty"`
+	// CredentialsToInclude names the credential queries of the verifier's
+	// request the user consented to answer (Section 3.2.5): each entry is
+	// {"credential_query_id": ...} and nothing else, no credential
+	// identifier and no claim names. The wallet knows which credential and
+	// which claims. Empty for OID4VCI sign_proof, where it doesn't apply.
+	CredentialsToInclude []CredentialQueryRef `json:"credentials_to_include,omitempty"`
+	// SelectionHandle is the handle of the select_credentials action that
+	// recorded the consent, handed back unchanged (Section 3.2.5). Required
+	// when the sub-flow follows a consenting select_credentials; absent
+	// otherwise. The orchestrator never interprets it.
+	SelectionHandle string `json:"selection_handle,omitempty"`
 	// ReissuanceKid, when set (a credential renewal request), asks the
 	// client to sign this proof with the EXISTING keypair identified by
 	// this kid rather than generating a fresh one, so the issuer can match
@@ -401,17 +405,10 @@ type SelectionAction struct {
 	Consent         bool  `json:"consent"`
 }
 
-// ConsentAction is the action params for select_credentials (VP).
-type ConsentAction struct {
-	Selections []CredentialSelection `json:"selections"`
-	Consent    bool                  `json:"consent"`
-}
-
-// CredentialSelection represents a user's credential disclosure selection.
-type CredentialSelection struct {
-	CredentialID      string   `json:"credential_id"`
-	CredentialQueryID string   `json:"credential_query_id,omitempty"`
-	DisclosedClaims   []string `json:"disclosed_claims,omitempty"`
+// CredentialQueryRef names one credential query of the verifier's request in a
+// sign request's credentials_to_include (Section 3.2.5).
+type CredentialQueryRef struct {
+	CredentialQueryID string `json:"credential_query_id"`
 }
 
 // FlowStartHandler is called when an OID4VCI or OID4VP flow is started.
@@ -675,7 +672,7 @@ func ValidateAction(flowType, action string) error {
 	}
 	// Allow sign_response, match_response, trust_result, consent, etc. from the engine.
 	switch action {
-	case "sign_response", "match_response", "trust_result", "consent",
+	case "sign_response", "match_response", "trust_result",
 		"select_credential", "authorization_complete", "provide_pin",
 		"credentials_matched", "decline":
 		return nil
