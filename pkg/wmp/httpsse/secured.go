@@ -734,6 +734,11 @@ func (h *ServerHandler) Close(ctx context.Context) error {
 		sessions := h.sessions
 		h.sessions = make(map[string]*serverSession)
 		st.drained = make(chan struct{})
+		// Sessions being retired or built by other callers are waited for too.
+		var pending []chan struct{}
+		for _, b := range st.building {
+			pending = append(pending, b.done)
+		}
 		close(st.stop)
 		go func() {
 			for _, s := range sessions {
@@ -743,6 +748,9 @@ func (h *ServerHandler) Close(ctx context.Context) error {
 			// shutdown counts as done.
 			for _, s := range sessions {
 				<-s.stopped
+			}
+			for _, done := range pending {
+				<-done
 			}
 			st.sweepWG.Wait()
 			st.inflight.Wait()

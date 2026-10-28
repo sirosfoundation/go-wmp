@@ -1308,3 +1308,29 @@ func TestServerCloseWaitsForBroadcasters(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A Drop under way when Close starts is waited for too.
+func TestServerCloseWaitsForARetirementUnderWay(t *testing.T) {
+	var spy *hookLog
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		spy = &hookLog{EventLog: NewMemoryEventLog(10, 0), appended: make(chan struct{}, 1), release: make(chan struct{})}
+		c.Stream.Log = spy
+	})
+	sid, _ := f.create("Bearer alice")
+	spy.arm()
+	f.emit(sid, progress(sid, "f", "s1"))
+	<-spy.appended
+	go f.h.Drop(sid) // takes the session out of the map, then waits for its broadcaster
+	time.Sleep(100 * time.Millisecond)
+	done := make(chan error, 1)
+	go func() { done <- f.h.Close(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("Close returned (%v) while a retirement was still waiting for its broadcaster", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(spy.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
