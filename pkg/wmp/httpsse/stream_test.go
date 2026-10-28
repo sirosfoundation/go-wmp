@@ -795,7 +795,7 @@ func TestForgetWaitsForTheBroadcaster(t *testing.T) {
 	}
 	close(spy.release)
 	<-done
-	if _, found, _ := spy.EventLog.After(sid, ""); found {
+	if _, found, _ := spy.After(sid, ""); found {
 		t.Fatal("the log kept events of a forgotten session")
 	}
 }
@@ -849,12 +849,14 @@ func TestResumeSnapshotFollowsQueuedNotifications(t *testing.T) {
 	<-spy.appended
 	f.emit(sid, map[string]any{"method": wmp.MethodFlowError, "params": map[string]any{
 		"wmp": map[string]any{"version": wmp.Version, "session_id": sid}, "flow_id": "f", "code": -31006, "message": "declined"}})
-	go f.post("Bearer alice", nil, rpc("r1", wmp.MethodSessionResume, sid, map[string]any{"session_id": sid, "resumption_token": token}))
+	go func() {
+		_ = f.postRaw("Bearer alice", rpc("r1", wmp.MethodSessionResume, sid, map[string]any{"session_id": sid, "resumption_token": token}))
+	}()
 	time.Sleep(150 * time.Millisecond) // the resume is queued behind the error
 	close(spy.release)
-	evs := c.waitEvents(t, 3) // p1, the error, and the re-sent error
+	c.waitEvents(t, 3) // p1, the error, and the re-sent error
 	time.Sleep(150 * time.Millisecond)
-	evs = c.waitEvents(t, 3)
+	evs := c.waitEvents(t, 3)
 	if len(evs) != 3 {
 		t.Fatalf("got %d events, want 3 (p1, error, re-sent error): %s", len(evs), tvEventsString(evs))
 	}

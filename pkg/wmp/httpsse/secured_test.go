@@ -83,6 +83,21 @@ type rpcReply struct {
 	Raw    []byte
 }
 
+// postRaw is post without t.Fatal, for goroutines other than the test's.
+func (f *securedFixture) postRaw(auth string, body any) error {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, _ := http.NewRequest(http.MethodPost, f.ts.URL, bytes.NewReader(b))
+	req.Header.Set("Authorization", auth)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
 func (f *securedFixture) post(auth string, headers map[string]string, body any) rpcReply {
 	f.t.Helper()
 	b, err := json.Marshal(body)
