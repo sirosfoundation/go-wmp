@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -305,7 +306,8 @@ type ServerHandler struct {
 	peerOptions []wmp.PeerOption
 
 	// secured is non-nil for a handler made by NewSecuredServerHandler.
-	secured *securedState
+	secured  *securedState
+	trackers map[string]*flowTracker // secured only: sessions with retained state
 }
 
 type serverEvent struct {
@@ -313,8 +315,16 @@ type serverEvent struct {
 	Data []byte
 }
 
+// outMsg is one outbound message on its way to the broadcast loop.
+type outMsg struct {
+	data []byte
+	// resend marks a message the server re-sends on resume (already in its
+	// retained form): it is neither filtered nor tracked again.
+	resend bool
+}
+
 type serverSession struct {
-	outgoing chan []byte // server -> broadcast loop
+	outgoing chan outMsg // server -> broadcast loop
 	peer     *wmp.Peer
 	owner    string // Principal.Key of the owner; empty for legacy sessions
 
@@ -330,6 +340,17 @@ type serverSession struct {
 	clients   map[chan serverEvent]struct{}
 	isClosed  bool
 
+	// Secured sessions only (nil/zero for the legacy handler): the event log
+	// that backs replay, the replay filter, and the flow notifications kept
+	// for resume. emitMu serialises emission against attaching a stream, so a
+	// stream's replay and its live events neither overlap nor leave a hole.
+	sid    string
+	log    EventLog
+	filter func([]byte) ([]byte, []byte, bool)
+	flows  *flowTracker
+	emitMu sync.Mutex
+	logger *slog.Logger
+
 	// Event buffer for Last-Event-ID replay.
 	bufMu     sync.Mutex
 	events    []serverEvent
@@ -342,7 +363,7 @@ func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int)
 		maxEvents = 200
 	}
 	sess := &serverSession{
-		outgoing:  make(chan []byte, 64),
+		outgoing:  make(chan outMsg, 64),
 		done:      make(chan struct{}),
 		clients:   make(map[chan serverEvent]struct{}),
 		maxEvents: maxEvents,
@@ -378,13 +399,13 @@ func (s *serverSession) close() {
 // registerClient adds a new SSE client and returns its dedicated channel, or
 // nil when the session is closed. The caller must call unregisterClient when
 // the client disconnects.
-func (s *serverSession) registerClient() chan serverEvent {
+func (s *serverSession) registerClient(buffer int) chan serverEvent {
 	s.clientsMu.Lock()
 	defer s.clientsMu.Unlock()
 	if s.isClosed {
 		return nil
 	}
-	ch := make(chan serverEvent, 64)
+	ch := make(chan serverEvent, buffer)
 	s.clients[ch] = struct{}{}
 	return ch
 }
@@ -410,12 +431,17 @@ func (s *serverSession) clientCount() int {
 // every registered SSE client, buffering each event for Last-Event-ID replay.
 func (s *serverSession) broadcastLoop() {
 	for {
-		var data []byte
+		var msg outMsg
 		select {
 		case <-s.done:
 			return
-		case data = <-s.outgoing:
+		case msg = <-s.outgoing:
 		}
+		if s.log != nil {
+			s.emit(msg)
+			continue
+		}
+		data := msg.data
 		s.bufMu.Lock()
 		id := s.bufferEventLocked(data)
 		s.bufMu.Unlock()
@@ -441,7 +467,7 @@ func (s *serverSession) broadcastLoop() {
 // serverTransport is a no-op transport used only so the per-session Peer can
 // send outbound notifications/messages via WriteMessage.
 type serverTransport struct {
-	outgoing chan []byte
+	outgoing chan outMsg
 	done     <-chan struct{}
 }
 
@@ -456,7 +482,7 @@ func (t *serverTransport) WriteMessage(ctx context.Context, data []byte) error {
 		return ctx.Err()
 	case <-t.done:
 		return errSessionClosed
-	case t.outgoing <- data:
+	case t.outgoing <- outMsg{data: data}:
 		return nil
 	}
 }
@@ -634,7 +660,7 @@ func (h *ServerHandler) stream(w http.ResponseWriter, r *http.Request, sess *ser
 	// receive server-sent events. Registering first closes a race where an
 	// event written right after ConnectSSE returns could otherwise be
 	// dropped because the server hadn't finished subscribing this client.
-	clientCh := sess.registerClient()
+	clientCh := sess.registerClient(64)
 	if clientCh == nil {
 		http.Error(w, "session closed", http.StatusNotFound)
 		return
@@ -672,7 +698,7 @@ type ServerTransport struct {
 }
 
 func newServerTransport(sess *serverSession) *ServerTransport {
-	client := sess.registerClient()
+	client := sess.registerClient(64)
 	if client == nil {
 		// The session is closed: reads report EOF, writes fail.
 		client = make(chan serverEvent)
@@ -716,7 +742,7 @@ func (t *ServerTransport) WriteMessage(ctx context.Context, data []byte) error {
 		return ctx.Err()
 	case <-t.sess.done:
 		return errSessionClosed
-	case t.sess.outgoing <- data:
+	case t.sess.outgoing <- outMsg{data: data}:
 		return nil
 	}
 }

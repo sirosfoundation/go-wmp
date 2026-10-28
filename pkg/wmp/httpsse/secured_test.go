@@ -532,7 +532,7 @@ func TestBroadcastWhileClientsComeAndGo(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for !stop.Load() {
-				ch := sess.registerClient()
+				ch := sess.registerClient(64)
 				if ch != nil {
 					sess.unregisterClient(ch)
 				}
@@ -540,7 +540,7 @@ func TestBroadcastWhileClientsComeAndGo(t *testing.T) {
 		}()
 	}
 	for i := 0; i < 2000; i++ {
-		sess.outgoing <- []byte(`{}`)
+		sess.outgoing <- outMsg{data: []byte(`{}`)}
 	}
 	stop.Store(true)
 	wg.Wait()

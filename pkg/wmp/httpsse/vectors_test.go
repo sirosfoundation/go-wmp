@@ -86,18 +86,6 @@ func transportVectorsDir(t *testing.T) string {
 	return ""
 }
 
-// vectorsNotYet lists the vectors this change does not satisfy yet.
-var vectorsNotYet = map[string]string{
-	"transport-sse-replay-last-event-id-query":       "streaming hardening (G3b)",
-	"transport-sse-replay-header-wins":               "streaming hardening (G3b)",
-	"transport-sse-replay-oldest-retained-boundary":  "streaming hardening (G3b)",
-	"transport-sse-gap-410-then-resume":              "streaming hardening (G3b)",
-	"transport-resume-resends-terminal-notification": "streaming hardening (G3b)",
-	"transport-sse-gap-unknown-cursor":               "streaming hardening (G3b)",
-	"transport-sse-heartbeat":                        "streaming hardening (G3b)",
-	"transport-sse-replay-redacts-secret-members":    "streaming hardening (G3b)",
-}
-
 func TestTransportHTTPVectors(t *testing.T) {
 	dir := transportVectorsDir(t)
 	if dir == "" {
@@ -116,9 +104,6 @@ func TestTransportHTTPVectors(t *testing.T) {
 	}
 	for _, v := range vectors {
 		t.Run(v.ID, func(t *testing.T) {
-			if why, skip := vectorsNotYet[v.ID]; skip {
-				t.Skip(why)
-			}
 			runTransportVector(t, v)
 		})
 	}
@@ -183,7 +168,7 @@ type tvRun struct {
 func runTransportVector(t *testing.T, v tvVector) {
 	f := newSecuredFixture(t, func(c *ServerConfig) {
 		if v.Setup.EventBuffer > 0 {
-			c.MaxEvents = v.Setup.EventBuffer
+			c.Stream.MaxEvents = v.Setup.EventBuffer
 		}
 		c.Authenticate = func(r *http.Request) (wmp.Principal, error) {
 			got := r.Header.Get("Authorization")
@@ -527,4 +512,4 @@ func tvIdle(seconds float64) time.Duration {
 }
 
 // tvConfigure applies harness-specific settings to the handler config.
-func tvConfigure(c *ServerConfig) {}
+func tvConfigure(c *ServerConfig) { c.Stream.Heartbeat = 40 * time.Millisecond }

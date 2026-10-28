@@ -53,8 +53,9 @@ type ServerConfig struct {
 	// sessions is dropped. Default one minute; negative disables the sweeper.
 	SweepInterval time.Duration
 
-	// MaxEvents bounds the per-session event buffer by count (default 200).
-	MaxEvents int
+	// Stream tunes the event streams: heartbeat, write deadline, the event
+	// log and replay redaction.
+	Stream StreamConfig
 
 	// Logger receives sweep errors. Default slog.Default().
 	Logger *slog.Logger
@@ -89,14 +90,13 @@ func NewSecuredServerHandler(cfg ServerConfig) *ServerHandler {
 	if cfg.SweepInterval == 0 {
 		cfg.SweepInterval = defaultSweepInterval
 	}
-	if cfg.MaxEvents <= 0 {
-		cfg.MaxEvents = defaultMaxEvents
-	}
+	cfg.Stream.applyDefaults()
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	h := &ServerHandler{
 		sessions: make(map[string]*serverSession),
+		trackers: make(map[string]*flowTracker),
 		secured:  &securedState{cfg: cfg, store: cfg.Service.Store(), stop: make(chan struct{})},
 	}
 	if cfg.SweepInterval > 0 {
@@ -243,8 +243,12 @@ func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wm
 		// The service deleted the record when the owner closed the session;
 		// end its in-memory state with it.
 		if _, ok := h.secured.store.Get(id); !ok {
-			h.Drop(id)
+			h.forget(id)
 		}
+	}
+	if env.Method == wmp.MethodSessionResume && resumed(resp) {
+		// Re-send what the event buffer may have lost (transport 4.3.4).
+		sess.resend()
 	}
 	writeResponse(w, resp)
 }
@@ -255,7 +259,7 @@ func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wm
 func (h *ServerHandler) createSession(ctx context.Context, w http.ResponseWriter, p wmp.Principal, body []byte) {
 	hctx := context.WithoutCancel(ctx)
 	handler, opts := h.secured.cfg.NewHandler(hctx, p, "")
-	tmp := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.MaxEvents)
+	tmp := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.Stream.MaxEvents)
 	resp, err := tmp.peer.HandleRequestSync(ctx, body)
 	tmp.close()
 	if err != nil {
@@ -286,7 +290,7 @@ func (h *ServerHandler) lookup(ctx context.Context, p wmp.Principal, id string, 
 	rec, ok := h.secured.store.Get(id)
 	if !ok || !rec.OwnedBy(p.Key()) {
 		if !ok {
-			h.Drop(id) // a closed or expired session must not linger in memory
+			h.forget(id) // a closed or expired session must not linger in memory
 		}
 		return nil, wmp.ErrSessionNotFound
 	}
@@ -310,8 +314,12 @@ func (h *ServerHandler) liveSession(ctx context.Context, p wmp.Principal, id str
 	}
 
 	handler, opts := h.secured.cfg.NewHandler(context.WithoutCancel(ctx), p, id)
-	built := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.MaxEvents)
+	built := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.Stream.MaxEvents)
 	built.owner = p.Key()
+	built.sid = id
+	built.log = h.secured.cfg.Stream.Log
+	built.filter = h.secured.cfg.Stream.ReplayFilter
+	built.logger = h.secured.cfg.Logger
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -323,6 +331,12 @@ func (h *ServerHandler) liveSession(ctx context.Context, p wmp.Principal, id str
 		built.close()
 		return nil
 	}
+	tr := h.trackers[id]
+	if tr == nil {
+		tr = newFlowTracker()
+		h.trackers[id] = tr
+	}
+	built.flows = tr
 	h.sessions[id] = built
 	return built
 }
@@ -346,7 +360,7 @@ func (h *ServerHandler) getSecured(w http.ResponseWriter, r *http.Request, p wmp
 		_ = json.NewEncoder(w).Encode(wmp.NewErrorResponse(nil, wmp.NewRPCError(wmp.ErrSessionNotFound, nil)))
 		return
 	}
-	h.stream(w, r, sess)
+	h.streamSecured(w, r, sess)
 }
 
 // agreedSessionID returns the one non-empty value in ids, "" when there is
@@ -381,6 +395,26 @@ func writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, data int
 		return
 	}
 	writeResponse(w, b)
+}
+
+// resumed reports whether a JSON-RPC response is a successful resume.
+func resumed(resp []byte) bool {
+	var out struct {
+		Result struct {
+			Resumed bool `json:"resumed"`
+		} `json:"result"`
+	}
+	return json.Unmarshal(resp, &out) == nil && out.Result.Resumed
+}
+
+// forget ends a session for good: its live state, its event log and the flow
+// notifications kept for resume. Use it when the stored session is gone.
+func (h *ServerHandler) forget(id string) {
+	h.Drop(id)
+	h.mu.Lock()
+	delete(h.trackers, id)
+	h.mu.Unlock()
+	h.secured.cfg.Stream.Log.Drop(id)
 }
 
 // Drop ends the in-memory state of a session: its peer is closed and its event
@@ -457,9 +491,10 @@ func (h *ServerHandler) Sweep(ctx context.Context) {
 	if _, err := st.cfg.Service.Sweep(ctx); err != nil {
 		st.cfg.Logger.Warn("httpsse: session sweep failed", "error", err)
 	}
+	// trackers names every session with retained state, live or idle-dropped.
 	h.mu.RLock()
-	ids := make([]string, 0, len(h.sessions))
-	for id := range h.sessions {
+	ids := make([]string, 0, len(h.trackers))
+	for id := range h.trackers {
 		ids = append(ids, id)
 	}
 	h.mu.RUnlock()
@@ -468,7 +503,7 @@ func (h *ServerHandler) Sweep(ctx context.Context) {
 	for _, id := range ids {
 		rec, ok := st.store.Get(id)
 		if !ok || rec.IsExpired() {
-			h.Drop(id)
+			h.forget(id)
 			continue
 		}
 		if st.cfg.IdleTimeout <= 0 {

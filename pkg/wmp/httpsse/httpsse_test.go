@@ -144,7 +144,7 @@ func TestSSEStreamIncludesEventIDs(t *testing.T) {
 		handler.mu.RLock()
 		sess := handler.sessions["test-session"]
 		handler.mu.RUnlock()
-		sess.outgoing <- []byte(`{"jsonrpc":"2.0","method":"test"}`)
+		sess.outgoing <- outMsg{data: []byte(`{"jsonrpc":"2.0","method":"test"}`)}
 	}()
 
 	// Read SSE frames. Expect id: and data: lines.

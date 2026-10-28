@@ -318,7 +318,7 @@ func mustMarshal(t *testing.T, v interface{}) []byte {
 }
 
 func TestServerTransport(t *testing.T) {
-	out := make(chan []byte, 1)
+	out := make(chan outMsg, 1)
 	tr := &serverTransport{outgoing: out}
 
 	// Close is a no-op.
@@ -334,15 +334,15 @@ func TestServerTransport(t *testing.T) {
 	}
 	select {
 	case got := <-out:
-		if string(got) != "hello" {
-			t.Fatalf("unexpected message: %s", got)
+		if string(got.data) != "hello" {
+			t.Fatalf("unexpected message: %s", got.data)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for message")
 	}
 
 	// WriteMessage returns context error when channel is full and context is canceled.
-	full := make(chan []byte) // unbuffered, no reader
+	full := make(chan outMsg) // unbuffered, no reader
 	trFull := &serverTransport{outgoing: full}
 	cctx, ccancel := context.WithCancel(context.Background())
 	go func() {
