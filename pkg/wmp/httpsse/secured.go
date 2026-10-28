@@ -156,7 +156,7 @@ func (h *ServerHandler) ServeAuthenticated(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if !h.beginRequest() {
-		http.Error(w, "server closing", http.StatusServiceUnavailable)
+		http.Error(w, msgClosing, http.StatusServiceUnavailable)
 		return
 	}
 	defer h.secured.inflight.Done()
@@ -182,16 +182,27 @@ func (h *ServerHandler) beginRequest() bool {
 	return true
 }
 
+const (
+	headerSessionID = "Wmp-Session-Id"
+	msgClosing      = "server closing"
+)
+
+// sessionRef is the wmp metadata member that names a session.
+type sessionRef struct {
+	SessionID string `json:"session_id"`
+}
+
+// routeParams is the part of the params the transport routes on.
+type routeParams struct {
+	WMP       sessionRef `json:"wmp"`
+	SessionID string     `json:"session_id"`
+}
+
 // envelope is the part of a JSON-RPC message the transport needs to route it.
 type envelope struct {
 	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method"`
-	Params struct {
-		WMP struct {
-			SessionID string `json:"session_id"`
-		} `json:"wmp"`
-		SessionID string `json:"session_id"`
-	} `json:"params"`
+	Params routeParams     `json:"params"`
 }
 
 func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wmp.Principal) {
@@ -204,33 +215,12 @@ func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wm
 		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-
-	var env envelope
-	if json.Unmarshal(body, &env) != nil {
-		writeRPCError(w, nil, wmp.ErrParseError, nil)
-		return
-	}
-	if ambiguousRouting(body) {
-		// Ownership is decided on one reading of the message and dispatch
-		// uses another if a member name can be read two ways.
-		writeRPCError(w, env.ID, wmp.ErrInvalidRequest, map[string]string{"reason": "ambiguous member names"})
-		return
-	}
-
-	// The session may be named in the header, in wmp metadata and, for
-	// resume, in the params; the values must agree (transport section 4.5).
-	ids := []string{r.Header.Get("Wmp-Session-Id"), env.Params.WMP.SessionID}
-	if env.Method == wmp.MethodSessionResume {
-		ids = append(ids, env.Params.SessionID)
-	}
-	id, ok := agreedSessionID(ids)
+	env, id, ok := routeOf(w, r, body)
 	if !ok {
-		writeRPCError(w, env.ID, wmp.ErrInvalidParams, map[string]string{"reason": "conflicting session ids"})
 		return
 	}
 
 	ctx := wmp.ContextWithPrincipal(r.Context(), p)
-
 	if env.Method == wmp.MethodSessionCreate {
 		if id != "" {
 			// The server assigns the ID; a client never proposes one.
@@ -244,11 +234,42 @@ func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wm
 		writeRPCError(w, env.ID, wmp.ErrInvalidParams, map[string]string{"reason": "session id required"})
 		return
 	}
+	h.dispatch(ctx, w, p, env, id, body)
+}
 
+// routeOf decodes the routing members of a POST body and the session it names.
+// On failure it has written the answer and ok is false.
+func routeOf(w http.ResponseWriter, r *http.Request, body []byte) (env envelope, id string, ok bool) {
+	if json.Unmarshal(body, &env) != nil {
+		writeRPCError(w, nil, wmp.ErrParseError, nil)
+		return env, "", false
+	}
+	if ambiguousRouting(body) {
+		// Ownership is decided on one reading of the message and dispatch
+		// uses another if a member name can be read two ways.
+		writeRPCError(w, env.ID, wmp.ErrInvalidRequest, map[string]string{"reason": "ambiguous member names"})
+		return env, "", false
+	}
+	// The session may be named in the header, in wmp metadata and, for
+	// resume, in the params; the values must agree (transport section 4.5).
+	ids := []string{r.Header.Get(headerSessionID), env.Params.WMP.SessionID}
+	if env.Method == wmp.MethodSessionResume {
+		ids = append(ids, env.Params.SessionID)
+	}
+	id, agreed := agreedSessionID(ids)
+	if !agreed {
+		writeRPCError(w, env.ID, wmp.ErrInvalidParams, map[string]string{"reason": "conflicting session ids"})
+		return env, "", false
+	}
+	return env, id, true
+}
+
+// dispatch runs a request on the live session id of principal p.
+func (h *ServerHandler) dispatch(ctx context.Context, w http.ResponseWriter, p wmp.Principal, env envelope, id string, body []byte) {
 	sess, code := h.lookup(ctx, p, id, env.Method == wmp.MethodSessionResume)
 	if sess == nil {
 		if code == lookupClosing {
-			http.Error(w, "server closing", http.StatusServiceUnavailable)
+			http.Error(w, msgClosing, http.StatusServiceUnavailable)
 			return
 		}
 		writeRPCError(w, env.ID, code, nil)
@@ -373,6 +394,15 @@ func withSessionID(body []byte, id string) []byte {
 	return out
 }
 
+// createReply is the part of a create response the transport reads.
+type createReply struct {
+	Result resultWMP `json:"result"`
+}
+
+type resultWMP struct {
+	WMP sessionRef `json:"wmp"`
+}
+
 // createSession dispatches wmp.session.create on a throw-away peer (the ID is
 // not known until the service has assigned it) and, when it succeeded, builds
 // the session's long-lived peer under the assigned ID.
@@ -390,13 +420,7 @@ func (h *ServerHandler) createSession(ctx context.Context, w http.ResponseWriter
 		http.Error(w, "dispatch error", http.StatusInternalServerError)
 		return
 	}
-	var out struct {
-		Result struct {
-			WMP struct {
-				SessionID string `json:"session_id"`
-			} `json:"wmp"`
-		} `json:"result"`
-	}
+	var out createReply
 	if json.Unmarshal(resp, &out) == nil && out.Result.WMP.SessionID != "" {
 		sess, code := h.lookup(ctx, p, out.Result.WMP.SessionID, false)
 		if sess != nil {
@@ -510,14 +534,14 @@ func (h *ServerHandler) sessionPeerOptions(opts []wmp.PeerOption) []wmp.PeerOpti
 }
 
 func (h *ServerHandler) getSecured(w http.ResponseWriter, r *http.Request, p wmp.Principal) {
-	id, ok := agreedSessionID([]string{r.URL.Query().Get("session_id"), r.Header.Get("Wmp-Session-Id")})
+	id, ok := agreedSessionID([]string{r.URL.Query().Get("session_id"), r.Header.Get(headerSessionID)})
 	if !ok || id == "" {
 		http.Error(w, "missing or conflicting session id", http.StatusBadRequest)
 		return
 	}
 	sess, code := h.lookup(wmp.ContextWithPrincipal(r.Context(), p), p, id, false)
 	if code == lookupClosing {
-		http.Error(w, "server closing", http.StatusServiceUnavailable)
+		http.Error(w, msgClosing, http.StatusServiceUnavailable)
 		return
 	}
 	if sess == nil {

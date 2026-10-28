@@ -180,20 +180,24 @@ type tvRun struct {
 	labels map[string]rpcReply
 }
 
+func vectorAuth(principals map[string]string) func(*http.Request) (wmp.Principal, error) {
+	return func(r *http.Request) (wmp.Principal, error) {
+		got := r.Header.Get("Authorization")
+		for name, hv := range principals {
+			if got != "" && got == hv {
+				return wmp.Principal{Subject: name}, nil
+			}
+		}
+		return wmp.Principal{}, http.ErrNoCookie
+	}
+}
+
 func runTransportVector(t *testing.T, v tvVector) {
 	f := newSecuredFixture(t, func(c *ServerConfig) {
 		if v.Setup.EventBuffer > 0 {
 			c.MaxEvents = v.Setup.EventBuffer
 		}
-		c.Authenticate = func(r *http.Request) (wmp.Principal, error) {
-			got := r.Header.Get("Authorization")
-			for name, hv := range v.Setup.Principals {
-				if got != "" && got == hv {
-					return wmp.Principal{Subject: name}, nil
-				}
-			}
-			return wmp.Principal{}, http.ErrNoCookie
-		}
+		c.Authenticate = vectorAuth(v.Setup.Principals)
 		tvConfigure(c)
 	})
 	run := &tvRun{t: t, f: f, vars: map[string]string{}, conns: map[string]*tvConn{}, labels: map[string]rpcReply{}}
@@ -235,23 +239,29 @@ func (r *tvRun) step(i int, st tvStep) {
 			r.fail(i, st, "no connection %q", st.Close)
 		}
 		c.cancel()
-		return
 	case len(st.Emit) > 0:
-		for _, m := range st.Emit {
-			msg := r.subst(m).(map[string]any)
-			params, _ := msg["params"].(map[string]any)
-			sid, _ := params["wmp"].(map[string]any)["session_id"].(string)
-			if err := tvEmit(r.f.h, sid, msg); err != nil {
-				r.fail(i, st, "emit: %v", err)
-			}
-		}
-		r.deliver(i, st)
-		return
-	case st.Request == nil:
+		r.stepEmit(i, st)
+	case st.Request != nil:
+		r.stepRequest(i, st)
+	default:
 		r.fail(i, st, "unknown step kind")
 	}
+}
 
-	req := r.subst(st.Request).(map[string]any)
+func (r *tvRun) stepEmit(i int, st tvStep) {
+	for _, m := range st.Emit {
+		msg := r.subst(m).(map[string]any)
+		params, _ := msg["params"].(map[string]any)
+		sid, _ := params["wmp"].(map[string]any)["session_id"].(string)
+		if err := tvEmit(r.f.h, sid, msg); err != nil {
+			r.fail(i, st, "emit: %v", err)
+		}
+	}
+	r.deliver(i, st)
+}
+
+// buildRequest turns a substituted vector request into an HTTP request.
+func (r *tvRun) buildRequest(req map[string]any) *http.Request {
 	method, _ := req["method"].(string)
 	path, _ := req["path"].(string)
 	u := r.f.ts.URL + path
@@ -276,7 +286,11 @@ func (r *tvRun) step(i int, st tvStep) {
 	if body != nil {
 		hreq.Header.Set("Content-Type", "application/json")
 	}
+	return hreq
+}
 
+func (r *tvRun) stepRequest(i int, st tvStep) {
+	hreq := r.buildRequest(r.subst(st.Request).(map[string]any))
 	ctx, cancel := context.WithCancel(context.Background())
 	resp, err := http.DefaultClient.Do(hreq.WithContext(ctx))
 	if err != nil {
@@ -297,17 +311,24 @@ func (r *tvRun) step(i int, st tvStep) {
 	raw, _ := io.ReadAll(resp.Body)
 	reply := rpcReply{Status: resp.StatusCode, Raw: raw}
 	_ = json.Unmarshal(raw, &reply.Body)
+	r.checkSame(i, st, reply)
+	r.checkExpect(i, st, reply, nil, resp)
+	r.deliver(i, st)
+}
+
+// checkSame records the reply under the step's label and compares it with the
+// labelled reply the step names.
+func (r *tvRun) checkSame(i int, st tvStep, reply rpcReply) {
 	if st.Label != "" {
 		r.labels[st.Label] = reply
 	}
-	if st.Same != "" {
-		prev, ok := r.labels[st.Same]
-		if !ok || prev.Status != reply.Status || !bytes.Equal(prev.Raw, reply.Raw) {
-			r.fail(i, st, "response %d %s is not the same as %q (%d %s)", reply.Status, raw, st.Same, prev.Status, prev.Raw)
-		}
+	if st.Same == "" {
+		return
 	}
-	r.checkExpect(i, st, reply, nil, resp)
-	r.deliver(i, st)
+	prev, ok := r.labels[st.Same]
+	if !ok || prev.Status != reply.Status || !bytes.Equal(prev.Raw, reply.Raw) {
+		r.fail(i, st, "response %d %s is not the same as %q (%d %s)", reply.Status, reply.Raw, st.Same, prev.Status, prev.Raw)
+	}
 }
 
 func (r *tvRun) checkExpect(i int, st tvStep, reply rpcReply, c *tvConn, resp *http.Response) {
@@ -365,51 +386,12 @@ func (r *tvRun) deliver(i int, st tvStep) {
 }
 
 func (r *tvRun) expectEvents(i int, st tvStep, c *tvConn, want []any, _ []string) {
-	deadline := time.Now().Add(2 * time.Second)
-	if len(want) == 0 {
-		time.Sleep(150 * time.Millisecond) // nothing may arrive
-		deadline = time.Now()
-	}
-	for {
-		c.mu.Lock()
-		n := len(c.events) - c.consumed
-		c.mu.Unlock()
-		if n >= len(want) || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	c.mu.Lock()
-	got := append([]tvEvent(nil), c.events[c.consumed:]...)
-	c.consumed = len(c.events)
-	c.mu.Unlock()
+	got := c.take(len(want))
 	if len(got) != len(want) {
 		r.fail(i, st, "received %d events, want %d: %v", len(got), len(want), tvEventsString(got))
 	}
 	for j, w := range want {
-		exp, _ := w.(map[string]any)
-		ev := got[j]
-		if want, ok := exp["event"].(string); ok && ev.Event != want {
-			r.fail(i, st, "event %d: event type %q", j, ev.Event)
-		}
-		if ev.ID == "" {
-			r.fail(i, st, "event %d carries no id", j)
-		}
-		if err := r.match(r.subst(exp["id"]), ev.ID, ""); exp["id"] != nil && err != nil {
-			r.fail(i, st, "event %d id: %v", j, err)
-		}
-		var data any
-		_ = json.Unmarshal(ev.Data, &data)
-		if err := r.match(r.subst(exp["data"]), data, ""); err != nil {
-			r.fail(i, st, "event %d data %s: %v", j, ev.Data, err)
-		}
-		if abs, ok := exp["absent"].([]any); ok {
-			for _, p := range abs {
-				if tvHasPointer(data, p.(string)) {
-					r.fail(i, st, "event %d data %s carries %s", j, ev.Data, p)
-				}
-			}
-		}
+		r.checkEvent(i, st, j, got[j], w)
 	}
 	if st.Expect != nil && st.Expect.NoIDOnCmts {
 		c.mu.Lock()
@@ -418,6 +400,56 @@ func (r *tvRun) expectEvents(i int, st tvStep, c *tvConn, want []any, _ []string
 			if strings.Contains(cm, "id:") {
 				r.fail(i, st, "comment %q carries an id", cm)
 			}
+		}
+	}
+}
+
+// take waits for n more events (or, for n == 0, for a moment to see that none
+// arrive) and returns everything received since the last take.
+func (c *tvConn) take(n int) []tvEvent {
+	deadline := time.Now().Add(2 * time.Second)
+	if n == 0 {
+		time.Sleep(150 * time.Millisecond) // nothing may arrive
+		deadline = time.Now()
+	}
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		have := len(c.events) - c.consumed
+		c.mu.Unlock()
+		if have >= n {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	got := append([]tvEvent(nil), c.events[c.consumed:]...)
+	c.consumed = len(c.events)
+	return got
+}
+
+func (r *tvRun) checkEvent(i int, st tvStep, j int, ev tvEvent, w any) {
+	exp, _ := w.(map[string]any)
+	if want, ok := exp["event"].(string); ok && ev.Event != want {
+		r.fail(i, st, "event %d: event type %q", j, ev.Event)
+	}
+	if ev.ID == "" {
+		r.fail(i, st, "event %d carries no id", j)
+	}
+	if exp["id"] != nil {
+		if err := r.match(r.subst(exp["id"]), ev.ID, ""); err != nil {
+			r.fail(i, st, "event %d id: %v", j, err)
+		}
+	}
+	var data any
+	_ = json.Unmarshal(ev.Data, &data)
+	if err := r.match(r.subst(exp["data"]), data, ""); err != nil {
+		r.fail(i, st, "event %d data %s: %v", j, ev.Data, err)
+	}
+	abs, _ := exp["absent"].([]any)
+	for _, p := range abs {
+		if tvHasPointer(data, p.(string)) {
+			r.fail(i, st, "event %d data %s carries %s", j, ev.Data, p)
 		}
 	}
 }
@@ -449,63 +481,75 @@ func tvHasPointer(v any, ptr string) bool {
 func (r *tvRun) match(expected, actual any, at string) error {
 	switch e := expected.(type) {
 	case map[string]any:
-		if name, ok := e["capture"].(string); ok && len(e) == 1 {
-			s, isStr := actual.(string)
-			if !isStr {
-				return fmt.Errorf("%s: capture %q needs a string, got %v", at, name, actual)
-			}
-			r.vars[name] = s
-			return nil
-		}
-		if any_, ok := e["any"].(bool); ok && any_ && len(e) == 1 {
-			return nil
-		}
-		a, ok := actual.(map[string]any)
-		if !ok {
-			return fmt.Errorf("%s: want object, got %v", at, actual)
-		}
-		for k, ev := range e {
-			av, present := a[k]
-			if !present {
-				return fmt.Errorf("%s/%s: missing", at, k)
-			}
-			if err := r.match(ev, av, at+"/"+k); err != nil {
-				return err
-			}
-		}
-		return nil
+		return r.matchObject(e, actual, at)
 	case []any:
-		a, ok := actual.([]any)
-		if !ok || len(a) != len(e) {
-			return fmt.Errorf("%s: want array %v, got %v", at, e, actual)
-		}
-		for j := range e {
-			if err := r.match(e[j], a[j], fmt.Sprintf("%s/%d", at, j)); err != nil {
-				return err
-			}
-		}
-		return nil
+		return r.matchArray(e, actual, at)
 	case string:
-		a, ok := actual.(string)
-		if !ok {
-			return fmt.Errorf("%s: want string %q, got %v", at, e, actual)
-		}
-		if strings.HasSuffix(e, "*") {
-			if !strings.HasPrefix(a, strings.TrimSuffix(e, "*")) {
-				return fmt.Errorf("%s: %q does not match %q", at, a, e)
-			}
-			return nil
-		}
-		if a != e {
-			return fmt.Errorf("%s: %q, want %q", at, a, e)
-		}
-		return nil
+		return matchString(e, actual, at)
 	default:
 		if !reflect.DeepEqual(expected, actual) {
 			return fmt.Errorf("%s: %v, want %v", at, actual, expected)
 		}
 		return nil
 	}
+}
+
+func (r *tvRun) matchObject(e map[string]any, actual any, at string) error {
+	if name, ok := e["capture"].(string); ok && len(e) == 1 {
+		s, isStr := actual.(string)
+		if !isStr {
+			return fmt.Errorf("%s: capture %q needs a string, got %v", at, name, actual)
+		}
+		r.vars[name] = s
+		return nil
+	}
+	if anyOK, ok := e["any"].(bool); ok && anyOK && len(e) == 1 {
+		return nil
+	}
+	a, ok := actual.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s: want object, got %v", at, actual)
+	}
+	for k, ev := range e {
+		av, present := a[k]
+		if !present {
+			return fmt.Errorf("%s/%s: missing", at, k)
+		}
+		if err := r.match(ev, av, at+"/"+k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *tvRun) matchArray(e []any, actual any, at string) error {
+	a, ok := actual.([]any)
+	if !ok || len(a) != len(e) {
+		return fmt.Errorf("%s: want array %v, got %v", at, e, actual)
+	}
+	for j := range e {
+		if err := r.match(e[j], a[j], fmt.Sprintf("%s/%d", at, j)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func matchString(e string, actual any, at string) error {
+	a, ok := actual.(string)
+	if !ok {
+		return fmt.Errorf("%s: want string %q, got %v", at, e, actual)
+	}
+	if prefix, wild := strings.CutSuffix(e, "*"); wild {
+		if !strings.HasPrefix(a, prefix) {
+			return fmt.Errorf("%s: %q does not match %q", at, a, e)
+		}
+		return nil
+	}
+	if a != e {
+		return fmt.Errorf("%s: %q, want %q", at, a, e)
+	}
+	return nil
 }
 
 // tvEmit makes the server emit msg to the session through its peer.

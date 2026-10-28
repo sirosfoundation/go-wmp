@@ -261,8 +261,8 @@ func (t *Transport) WriteMessage(ctx context.Context, data []byte) error {
 		t.mu.Lock()
 		sid := t.sessionID
 		t.mu.Unlock()
-		if sid != "" && req.Header.Get("Wmp-Session-Id") == "" {
-			req.Header.Set("Wmp-Session-Id", sid)
+		if sid != "" && req.Header.Get(headerSessionID) == "" {
+			req.Header.Set(headerSessionID, sid)
 		}
 	}
 
@@ -615,7 +615,7 @@ func (h *ServerHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract session_id from the message or header.
-	sessionID := r.Header.Get("Wmp-Session-Id")
+	sessionID := r.Header.Get(headerSessionID)
 	if sessionID == "" {
 		// Try to extract from the JSON.
 		var envelope struct {

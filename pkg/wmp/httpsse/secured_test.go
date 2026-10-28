@@ -846,44 +846,49 @@ func TestFirstWriteAfterCloseFails(t *testing.T) {
 }
 
 func TestSecuredSessionDeletedDuringBuildIsNotPublished(t *testing.T) {
-	for _, viaForget := range []bool{true, false} {
-		name := "recheck"
-		if viaForget {
-			name = "forget"
+	t.Run("forget", func(t *testing.T) { deletedDuringBuild(t, true) })
+	t.Run("recheck", func(t *testing.T) { deletedDuringBuild(t, false) })
+}
+
+// deletedDuringBuild deletes a session while its handler is being built, by
+// forgetting it (the stored record stays, only the build is cancelled) or by
+// deleting the record (found by the recheck before publishing).
+func deletedDuringBuild(t *testing.T, viaForget bool) {
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	f := newSecuredFixture(t, nil)
+	id, _ := f.create("Bearer alice")
+	f.h.Drop(id)
+	inner := f.h.secured.cfg.NewHandler
+	f.h.secured.cfg.NewHandler = func(ctx context.Context, p wmp.Principal, sid string) (wmp.Handler, []wmp.PeerOption) {
+		if sid != "" {
+			entered <- struct{}{}
+			<-release
 		}
-		t.Run(name, func(t *testing.T) {
-			entered := make(chan struct{}, 4)
-			release := make(chan struct{})
-			f := newSecuredFixture(t, nil)
-			id, _ := f.create("Bearer alice")
-			f.h.Drop(id)
-			inner := f.h.secured.cfg.NewHandler
-			f.h.secured.cfg.NewHandler = func(ctx context.Context, p wmp.Principal, sid string) (wmp.Handler, []wmp.PeerOption) {
-				if sid != "" {
-					entered <- struct{}{}
-					<-release
-				}
-				return inner(ctx, p, sid)
-			}
-			reply := f.postAsync("Bearer alice", rpc("1", wmp.MethodMessageDeliver, id, nil))
-			<-entered
-			if viaForget {
-				f.h.forget(id) // the stored record is still there: only the build is cancelled
-			} else {
-				_ = f.store.Delete(id)
-			}
-			close(release)
-			r := <-reply
-			if rpcCode(r) != wmp.ErrSessionNotFound {
-				t.Fatalf("reply: %s", r.Raw)
-			}
-			f.h.mu.RLock()
-			_, held := f.h.sessions[id]
-			f.h.mu.RUnlock()
-			if held {
-				t.Fatal("a session deleted during its build was published")
-			}
-		})
+		return inner(ctx, p, sid)
+	}
+	reply := f.postAsync("Bearer alice", rpc("1", wmp.MethodMessageDeliver, id, nil))
+	<-entered
+
+	forgotten := make(chan struct{})
+	if viaForget {
+		// forget waits for the build to end, so it runs on the side.
+		go func() { f.h.forget(id); close(forgotten) }()
+		time.Sleep(50 * time.Millisecond)
+	} else {
+		_ = f.store.Delete(id)
+		close(forgotten)
+	}
+	close(release)
+	<-forgotten
+	if r := <-reply; rpcCode(r) != wmp.ErrSessionNotFound {
+		t.Fatalf("reply: %s", r.Raw)
+	}
+	f.h.mu.RLock()
+	_, held := f.h.sessions[id]
+	f.h.mu.RUnlock()
+	if held {
+		t.Fatal("a session deleted during its build was published")
 	}
 }
 
