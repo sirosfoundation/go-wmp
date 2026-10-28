@@ -85,7 +85,8 @@ type FlowRouter interface {
 	// only ReleaseFlow ends it.
 	ClaimFlow(flowID, sessionID string, h FlowHandler) bool
 
-	// ReleaseFlow ends the routing set up by ClaimFlow, if h made it.
+	// ReleaseFlow ends the routing of flowID, if h owns it: a claim made with
+	// ClaimFlow, or a flow h started.
 	ReleaseFlow(flowID string, h FlowHandler)
 }
 
@@ -111,6 +112,9 @@ type subFlow struct {
 	// arrived.
 	outcome   chan subFlowOutcome
 	delivered bool
+	// sent is closed when the goroutine that sends the start has finished
+	// with it: a cancel must not overtake the start it cancels.
+	sent chan struct{}
 }
 
 type subFlowOutcome struct {
@@ -171,6 +175,7 @@ func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, para
 		id: childID, parentID: fc.FlowID, flowType: flowType,
 		sessionID: session, params: body,
 		outcome: make(chan subFlowOutcome, 1),
+		sent:    make(chan struct{}),
 	}
 	// Register before sending: the peer may complete before it has answered
 	// the start.
@@ -194,7 +199,7 @@ func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, para
 	outcome, started, err := fc.runSubFlow(sctx, sub, flowType)
 	if err != nil {
 		if started {
-			fc.cancelSubFlow(ctx, childID, session)
+			fc.cancelSubFlow(ctx, sub)
 		}
 		return nil, err
 	}
@@ -229,7 +234,16 @@ func (fc *FlowContext) runSubFlow(sctx context.Context, sub *subFlow, flowType s
 	ack := make(chan error, 1)
 	// The send runs apart from the wait: a transport write that ignores its
 	// context (a stalled socket) cannot hold the request past its timeout.
-	go func() { ack <- fc.peer.Call(sctx, MethodFlowStart, start, nil) }()
+	go func() {
+		defer close(sub.sent)
+		// A request already over must not put a start on the wire: Peer.Call
+		// writes before it looks at the context.
+		if err := sctx.Err(); err != nil {
+			ack <- err
+			return
+		}
+		ack <- fc.peer.Call(sctx, MethodFlowStart, start, nil)
+	}()
 	for {
 		select {
 		case out := <-sub.outcome:
@@ -281,16 +295,22 @@ func (fc *FlowContext) subFlowCause(sctx context.Context) error {
 
 // cancelSubFlow asks the peer to cancel a sub-flow, in the background and
 // best effort: the peer may be gone, and a sub-flow that already reached a
-// terminal state answers -31006 already_terminal.
-func (fc *FlowContext) cancelSubFlow(ctx context.Context, childID, session string) {
+// terminal state answers -31006 already_terminal. It goes out only after the
+// send of the start has finished, so the cancel cannot overtake a start that
+// was still on its way.
+func (fc *FlowContext) cancelSubFlow(ctx context.Context, sub *subFlow) {
 	bg := context.WithoutCancel(ctx)
 	meta := fc.meta()
-	meta.SessionID = session
+	meta.SessionID = sub.sessionID
 	go func() {
 		cctx, cancel := context.WithTimeout(bg, 5*time.Second)
 		defer cancel()
+		select {
+		case <-sub.sent:
+		case <-cctx.Done():
+		}
 		_ = fc.peer.Call(cctx, MethodFlowCancel, &FlowCancelParams{
-			WMP: meta, FlowID: childID, Reason: CancelReasonNoLongerNeeded,
+			WMP: meta, FlowID: sub.id, Reason: CancelReasonNoLongerNeeded,
 		}, nil)
 	}()
 }

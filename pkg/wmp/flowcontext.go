@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -119,7 +120,7 @@ func (fc *FlowContext) Complete(ctx context.Context, result interface{}) error {
 		Result: raw,
 	})
 	if err == nil {
-		fc.terminate() // sub-flows still outstanding end with their parent
+		fc.cancel() // the flow is terminal: its sub-flows and its context end
 	}
 	return err
 }
@@ -142,7 +143,7 @@ func (fc *FlowContext) Error(ctx context.Context, code int, message string, data
 		Data:    raw,
 	})
 	if err == nil {
-		fc.terminate()
+		fc.cancel()
 	}
 	return err
 }
@@ -204,7 +205,7 @@ type AsyncFlowProfile struct {
 	peer     PeerContext
 
 	mu    sync.RWMutex
-	flows map[string]*FlowContext // keyed by flow ID
+	flows map[flowKey]*FlowContext // keyed by the dispatching peer and the flow ID
 
 	// children holds the sub-flows this profile started (RequestSubFlow),
 	// keyed by child flow ID, and childSeq orders them.
@@ -212,12 +213,47 @@ type AsyncFlowProfile struct {
 	childSeq uint64
 }
 
+// flowKey identifies a flow of a profile shared by several peers (an HTTP+SSE
+// server gives each session its own Peer): the same flow_id on two peers is two
+// flows.
+type flowKey struct {
+	peer any
+	id   string
+}
+
+// peerCtxKey carries the dispatching Peer in the context of a flow message.
+type peerCtxKey struct{}
+
+// contextWithPeer returns ctx carrying the Peer that is dispatching.
+func contextWithPeer(ctx context.Context, p PeerContext) context.Context {
+	return context.WithValue(ctx, peerCtxKey{}, p)
+}
+
+// peerFor is the peer a flow message was dispatched on: the one in ctx, else
+// the peer the profile was last initialised with.
+func (p *AsyncFlowProfile) peerFor(ctx context.Context) PeerContext {
+	if pc, ok := ctx.Value(peerCtxKey{}).(PeerContext); ok {
+		return pc
+	}
+	return p.peer
+}
+
+// keyFor is the map key of flow id on the peer ctx names. A peer that is not a
+// comparable value cannot be told apart and shares the nil key.
+func (p *AsyncFlowProfile) keyFor(ctx context.Context, id string) flowKey {
+	pc := p.peerFor(ctx)
+	if pc != nil && reflect.TypeOf(pc).Comparable() {
+		return flowKey{peer: pc, id: id}
+	}
+	return flowKey{id: id}
+}
+
 // NewAsyncFlowProfile creates a profile that manages async flow goroutines.
 func NewAsyncFlowProfile(name string) *AsyncFlowProfile {
 	return &AsyncFlowProfile{
 		name:     name,
 		handlers: make(map[string]FlowFunc),
-		flows:    make(map[string]*FlowContext),
+		flows:    make(map[flowKey]*FlowContext),
 		children: make(map[string]*subFlow),
 	}
 }
@@ -258,7 +294,12 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	if sess := SessionFromContext(ctx); sess != nil {
 		sessionID = sess.ID
 	}
-	fc := newSessionFlowContext(params.FlowID, params.FlowType, params.Params, p.peer, sessionID)
+	// The peer the start was dispatched on, which a profile shared by several
+	// peers cannot take from its own field: the flow's messages, its sub-flow
+	// claims and its lifetime are that peer's.
+	peer := p.peerFor(ctx)
+	key := p.keyFor(ctx, params.FlowID)
+	fc := newSessionFlowContext(params.FlowID, params.FlowType, params.Params, peer, sessionID)
 	fc.profile = p
 
 	// The flow outlives the request that started it. ctx is the request's
@@ -271,12 +312,13 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	fc.stop = stop
 	// ...but not the peer: closing the Peer, or the end of Serve, ends it.
 	unlink := func() bool { return true }
-	if lt, ok := p.peer.(interface{ Lifetime() context.Context }); ok {
-		unlink = context.AfterFunc(lt.Lifetime(), stop)
+	if lt, ok := peer.(interface{ Lifetime() context.Context }); ok {
+		// The whole flow, sub-flows included, ends with the peer.
+		unlink = context.AfterFunc(lt.Lifetime(), fc.cancel)
 	}
 
 	p.mu.Lock()
-	p.flows[params.FlowID] = fc
+	p.flows[key] = fc
 	p.mu.Unlock()
 
 	// Run the flow handler in a goroutine.
@@ -284,9 +326,15 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 		defer func() {
 			unlink()
 			p.mu.Lock()
-			delete(p.flows, params.FlowID)
+			if p.flows[key] == fc {
+				delete(p.flows, key)
+			}
 			p.mu.Unlock()
 			fc.cancel()
+			// The flow is over: the peer stops routing to it.
+			if router, ok := peer.(FlowRouter); ok {
+				router.ReleaseFlow(params.FlowID, p)
+			}
 		}()
 
 		// A flow that was cancelled (by the remote peer, CancelFlow or the
@@ -304,9 +352,9 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	}, nil
 }
 
-func (p *AsyncFlowProfile) HandleAction(_ context.Context, params *FlowActionParams) (*FlowActionResult, error) {
+func (p *AsyncFlowProfile) HandleAction(ctx context.Context, params *FlowActionParams) (*FlowActionResult, error) {
 	p.mu.RLock()
-	fc, ok := p.flows[params.FlowID]
+	fc, ok := p.flows[p.keyFor(ctx, params.FlowID)]
 	p.mu.RUnlock()
 	if !ok {
 		return nil, NewRPCError(ErrFlowError, map[string]string{
@@ -327,14 +375,15 @@ func (p *AsyncFlowProfile) HandleProgress(_ context.Context, params *FlowProgres
 	// Progress from remote peer — currently no routing needed for server-side flows.
 }
 
-func (p *AsyncFlowProfile) HandleComplete(_ context.Context, params *FlowCompleteParams) {
+func (p *AsyncFlowProfile) HandleComplete(ctx context.Context, params *FlowCompleteParams) {
 	if p.deliverSubFlow(params.FlowID, subFlowOutcome{result: params.Result}) {
 		return
 	}
+	key := p.keyFor(ctx, params.FlowID)
 	p.mu.Lock()
-	fc, ok := p.flows[params.FlowID]
+	fc, ok := p.flows[key]
 	if ok {
-		delete(p.flows, params.FlowID)
+		delete(p.flows, key)
 	}
 	p.mu.Unlock()
 	if ok {
@@ -342,15 +391,16 @@ func (p *AsyncFlowProfile) HandleComplete(_ context.Context, params *FlowComplet
 	}
 }
 
-func (p *AsyncFlowProfile) HandleError(_ context.Context, params *FlowErrorParams) {
+func (p *AsyncFlowProfile) HandleError(ctx context.Context, params *FlowErrorParams) {
 	failure := &SubFlowError{Code: params.Code, Message: params.Message, Data: params.Data}
 	if p.deliverSubFlow(params.FlowID, subFlowOutcome{err: failure}) {
 		return
 	}
+	key := p.keyFor(ctx, params.FlowID)
 	p.mu.Lock()
-	fc, ok := p.flows[params.FlowID]
+	fc, ok := p.flows[key]
 	if ok {
-		delete(p.flows, params.FlowID)
+		delete(p.flows, key)
 	}
 	p.mu.Unlock()
 	if ok {
@@ -360,8 +410,8 @@ func (p *AsyncFlowProfile) HandleError(_ context.Context, params *FlowErrorParam
 
 // HandleCancel implements FlowCanceller: a remote wmp.flow.cancel ends the
 // flow, and with it the sub-flows it is waiting for.
-func (p *AsyncFlowProfile) HandleCancel(_ context.Context, params *FlowCancelParams) bool {
-	return p.cancelFlow(params.FlowID)
+func (p *AsyncFlowProfile) HandleCancel(ctx context.Context, params *FlowCancelParams) bool {
+	return p.cancelFlowKey(p.keyFor(ctx, params.FlowID))
 }
 
 // ActiveFlows returns the number of currently active flows.
@@ -371,15 +421,27 @@ func (p *AsyncFlowProfile) ActiveFlows() int {
 	return len(p.flows)
 }
 
-// CancelFlow cancels a specific flow by ID.
-func (p *AsyncFlowProfile) CancelFlow(flowID string) { p.cancelFlow(flowID) }
+// CancelFlow cancels the flows with the given ID, whichever peer runs them.
+func (p *AsyncFlowProfile) CancelFlow(flowID string) {
+	p.mu.RLock()
+	var keys []flowKey
+	for k := range p.flows {
+		if k.id == flowID {
+			keys = append(keys, k)
+		}
+	}
+	p.mu.RUnlock()
+	for _, k := range keys {
+		p.cancelFlowKey(k)
+	}
+}
 
-// cancelFlow cancels a flow, reporting whether this profile was running it.
-func (p *AsyncFlowProfile) cancelFlow(flowID string) bool {
+// cancelFlowKey cancels one flow, reporting whether this profile was running it.
+func (p *AsyncFlowProfile) cancelFlowKey(key flowKey) bool {
 	p.mu.Lock()
-	fc, ok := p.flows[flowID]
+	fc, ok := p.flows[key]
 	if ok {
-		delete(p.flows, flowID)
+		delete(p.flows, key)
 	}
 	p.mu.Unlock()
 	if ok {

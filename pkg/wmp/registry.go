@@ -136,13 +136,14 @@ func (r *registry) restartable(flowID string, h FlowHandler) bool {
 }
 
 // beginStart reserves flowID for a wmp.flow.start about to run a handler. It
-// fails when the flow_id is claimed (ClaimFlow) or another start of it is in
-// progress, so a claim made while the handler runs cannot be overwritten by
-// the start's trackFlow. endStart releases the reservation.
+// fails when the flow_id is already owned (a claim, or a flow still running)
+// or another start of it is in progress: a start never replaces a live flow
+// or its session binding, and a claim made while the handler runs cannot be
+// overwritten by the start's trackFlow. endStart releases the reservation.
 func (r *registry) beginStart(flowID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, claimed := r.claimed[flowID]; claimed {
+	if _, owned := r.flowOwners[flowID]; owned {
 		return false
 	}
 	if _, busy := r.starting[flowID]; busy {
@@ -177,11 +178,12 @@ func (r *registry) claimFlow(flowID, sessionID string, h FlowHandler) bool {
 	return true
 }
 
-// releaseFlow ends a claim, but only for the handler that made it.
+// releaseFlow ends the routing of flowID (a claim, or a tracked flow), but only
+// for the handler that owns it.
 func (r *registry) releaseFlow(flowID string, h FlowHandler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, claimed := r.claimed[flowID]; claimed && r.flowOwners[flowID] == h {
+	if owner, ok := r.flowOwners[flowID]; ok && owner == h {
 		delete(r.flowOwners, flowID)
 		delete(r.flowSessions, flowID)
 		delete(r.claimed, flowID)

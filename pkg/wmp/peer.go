@@ -209,6 +209,9 @@ func (p *Peer) ResolveIdentifier(ctx context.Context, identifier string) (*Disco
 // It blocks until the context is cancelled or the transport is closed.
 func (p *Peer) Serve(ctx context.Context) error {
 	defer p.endLife()
+	// A transport whose ReadMessage ignores its context (an idle WebSocket)
+	// does not return when ctx ends; the flows still must.
+	defer context.AfterFunc(ctx, p.endLife)()
 	for {
 		data, err := p.transport.ReadMessage(ctx)
 		if err != nil {
@@ -367,6 +370,9 @@ func (p *Peer) handleRequest(ctx context.Context, req *Request) {
 }
 
 func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
+	// Profiles shared by several peers learn from the context which peer a
+	// flow message arrived on.
+	ctx = contextWithPeer(ctx, p)
 	switch method {
 	case MethodSessionCreate:
 		var ps SessionCreateParams
