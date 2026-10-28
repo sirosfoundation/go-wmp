@@ -81,9 +81,6 @@ type build struct {
 	// cancelled is set (under ServerHandler.mu) when the session was deleted
 	// while it was being built: the result must not be published.
 	cancelled bool
-	// retiring marks the placeholder of a session being shut down (as opposed
-	// to one being built).
-	retiring bool
 }
 
 // NewSecuredServerHandler returns the production server handler: every
@@ -480,6 +477,14 @@ func (h *ServerHandler) liveSession(ctx context.Context, p wmp.Principal, id str
 	}
 }
 
+// discard shuts an unpublished session down and waits for its broadcaster: a
+// profile's Init may already have queued notifications, and nothing may be
+// appended to the log once the build's placeholder is released.
+func discard(s *serverSession) {
+	s.close()
+	<-s.stopped
+}
+
 // tracker returns the flow tracker of session id, creating it.
 func (h *ServerHandler) tracker(id string) *flowTracker {
 	h.mu.Lock()
@@ -526,11 +531,11 @@ func (h *ServerHandler) finishBuild(ctx context.Context, p wmp.Principal, id str
 	switch {
 	case h.secured.closed:
 		h.mu.Unlock()
-		built.close()
+		discard(built)
 		return nil, lookupClosing
 	case b.cancelled || !stored || !rec.OwnedBy(p.Key()):
 		h.mu.Unlock()
-		built.close()
+		discard(built)
 		return nil, wmp.ErrSessionNotFound
 	}
 	published = true
@@ -631,12 +636,13 @@ func (h *ServerHandler) forget(id string) {
 	}
 	h.mu.Unlock()
 	h.Drop(id) // waits for the broadcaster: nothing appends after the log is dropped
-	// A retirement already under way (Drop from another caller) is waited for
-	// too: its broadcaster may still be appending.
+	// A retirement under way (Drop from another caller) and a build that is
+	// being discarded are waited for too: their broadcaster may still be
+	// appending.
 	for {
 		h.mu.Lock()
 		b := h.secured.building[id]
-		if b == nil || !b.retiring {
+		if b == nil {
 			delete(h.trackers, id)
 			h.mu.Unlock()
 			break
@@ -670,7 +676,7 @@ func (h *ServerHandler) detachLocked(id string) (*serverSession, *build) {
 	if h.secured == nil {
 		return sess, nil
 	}
-	b := &build{done: make(chan struct{}), retiring: true}
+	b := &build{done: make(chan struct{})}
 	h.secured.building[id] = b
 	return sess, b
 }

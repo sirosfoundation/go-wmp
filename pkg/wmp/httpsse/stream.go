@@ -264,9 +264,10 @@ type flowTracker struct {
 }
 
 type flowEntry struct {
-	progress []byte
-	terminal []byte
-	over     bool
+	progress  []byte
+	terminal  []byte
+	over      bool // its terminal notification was observed
+	cancelled bool // an inbound cancel ended it; a terminal notification may still follow
 }
 
 func newFlowTracker(limit int, logger *slog.Logger) *flowTracker {
@@ -283,10 +284,16 @@ func (t *flowTracker) end(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e := t.flows[id]
-	if e == nil || e.over {
+	if e == nil || e.over || e.cancelled {
 		return
 	}
-	t.finishLocked(id, e, nil)
+	// Ended, but the flow's own terminal notification may still follow and is
+	// then kept (observe); progress no longer is.
+	e.cancelled = true
+	e.progress = nil
+	t.active = removeString(t.active, id)
+	t.ended = append(t.ended, id)
+	t.evictLocked()
 }
 
 func (t *flowTracker) finishLocked(id string, e *flowEntry, terminal []byte) {
@@ -295,12 +302,21 @@ func (t *flowTracker) finishLocked(id string, e *flowEntry, terminal []byte) {
 	e.terminal = terminal
 	t.active = removeString(t.active, id)
 	t.ended = append(t.ended, id)
+	t.evictLocked()
+}
+
+// evictLocked forgets the oldest ended flows while more than the limit are held.
+func (t *flowTracker) evictLocked() {
 	for len(t.flows) > t.limit && len(t.ended) > 0 {
-		if t.logger != nil {
-			t.logger.Warn("httpsse: forgetting an ended flow's recovery state (StreamConfig.MaxFlows)", "flow_id", t.ended[0])
-		}
+		t.warn("forgetting an ended flow's recovery state", t.ended[0])
 		delete(t.flows, t.ended[0])
 		t.ended = t.ended[1:]
+	}
+}
+
+func (t *flowTracker) warn(msg, flowID string) {
+	if t.logger != nil {
+		t.logger.Warn("httpsse: "+msg+" (StreamConfig.MaxFlows)", "flow_id", flowID)
 	}
 }
 
@@ -328,6 +344,17 @@ func (t *flowTracker) observe(data, retained []byte) {
 	defer t.mu.Unlock()
 	e := t.flows[id]
 	if e == nil {
+		for len(t.flows) >= t.limit && len(t.ended) > 0 {
+			// Room for the new flow: ended flows go first.
+			t.warn("forgetting an ended flow's recovery state", t.ended[0])
+			delete(t.flows, t.ended[0])
+			t.ended = t.ended[1:]
+		}
+		if len(t.flows) >= t.limit {
+			// Every remembered flow is still active: a new one is not admitted.
+			t.warn("not remembering a new flow, all remembered flows are active", id)
+			return
+		}
 		e = &flowEntry{}
 		t.flows[id] = e
 		t.active = append(t.active, id)
@@ -336,7 +363,15 @@ func (t *flowTracker) observe(data, retained []byte) {
 		return // nothing follows a terminal notification
 	}
 	if env.Method == wmp.MethodFlowProgress {
-		e.progress = retained
+		if !e.cancelled {
+			e.progress = retained
+		}
+		return
+	}
+	if e.cancelled {
+		// Already counted as ended: only keep its terminal notification.
+		e.over = true
+		e.terminal = retained
 		return
 	}
 	t.finishLocked(id, e, retained)
@@ -496,7 +531,15 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 	sess.emitMu.Lock()
 	if cur != "" {
 		evs, found, err := sess.log.After(sess.sid, cur)
-		if err != nil || !found {
+		if err != nil {
+			// The log could not be read: that says nothing about the cursor.
+			// Not a gap (410 would make the client resume); try again.
+			sess.emitMu.Unlock()
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if !found {
 			sess.emitMu.Unlock()
 			// A gap: no part of the replay is delivered and no stream opens.
 			w.WriteHeader(http.StatusGone)

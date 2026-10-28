@@ -1044,3 +1044,132 @@ func TestOutboundCancelRequestDoesNotEndTheFlow(t *testing.T) {
 		t.Fatalf("resendable = %q, want the latest progress only", got)
 	}
 }
+
+// gateStore blocks the nth Get after arm until released.
+type gateStore struct {
+	*wmp.MemorySessionStore
+	mu      sync.Mutex
+	after   int // Gets still to pass before the blocking one; <0: disarmed
+	blocked chan struct{}
+	release chan struct{}
+}
+
+func (g *gateStore) arm(passes int) {
+	g.mu.Lock()
+	g.after = passes
+	g.mu.Unlock()
+}
+
+func (g *gateStore) Get(id string) (*wmp.Session, bool) {
+	g.mu.Lock()
+	block := false
+	if g.after == 0 {
+		block = true
+		g.after = -1
+	} else if g.after > 0 {
+		g.after--
+	}
+	g.mu.Unlock()
+	if block {
+		g.blocked <- struct{}{}
+		<-g.release
+	}
+	return g.MemorySessionStore.Get(id)
+}
+
+// forget waits for the broadcaster of a build that is discarded: a profile's
+// Init may have queued notifications that are being appended right now.
+func TestForgetWaitsForADiscardedBuildsBroadcaster(t *testing.T) {
+	gs := &gateStore{MemorySessionStore: wmp.NewMemorySessionStore(), after: -1, blocked: make(chan struct{}, 1), release: make(chan struct{})}
+	spy := &hookLog{EventLog: NewMemoryEventLog(10, 0), appended: make(chan struct{}, 1), release: make(chan struct{})}
+	svc := wmp.NewSessionService(wmp.SessionServiceConfig{Store: gs})
+	var initNotify atomic.Bool
+	h := NewSecuredServerHandler(ServerConfig{
+		Service: svc, Authenticate: bearerAuth, SweepInterval: -1,
+		Stream: StreamConfig{Log: spy},
+		NewHandler: func(_ context.Context, _ wmp.Principal, id string) (wmp.Handler, []wmp.PeerOption) {
+			var opts []wmp.PeerOption
+			if id != "" && initNotify.Load() {
+				opts = append(opts, wmp.WithProfile(&initNotifier{sid: id}))
+			}
+			return wmp.NewSessionHandler(svc), opts
+		},
+	})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	f := &securedFixture{t: t, store: nil, svc: svc, h: h, ts: ts}
+	id, _ := f.create("Bearer alice")
+	h.Drop(id)
+
+	initNotify.Store(true)
+	spy.arm()
+	gs.arm(1) // lookup's Get passes; finishBuild's recheck blocks
+	reply := f.postAsync("Bearer alice", rpc("1", wmp.MethodMessageDeliver, id, nil))
+	<-spy.appended // the unpublished session's broadcaster is inside Append
+	<-gs.blocked   // the build is about to recheck the store
+
+	done := make(chan struct{})
+	go func() { h.forget(id); close(done) }()
+	time.Sleep(100 * time.Millisecond)
+	close(gs.release)
+	select {
+	case <-done:
+		t.Fatal("forget returned while the discarded build's broadcaster was still appending")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(spy.release)
+	<-done
+	<-reply
+	if _, found, _ := spy.After(id, ""); found {
+		t.Fatal("the log kept events of a forgotten session")
+	}
+}
+
+func TestFlowTrackerBoundsActiveFlowsToo(t *testing.T) {
+	var logged strings.Builder
+	tr := newFlowTracker(2, slog.New(slog.NewTextHandler(&logged, nil)))
+	for _, id := range []string{"a", "b", "c"} {
+		tr.observe([]byte(fmt.Sprintf(`{"method":"wmp.flow.progress","params":{"flow_id":%q}}`, id)), []byte("P-"+id))
+	}
+	if got := tr.resendable(); len(got) != 2 {
+		t.Fatalf("remembered %d active flows with a limit of 2", len(got))
+	}
+	if !strings.Contains(logged.String(), "flow_id=c") {
+		t.Fatalf("the refusal was not reported: %q", logged.String())
+	}
+	// An ended flow makes room for a new one.
+	tr.observe([]byte(`{"method":"wmp.flow.error","params":{"flow_id":"a"}}`), []byte("T-a"))
+	tr.observe([]byte(`{"method":"wmp.flow.progress","params":{"flow_id":"d"}}`), []byte("P-d"))
+	got := tr.resendable()
+	if len(got) != 2 || string(got[0]) != "P-b" || string(got[1]) != "P-d" {
+		t.Fatalf("resendable = %q", got)
+	}
+}
+
+func TestTerminalAfterInboundCancelIsKept(t *testing.T) {
+	tr := newFlowTracker(0, nil)
+	tr.observe([]byte(`{"method":"wmp.flow.progress","params":{"flow_id":"f"}}`), []byte("P1"))
+	tr.end("f")
+	tr.observe([]byte(`{"method":"wmp.flow.progress","params":{"flow_id":"f"}}`), []byte("P-late"))
+	tr.observe([]byte(`{"method":"wmp.flow.error","params":{"flow_id":"f"}}`), []byte("TERMINAL"))
+	tr.observe([]byte(`{"method":"wmp.flow.error","params":{"flow_id":"f"}}`), []byte("SECOND"))
+	got := tr.resendable()
+	if len(got) != 1 || string(got[0]) != "TERMINAL" {
+		t.Fatalf("resendable = %q, want the first terminal only", got)
+	}
+}
+
+type errLog struct{ EventLog }
+
+func (errLog) After(string, string) ([]Event, bool, error) {
+	return nil, false, errors.New("backend down")
+}
+
+func TestLogReadErrorIsNotAGap(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) { c.Stream.Log = errLog{NewMemoryEventLog(10, 0)} })
+	sid, _ := f.create("Bearer alice")
+	resp := f.get("Bearer alice", "session_id="+sid, map[string]string{"Last-Event-ID": "x"})
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503 (410 would make the client resume)", resp.StatusCode)
+	}
+}
