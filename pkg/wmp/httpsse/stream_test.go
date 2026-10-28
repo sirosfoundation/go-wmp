@@ -1173,3 +1173,80 @@ func TestLogReadErrorIsNotAGap(t *testing.T) {
 		t.Fatalf("status %d, want 503 (410 would make the client resume)", resp.StatusCode)
 	}
 }
+
+// Notifications accepted before a session is retired are processed, not lost:
+// the log and the flow tracker see them before the retirement completes.
+func TestRetirementDrainsAcceptedNotifications(t *testing.T) {
+	// The broadcaster chooses between "closed" and "message queued" at random
+	// when both are ready, so a missing drain shows up in one run in two.
+	for i := 0; i < 24; i++ {
+		retireWithQueuedNotification(t)
+	}
+}
+
+func retireWithQueuedNotification(t *testing.T) {
+	t.Helper()
+	var spy *hookLog
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		spy = &hookLog{EventLog: NewMemoryEventLog(10, 0), appended: make(chan struct{}, 1), release: make(chan struct{})}
+		c.Stream.Log = spy
+	})
+	sid, _ := f.create("Bearer alice")
+	f.h.mu.RLock()
+	tr := f.h.trackers[sid]
+	f.h.mu.RUnlock()
+	spy.arm()
+	f.emit(sid, progress(sid, "f", "p1"))
+	<-spy.appended // the broadcaster is inside Append
+	f.emit(sid, map[string]any{"method": wmp.MethodFlowError, "params": map[string]any{
+		"wmp": map[string]any{"version": wmp.Version, "session_id": sid}, "flow_id": "f", "code": -31006, "message": "declined"}})
+	done := make(chan struct{})
+	go func() { f.h.Drop(sid); close(done) }()
+	time.Sleep(20 * time.Millisecond)
+	close(spy.release)
+	<-done
+	evs, found, _ := spy.After(sid, "")
+	if !found || len(evs) != 2 {
+		t.Fatalf("the log has %d events (found=%v), want both", len(evs), found)
+	}
+	got := tr.resendable()
+	if len(got) != 1 || !strings.Contains(string(got[0]), wmp.MethodFlowError) {
+		t.Fatalf("the tracker missed the queued terminal notification: %q", got)
+	}
+}
+
+func TestCancelBeforeAnyNotificationSuppressesLateProgress(t *testing.T) {
+	tr := newFlowTracker(0, nil)
+	tr.end("f")
+	tr.observe([]byte(`{"method":"wmp.flow.progress","params":{"flow_id":"f"}}`), []byte("P-late"))
+	if got := tr.resendable(); len(got) != 0 {
+		t.Fatalf("late progress of a cancelled flow is re-sent: %q", got)
+	}
+	tr.observe([]byte(`{"method":"wmp.flow.error","params":{"flow_id":"f"}}`), []byte("TERMINAL"))
+	if got := tr.resendable(); len(got) != 1 || string(got[0]) != "TERMINAL" {
+		t.Fatalf("resendable = %q", got)
+	}
+}
+
+func TestDeadlineGuardKeepsTheAbortDeadline(t *testing.T) {
+	var calls []time.Time
+	g := &deadlineGuard{set: func(d time.Time) error { calls = append(calls, d); return nil }}
+	if !g.arm(time.Now().Add(time.Hour)) {
+		t.Fatal("arm before kill")
+	}
+	g.kill()
+	n := len(calls)
+	if g.arm(time.Now().Add(time.Hour)) {
+		t.Fatal("arm after kill must refuse: it would extend the aborted write")
+	}
+	g.clear()
+	if len(calls) != n {
+		t.Fatalf("the deadline was changed after kill: %v", calls[n:])
+	}
+	if time.Since(calls[n-1]) > time.Minute || calls[n-1].After(time.Now()) {
+		t.Fatalf("the abort deadline is %v, want now", calls[n-1])
+	}
+	if !g.isKilled() {
+		t.Fatal("isKilled")
+	}
+}

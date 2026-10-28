@@ -484,6 +484,7 @@ func (s *serverSession) broadcastLoop() {
 		var msg outMsg
 		select {
 		case <-s.done:
+			s.drain()
 			return
 		case msg = <-s.outgoing:
 		}
@@ -511,6 +512,23 @@ func (s *serverSession) broadcastLoop() {
 			}
 		}
 		s.clientsMu.Unlock()
+	}
+}
+
+// drain processes the messages already accepted into the queue when the
+// session was closed (writes after that fail): a secured session must not lose
+// a notification it accepted, or the log and the flow tracker would miss it.
+func (s *serverSession) drain() {
+	if s.log == nil {
+		return
+	}
+	for {
+		select {
+		case msg := <-s.outgoing:
+			s.handle(msg)
+		default:
+			return
+		}
 	}
 }
 

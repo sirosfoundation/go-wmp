@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
@@ -284,14 +283,22 @@ func (t *flowTracker) end(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e := t.flows[id]
-	if e == nil || e.over || e.cancelled {
+	if e == nil {
+		// Cancelled before it sent anything: remember that, so that what the
+		// still-unwinding flow sends afterwards is not taken for a running flow.
+		if e = t.admitLocked(id); e == nil {
+			return
+		}
+		t.active = removeString(t.active, id) // admitLocked lists it as active
+	} else if e.over || e.cancelled {
 		return
+	} else {
+		t.active = removeString(t.active, id)
 	}
 	// Ended, but the flow's own terminal notification may still follow and is
 	// then kept (observe); progress no longer is.
 	e.cancelled = true
 	e.progress = nil
-	t.active = removeString(t.active, id)
 	t.ended = append(t.ended, id)
 	t.evictLocked()
 }
@@ -312,6 +319,25 @@ func (t *flowTracker) evictLocked() {
 		delete(t.flows, t.ended[0])
 		t.ended = t.ended[1:]
 	}
+}
+
+// admitLocked adds an active entry for a new flow, making room by forgetting
+// the oldest ended flows first. It returns nil when every remembered flow is
+// still active: the new flow is then not remembered.
+func (t *flowTracker) admitLocked(id string) *flowEntry {
+	for len(t.flows) >= t.limit && len(t.ended) > 0 {
+		t.warn("forgetting an ended flow's recovery state", t.ended[0])
+		delete(t.flows, t.ended[0])
+		t.ended = t.ended[1:]
+	}
+	if len(t.flows) >= t.limit {
+		t.warn("not remembering a new flow, all remembered flows are active", id)
+		return nil
+	}
+	e := &flowEntry{}
+	t.flows[id] = e
+	t.active = append(t.active, id)
+	return e
 }
 
 func (t *flowTracker) warn(msg, flowID string) {
@@ -344,20 +370,9 @@ func (t *flowTracker) observe(data, retained []byte) {
 	defer t.mu.Unlock()
 	e := t.flows[id]
 	if e == nil {
-		for len(t.flows) >= t.limit && len(t.ended) > 0 {
-			// Room for the new flow: ended flows go first.
-			t.warn("forgetting an ended flow's recovery state", t.ended[0])
-			delete(t.flows, t.ended[0])
-			t.ended = t.ended[1:]
-		}
-		if len(t.flows) >= t.limit {
-			// Every remembered flow is still active: a new one is not admitted.
-			t.warn("not remembering a new flow, all remembered flows are active", id)
+		if e = t.admitLocked(id); e == nil {
 			return
 		}
-		e = &flowEntry{}
-		t.flows[id] = e
-		t.active = append(t.active, id)
 	}
 	if e.over {
 		return // nothing follows a terminal notification
@@ -549,11 +564,8 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 	}
 	// Registered with its abort hook in one step: the emitter may give up on
 	// the stream the moment it is registered.
-	var killed atomic.Bool
-	ch := sess.registerClient(cfg.ClientBuffer, func() {
-		killed.Store(true)
-		_ = rc.SetWriteDeadline(time.Now())
-	})
+	guard := &deadlineGuard{set: rc.SetWriteDeadline}
+	ch := sess.registerClient(cfg.ClientBuffer, guard.kill)
 	sess.emitMu.Unlock()
 	if ch == nil {
 		http.Error(w, "session closed", http.StatusNotFound)
@@ -567,10 +579,8 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 	w.Header().Set("Connection", "keep-alive")
 
 	write := func(s string) bool {
-		if cfg.WriteTimeout > 0 {
-			if err := rc.SetWriteDeadline(time.Now().Add(cfg.WriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
-				return false
-			}
+		if cfg.WriteTimeout > 0 && !guard.arm(time.Now().Add(cfg.WriteTimeout)) {
+			return false
 		}
 		if _, err := fmt.Fprint(w, s); err != nil {
 			return false
@@ -582,8 +592,7 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 			flusher.Flush()
 		}
 		if cfg.WriteTimeout > 0 {
-			// The deadline bounds the write, not the idle time after it.
-			_ = rc.SetWriteDeadline(time.Time{})
+			guard.clear() // the deadline bounds the write, not the idle time after it
 		}
 		return true
 	}
@@ -592,7 +601,7 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 		return
 	}
 	for _, ev := range replay {
-		if killed.Load() {
+		if guard.isKilled() {
 			return
 		}
 		if ev.Data == nil {
@@ -613,7 +622,7 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 	for {
 		select {
 		case ev, open := <-ch:
-			if !open || killed.Load() {
+			if !open || guard.isKilled() {
 				return
 			}
 			if !write(formatEvent(ev.ID, ev.Data)) {
@@ -630,6 +639,50 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 			return
 		}
 	}
+}
+
+// deadlineGuard serialises the write deadline of a stream with its abort: once
+// killed, the deadline stays at "now" and no later arm or clear can move it.
+type deadlineGuard struct {
+	mu     sync.Mutex
+	killed bool
+	set    func(time.Time) error
+}
+
+// arm sets the deadline for the next write. It returns false when the stream
+// was killed or the deadline cannot be set (a connection that does not support
+// deadlines is not an error).
+func (g *deadlineGuard) arm(d time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.killed {
+		return false
+	}
+	err := g.set(d)
+	return err == nil || errors.Is(err, http.ErrNotSupported)
+}
+
+// clear removes the deadline unless the stream was killed.
+func (g *deadlineGuard) clear() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.killed {
+		_ = g.set(time.Time{})
+	}
+}
+
+// kill aborts the stream: a write in progress fails at once.
+func (g *deadlineGuard) kill() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.killed = true
+	_ = g.set(time.Now())
+}
+
+func (g *deadlineGuard) isKilled() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.killed
 }
 
 func formatEvent(id string, data []byte) string {
