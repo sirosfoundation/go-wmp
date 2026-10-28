@@ -538,7 +538,7 @@ func TestLegacyHandlerIsNotSecured(t *testing.T) {
 // A client that connects and disconnects while events are broadcast must not
 // make the broadcast loop send on a closed channel.
 func TestBroadcastWhileClientsComeAndGo(t *testing.T) {
-	sess := newServerSession(wmp.BaseHandler{}, nil, 0)
+	sess := newServerSession(wmp.BaseHandler{}, nil, 0, nil)
 	defer sess.close()
 	var stop atomic.Bool
 	var wg sync.WaitGroup
@@ -547,7 +547,7 @@ func TestBroadcastWhileClientsComeAndGo(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for !stop.Load() {
-				ch := sess.registerClient(64)
+				ch := sess.registerClient(64, nil)
 				if ch != nil {
 					sess.unregisterClient(ch)
 				}
@@ -562,7 +562,7 @@ func TestBroadcastWhileClientsComeAndGo(t *testing.T) {
 }
 
 func TestSessionCloseUnblocksWriters(t *testing.T) {
-	sess := newServerSession(wmp.BaseHandler{}, nil, 0)
+	sess := newServerSession(wmp.BaseHandler{}, nil, 0, nil)
 	tr := newServerTransport(sess)
 	sess.close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -579,7 +579,7 @@ func TestSessionCloseUnblocksWriters(t *testing.T) {
 }
 
 func TestPeerNotifyOnClosedSessionFails(t *testing.T) {
-	sess := newServerSession(wmp.BaseHandler{}, nil, 0)
+	sess := newServerSession(wmp.BaseHandler{}, nil, 0, nil)
 	sess.close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -830,7 +830,7 @@ func TestSecuredLookupWhileClosingIsNotAnError(t *testing.T) {
 }
 
 func TestFirstWriteAfterCloseFails(t *testing.T) {
-	sess := newServerSession(wmp.BaseHandler{}, nil, 0)
+	sess := newServerSession(wmp.BaseHandler{}, nil, 0, nil)
 	tr := newServerTransport(sess)
 	sess.close()
 	// The queue has room and done is closed: a select alone may take either.

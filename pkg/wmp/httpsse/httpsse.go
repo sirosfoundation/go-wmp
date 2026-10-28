@@ -348,6 +348,9 @@ type outMsg struct {
 	// resendFlows is a command, not a message: re-send the flow notifications
 	// a resume needs (see handle).
 	resendFlows bool
+	// endFlow is a command: the named flow was ended by an inbound
+	// wmp.flow.cancel, so a resume must not report it as running.
+	endFlow string
 }
 
 type serverSession struct {
@@ -388,7 +391,11 @@ type serverSession struct {
 	maxEvents int
 }
 
-func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int) *serverSession {
+// newServerSession builds a session and starts its broadcast loop. setup, when
+// given, runs before the peer is created and the loop started, so the fields
+// it sets are in place when the first message (a profile may send one from its
+// Init) is processed.
+func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int, setup func(*serverSession)) *serverSession {
 	if maxEvents <= 0 {
 		maxEvents = 200
 	}
@@ -400,6 +407,9 @@ func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int)
 		maxEvents: maxEvents,
 	}
 	sess.touch()
+	if setup != nil {
+		setup(sess)
+	}
 	// The peer writes outbound messages to the session's outgoing channel.
 	// A dedicated goroutine fans each message out to every attached SSE client
 	// so that multiple listeners on the same session each receive every event.
@@ -438,14 +448,14 @@ func (s *serverSession) close() {
 // registerClient adds a new SSE client and returns its dedicated channel, or
 // nil when the session is closed. The caller must call unregisterClient when
 // the client disconnects.
-func (s *serverSession) registerClient(buffer int) chan serverEvent {
+func (s *serverSession) registerClient(buffer int, kill func()) chan serverEvent {
 	s.clientsMu.Lock()
 	defer s.clientsMu.Unlock()
 	if s.isClosed {
 		return nil
 	}
 	ch := make(chan serverEvent, buffer)
-	s.clients[ch] = nil
+	s.clients[ch] = kill
 	return ch
 }
 
@@ -456,15 +466,6 @@ func (s *serverSession) unregisterClient(ch chan serverEvent) {
 	if _, ok := s.clients[ch]; ok {
 		delete(s.clients, ch)
 		close(ch)
-	}
-}
-
-// setKill sets the function that aborts the stream of client ch.
-func (s *serverSession) setKill(ch chan serverEvent, kill func()) {
-	s.clientsMu.Lock()
-	defer s.clientsMu.Unlock()
-	if _, ok := s.clients[ch]; ok {
-		s.clients[ch] = kill
 	}
 }
 
@@ -605,7 +606,7 @@ func (h *ServerHandler) session(sessionID string) *serverSession {
 	defer h.mu.Unlock()
 	sess, ok := h.sessions[sessionID]
 	if !ok {
-		sess = newServerSession(h.handler, h.peerOptions, 200)
+		sess = newServerSession(h.handler, h.peerOptions, 200, nil)
 		h.sessions[sessionID] = sess
 	}
 	return sess
@@ -729,7 +730,7 @@ func (h *ServerHandler) stream(w http.ResponseWriter, r *http.Request, sess *ser
 	// receive server-sent events. Registering first closes a race where an
 	// event written right after ConnectSSE returns could otherwise be
 	// dropped because the server hadn't finished subscribing this client.
-	clientCh := sess.registerClient(64)
+	clientCh := sess.registerClient(64, nil)
 	if clientCh == nil {
 		http.Error(w, "session closed", http.StatusNotFound)
 		return
@@ -768,7 +769,7 @@ type ServerTransport struct {
 }
 
 func newServerTransport(sess *serverSession) *ServerTransport {
-	client := sess.registerClient(64)
+	client := sess.registerClient(64, nil)
 	if client == nil {
 		// The session is closed: reads report EOF, writes fail.
 		client = make(chan serverEvent)

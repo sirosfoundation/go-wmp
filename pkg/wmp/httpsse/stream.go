@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,7 +24,7 @@ const (
 	defaultWriteTimeout  = 10 * time.Second
 	defaultMaxEventBytes = 4 << 20
 	defaultClientBuffer  = 256
-	maxTrackedFlows      = 1024
+	defaultMaxFlows      = 1024
 	heartbeatComment     = ": keepalive\n\n"
 )
 
@@ -85,6 +86,12 @@ type StreamConfig struct {
 	// session, by count (default 200) and by total data size (default 4 MiB).
 	// Ignored when Log is set.
 	MaxEvents, MaxEventBytes int
+	// MaxFlows bounds how many flows of one session the server remembers for
+	// wmp.session.resume (the latest progress of active flows, the terminal
+	// notification of ended ones). Past it the oldest ended flows are
+	// forgotten, a warning is logged, and a client that missed such a flow's
+	// terminal notification cannot recover it. Default 1024.
+	MaxFlows int
 	// ClientBuffer is how many events may queue for one attached stream
 	// before it counts as too slow and is closed (the client reconnects with
 	// its cursor). Default 256.
@@ -110,6 +117,9 @@ func (c *StreamConfig) applyDefaults() {
 	}
 	if c.MaxEventBytes <= 0 {
 		c.MaxEventBytes = defaultMaxEventBytes
+	}
+	if c.MaxFlows <= 0 {
+		c.MaxFlows = defaultMaxFlows
 	}
 	if c.ClientBuffer <= 0 {
 		c.ClientBuffer = defaultClientBuffer
@@ -246,6 +256,8 @@ func (l *memoryLog) Drop(sessionID string) {
 // (redacted) form.
 type flowTracker struct {
 	mu     sync.Mutex
+	limit  int
+	logger *slog.Logger
 	active []string // flow ids in first-seen order
 	flows  map[string]*flowEntry
 	ended  []string // flow ids in the order they ended
@@ -257,7 +269,40 @@ type flowEntry struct {
 	over     bool
 }
 
-func newFlowTracker() *flowTracker { return &flowTracker{flows: make(map[string]*flowEntry)} }
+func newFlowTracker(limit int, logger *slog.Logger) *flowTracker {
+	if limit <= 0 {
+		limit = defaultMaxFlows
+	}
+	return &flowTracker{limit: limit, logger: logger, flows: make(map[string]*flowEntry)}
+}
+
+// end marks a flow over without a terminal notification to re-send: the flow
+// was ended by the peer (an inbound wmp.flow.cancel), and what remains to
+// recover is only that it must not be reported as still running.
+func (t *flowTracker) end(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e := t.flows[id]
+	if e == nil || e.over {
+		return
+	}
+	t.finishLocked(id, e, nil)
+}
+
+func (t *flowTracker) finishLocked(id string, e *flowEntry, terminal []byte) {
+	e.over = true
+	e.progress = nil
+	e.terminal = terminal
+	t.active = removeString(t.active, id)
+	t.ended = append(t.ended, id)
+	for len(t.flows) > t.limit && len(t.ended) > 0 {
+		if t.logger != nil {
+			t.logger.Warn("httpsse: forgetting an ended flow's recovery state (StreamConfig.MaxFlows)", "flow_id", t.ended[0])
+		}
+		delete(t.flows, t.ended[0])
+		t.ended = t.ended[1:]
+	}
+}
 
 // observe records an outbound flow notification. retained is the copy to keep
 // (nil when it must not be retained).
@@ -292,15 +337,7 @@ func (t *flowTracker) observe(data, retained []byte) {
 		e.progress = retained
 		return
 	}
-	e.over = true
-	e.progress = nil
-	e.terminal = retained
-	t.active = removeString(t.active, id)
-	t.ended = append(t.ended, id)
-	for len(t.flows) > maxTrackedFlows && len(t.ended) > 0 {
-		delete(t.flows, t.ended[0])
-		t.ended = t.ended[1:]
-	}
+	t.finishLocked(id, e, retained)
 }
 
 // resendable returns what a resume re-sends, in order: progress of active
@@ -335,6 +372,10 @@ func removeString(list []string, s string) []string {
 
 // handle processes one item of the outbound queue in order.
 func (s *serverSession) handle(msg outMsg) {
+	if msg.endFlow != "" {
+		s.flows.end(msg.endFlow)
+		return
+	}
 	if msg.resendFlows {
 		// Snapshot here, after everything queued before the resume has been
 		// processed: a completion that is still queued is not overtaken by
@@ -353,13 +394,13 @@ func (s *serverSession) emit(msg outMsg) {
 	live, retain := msg.data, msg.data
 	if !msg.resend {
 		replay, liveCopy, ok := s.filter(msg.data)
-		switch {
-		case !ok || replay == nil:
-			retain = nil // must not be retained; the event still gets an ID
-		case liveCopy != nil:
-			retain, live = replay, liveCopy
-		default:
+		if liveCopy != nil {
+			live = liveCopy // the live transformation holds whether or not anything is retained
+		}
+		if ok && replay != nil {
 			retain = replay
+		} else {
+			retain = nil // must not be retained; the event still gets an ID
 		}
 		s.flows.observe(msg.data, retain)
 	}
@@ -409,6 +450,14 @@ func (s *serverSession) dropClients() {
 	}
 }
 
+// endFlow queues the news that an inbound cancel ended a flow.
+func (s *serverSession) endFlow(id string) {
+	select {
+	case s.outgoing <- outMsg{endFlow: id}:
+	case <-s.done:
+	}
+}
+
 // resend asks the broadcast loop to re-send the flow notifications a resume
 // needs, as new events.
 func (s *serverSession) resend() {
@@ -453,7 +502,13 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 		}
 		replay = evs
 	}
-	ch := sess.registerClient(cfg.ClientBuffer)
+	// Registered with its abort hook in one step: the emitter may give up on
+	// the stream the moment it is registered.
+	var killed atomic.Bool
+	ch := sess.registerClient(cfg.ClientBuffer, func() {
+		killed.Store(true)
+		_ = rc.SetWriteDeadline(time.Now())
+	})
 	sess.emitMu.Unlock()
 	if ch == nil {
 		http.Error(w, "session closed", http.StatusNotFound)
@@ -461,7 +516,6 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 	}
 	defer sess.unregisterClient(ch)
 	sess.touch()
-	var killed atomic.Bool
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -488,16 +542,14 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 		}
 		return true
 	}
-	// Aborts the stream when the emitter gives up on it: a write blocked on a
-	// client that does not read fails at once instead of at its deadline.
-	sess.setKill(ch, func() {
-		killed.Store(true)
-		_ = rc.SetWriteDeadline(time.Now())
-	})
+
 	if !write("") { // headers
 		return
 	}
 	for _, ev := range replay {
+		if killed.Load() {
+			return
+		}
 		if ev.Data == nil {
 			continue // withheld: nothing to replay
 		}

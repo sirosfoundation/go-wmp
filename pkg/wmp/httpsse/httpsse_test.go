@@ -65,7 +65,7 @@ func TestClientOptions(t *testing.T) {
 }
 
 func TestEventBufferAndReplay(t *testing.T) {
-	sess := newServerSession(nil, nil, 5)
+	sess := newServerSession(nil, nil, 5, nil)
 
 	// Buffer some events.
 	id1 := sess.bufferEvent([]byte(`{"msg":1}`))
@@ -99,7 +99,7 @@ func TestEventBufferAndReplay(t *testing.T) {
 }
 
 func TestEventBufferEviction(t *testing.T) {
-	sess := newServerSession(nil, nil, 3)
+	sess := newServerSession(nil, nil, 3, nil)
 
 	sess.bufferEvent([]byte(`1`))
 	sess.bufferEvent([]byte(`2`))
@@ -185,7 +185,7 @@ func TestSSELastEventIDReplay(t *testing.T) {
 	handler := NewServerHandler(nil)
 
 	// Pre-populate some buffered events.
-	sess := newServerSession(nil, nil, 200)
+	sess := newServerSession(nil, nil, 200, nil)
 	sess.bufferEvent([]byte(`{"n":1}`))
 	sess.bufferEvent([]byte(`{"n":2}`))
 	sess.bufferEvent([]byte(`{"n":3}`))

@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -862,5 +864,170 @@ func TestResumeSnapshotFollowsQueuedNotifications(t *testing.T) {
 	}
 	if !strings.Contains(string(evs[2].Data), wmp.MethodFlowError) {
 		t.Fatalf("the re-send after the terminal notification is %s", evs[2].Data)
+	}
+}
+
+// initNotifier sends a notification from Init, before the session is returned.
+type initNotifier struct {
+	wmp.BaseHandler
+	sid string
+}
+
+func (p *initNotifier) Name() string           { return "init-notifier" }
+func (p *initNotifier) Capabilities() []string { return nil }
+func (p *initNotifier) Init(ctx wmp.PeerContext) error {
+	return ctx.Notify(context.Background(), wmp.MethodFlowProgress, map[string]any{
+		"wmp": map[string]any{"version": wmp.Version, "session_id": p.sid}, "flow_id": "f", "step": "from-init"})
+}
+
+// A message sent while the peer is being set up is processed with the
+// session's log, filter and flow tracker in place.
+func TestMessageFromProfileInitIsLoggedAndTracked(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		f := newSecuredFixture(t, func(c *ServerConfig) {
+			inner := c.NewHandler
+			c.NewHandler = func(ctx context.Context, p wmp.Principal, id string) (wmp.Handler, []wmp.PeerOption) {
+				h, opts := inner(ctx, p, id)
+				if id != "" {
+					opts = append(opts, wmp.WithProfile(&initNotifier{sid: id}))
+				}
+				return h, opts
+			}
+		})
+		sid, _ := f.create("Bearer alice")
+		f.waitLogged(sid, 1)
+		f.h.mu.RLock()
+		tr := f.h.trackers[sid]
+		f.h.mu.RUnlock()
+		deadline := time.Now().Add(2 * time.Second)
+		for len(tr.resendable()) == 0 && time.Now().Before(deadline) {
+			time.Sleep(2 * time.Millisecond)
+		}
+		if len(tr.resendable()) != 1 {
+			t.Fatalf("iteration %d: the message from Init was not tracked", i)
+		}
+	}
+}
+
+func TestLiveCopyIsSentEvenWhenNothingIsRetained(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		c.Stream.ReplayFilter = func(d []byte) ([]byte, []byte, bool) {
+			return nil, []byte(strings.ReplaceAll(string(d), "s1", "LIVE")), false
+		}
+	})
+	sid, _ := f.create("Bearer alice")
+	c, _ := f.open(sid, nil, "")
+	f.emit(sid, progress(sid, "f", "s1"))
+	ev := c.waitEvents(t, 1)[0]
+	if !strings.Contains(string(ev.Data), "LIVE") {
+		t.Fatalf("the live copy was not applied: %s", ev.Data)
+	}
+	evs, _, _ := f.h.secured.cfg.Stream.Log.After(sid, "")
+	if len(evs) != 1 || evs[0].Data != nil {
+		t.Fatalf("something was retained: %v", evs)
+	}
+}
+
+// The abort hook is installed with the registration: an overflow right after
+// it still reaches the hook.
+func TestAbortHookIsInstalledAtomicallyWithRegistration(t *testing.T) {
+	f := newSecuredFixture(t, nil)
+	sid, _ := f.create("Bearer alice")
+	f.h.mu.RLock()
+	sess := f.h.sessions[sid]
+	f.h.mu.RUnlock()
+	var kills atomic.Int32
+	sess.emitMu.Lock()
+	ch := sess.registerClient(1, func() { kills.Add(1) })
+	sess.emitMu.Unlock()
+	if ch == nil {
+		t.Fatal("not registered")
+	}
+	for i := 0; i < 3; i++ {
+		f.emit(sid, progress(sid, "f", "x"))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for kills.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if kills.Load() != 1 {
+		t.Fatalf("hook ran %d times, want once", kills.Load())
+	}
+}
+
+// Two callers retiring the same session: the second one also waits for the
+// broadcaster, so nothing is appended after the log was dropped.
+func TestConcurrentForgetWaitsForRetirementInProgress(t *testing.T) {
+	var spy *hookLog
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		spy = &hookLog{EventLog: NewMemoryEventLog(10, 0), appended: make(chan struct{}, 1), release: make(chan struct{})}
+		c.Stream.Log = spy
+	})
+	sid, _ := f.create("Bearer alice")
+	spy.arm()
+	f.emit(sid, progress(sid, "f", "s1"))
+	<-spy.appended
+	go f.h.Drop(sid)
+	time.Sleep(100 * time.Millisecond) // Drop is waiting for the broadcaster
+	done := make(chan struct{})
+	go func() { f.h.forget(sid); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("forget returned while another retirement was still waiting for the broadcaster")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(spy.release)
+	<-done
+	if _, found, _ := spy.After(sid, ""); found {
+		t.Fatal("the log kept events of a forgotten session")
+	}
+}
+
+type cancelHandler struct{ wmp.SessionHandler }
+
+func (cancelHandler) FlowCancel(context.Context, *wmp.FlowCancelParams) (*wmp.FlowCancelResult, error) {
+	return &wmp.FlowCancelResult{}, nil
+}
+
+// A flow the client cancelled is not reported as running by a later resume.
+func TestInboundCancelEndsTheFlowForResume(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		c.NewHandler = func(context.Context, wmp.Principal, string) (wmp.Handler, []wmp.PeerOption) {
+			return cancelHandler{wmp.NewSessionHandler(c.Service)}, nil
+		}
+	})
+	sid, token := f.create("Bearer alice")
+	f.emit(sid, progress(sid, "f", "running"))
+	f.waitLogged(sid, 1)
+	r := f.post("Bearer alice", nil, rpc("c1", wmp.MethodFlowCancel, sid, map[string]any{"flow_id": "f"}))
+	if rpcCode(r) != 0 {
+		t.Fatalf("cancel: %s", r.Raw)
+	}
+	c, _ := f.open(sid, nil, "")
+	if r := f.post("Bearer alice", nil, rpc("r1", wmp.MethodSessionResume, sid, map[string]any{"session_id": sid, "resumption_token": token})); rpcCode(r) != 0 {
+		t.Fatalf("resume: %s", r.Raw)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := c.steps(t); len(got) != 0 {
+		t.Fatalf("resume re-sent %v for a cancelled flow", got)
+	}
+}
+
+func TestFlowTrackerOverflowIsExplicit(t *testing.T) {
+	var logged strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logged, nil))
+	tr := newFlowTracker(2, logger)
+	for _, id := range []string{"a", "b", "c"} {
+		tr.observe([]byte(fmt.Sprintf(`{"method":%q,"params":{"flow_id":%q}}`, wmp.MethodFlowError, id)), []byte("T-"+id))
+	}
+	got := tr.resendable()
+	if len(got) != 2 || string(got[0]) != "T-b" || string(got[1]) != "T-c" {
+		t.Fatalf("resendable = %q", got)
+	}
+	if !strings.Contains(logged.String(), "MaxFlows") || !strings.Contains(logged.String(), "flow_id=a") {
+		t.Fatalf("the eviction was not reported: %q", logged.String())
+	}
+	if newFlowTracker(0, nil).limit != defaultMaxFlows {
+		t.Fatal("default limit")
 	}
 }
