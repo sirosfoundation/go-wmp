@@ -67,8 +67,14 @@ type securedState struct {
 	stop     chan struct{}
 	sweepWG  sync.WaitGroup
 	inflight sync.WaitGroup
-	closed   bool // guarded by ServerHandler.mu
+	closed   bool              // guarded by ServerHandler.mu
+	drained  chan struct{}     // closed when Close's drain finished; set by the first Close
+	building map[string]*build // sessions being built, guarded by ServerHandler.mu
 }
+
+// build is a session under construction: concurrent requests for the same ID
+// wait for it instead of each calling NewHandler.
+type build struct{ done chan struct{} }
 
 // NewSecuredServerHandler returns the production server handler: every
 // request is authenticated, sessions are created by cfg.Service with
@@ -97,7 +103,7 @@ func NewSecuredServerHandler(cfg ServerConfig) *ServerHandler {
 	}
 	h := &ServerHandler{
 		sessions: make(map[string]*serverSession),
-		secured:  &securedState{cfg: cfg, store: cfg.Service.Store(), stop: make(chan struct{})},
+		secured:  &securedState{cfg: cfg, store: cfg.Service.Store(), stop: make(chan struct{}), building: make(map[string]*build)},
 	}
 	if cfg.SweepInterval > 0 {
 		h.secured.sweepWG.Add(1)
@@ -229,10 +235,23 @@ func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wm
 
 	sess, code := h.lookup(ctx, p, id, env.Method == wmp.MethodSessionResume)
 	if sess == nil {
+		if code == lookupClosing {
+			http.Error(w, "server closing", http.StatusServiceUnavailable)
+			return
+		}
 		writeRPCError(w, env.ID, code, nil)
 		return
 	}
-	sess.touch()
+	defer sess.release()
+
+	// The peer and the session service read the session from the wmp metadata:
+	// a request that named it only in the header gets it filled in.
+	if env.Params.WMP.SessionID == "" {
+		body = withSessionID(body, id)
+	}
+
+	ctx, cancel := h.dispatchContext(ctx, sess.done)
+	defer cancel()
 
 	resp, err := sess.peer.HandleRequestSync(ctx, body)
 	if err != nil {
@@ -249,6 +268,59 @@ func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wm
 	writeResponse(w, resp)
 }
 
+// dispatchContext returns ctx cancelled when done is closed or the handler is
+// closing. Ending a session or closing the server cancels a dispatch that is
+// waiting, for example for the client's response to a call: Peer.Close alone
+// does not unblock it.
+func (h *ServerHandler) dispatchContext(ctx context.Context, done <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-done:
+			cancel()
+		case <-h.secured.stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+// withSessionID returns body with params.wmp.session_id set to id, or body
+// unchanged when it cannot be (params absent or not an object).
+func withSessionID(body []byte, id string) []byte {
+	var top map[string]json.RawMessage
+	if json.Unmarshal(body, &top) != nil {
+		return body
+	}
+	var params map[string]json.RawMessage
+	if json.Unmarshal(top["params"], &params) != nil || params == nil {
+		return body
+	}
+	var meta map[string]json.RawMessage
+	if raw, ok := params["wmp"]; ok {
+		if json.Unmarshal(raw, &meta) != nil || meta == nil {
+			return body
+		}
+	} else {
+		meta = map[string]json.RawMessage{}
+	}
+	idJSON, _ := json.Marshal(id)
+	meta["session_id"] = idJSON
+	var err error
+	if params["wmp"], err = json.Marshal(meta); err != nil {
+		return body
+	}
+	if top["params"], err = json.Marshal(params); err != nil {
+		return body
+	}
+	out, err := json.Marshal(top)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // createSession dispatches wmp.session.create on a throw-away peer (the ID is
 // not known until the service has assigned it) and, when it succeeded, builds
 // the session's long-lived peer under the assigned ID.
@@ -256,7 +328,9 @@ func (h *ServerHandler) createSession(ctx context.Context, w http.ResponseWriter
 	hctx := context.WithoutCancel(ctx)
 	handler, opts := h.secured.cfg.NewHandler(hctx, p, "")
 	tmp := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.MaxEvents)
-	resp, err := tmp.peer.HandleRequestSync(ctx, body)
+	dctx, cancel := h.dispatchContext(ctx, tmp.done)
+	resp, err := tmp.peer.HandleRequestSync(dctx, body)
+	cancel()
 	tmp.close()
 	if err != nil {
 		http.Error(w, "dispatch error", http.StatusInternalServerError)
@@ -270,18 +344,25 @@ func (h *ServerHandler) createSession(ctx context.Context, w http.ResponseWriter
 		} `json:"result"`
 	}
 	if json.Unmarshal(resp, &out) == nil && out.Result.WMP.SessionID != "" {
-		if _, code := h.lookup(ctx, p, out.Result.WMP.SessionID, false); code != 0 {
+		sess, code := h.lookup(ctx, p, out.Result.WMP.SessionID, false)
+		if sess != nil {
+			sess.release()
+		} else if code != lookupClosing {
 			h.secured.cfg.Logger.Warn("httpsse: session created but not found in the store", "code", code)
 		}
 	}
 	writeResponse(w, resp)
 }
 
+// lookupClosing is the code lookup returns when the handler is closing.
+const lookupClosing = -1
+
 // lookup returns the live session id for principal p, building it from the
-// store when this process does not hold it. A session that does not exist and
-// one owned by someone else give the same answer, -31000. An expired session
-// is -31001 unless allowExpired (resume, whose expiry the service handles).
-// When the result is nil the code is the JSON-RPC error to answer.
+// store when this process does not hold it, with a reference held: the caller
+// must call release. A session that does not exist and one owned by someone
+// else give the same answer, -31000. An expired session is -31001 unless
+// allowExpired (resume, whose expiry the service handles). When the result is
+// nil the code is the JSON-RPC error to answer, or lookupClosing.
 func (h *ServerHandler) lookup(ctx context.Context, p wmp.Principal, id string, allowExpired bool) (*serverSession, int) {
 	rec, ok := h.secured.store.Get(id)
 	if !ok || !rec.OwnedBy(p.Key()) {
@@ -293,38 +374,56 @@ func (h *ServerHandler) lookup(ctx context.Context, p wmp.Principal, id string, 
 	if rec.IsExpired() && !allowExpired {
 		return nil, wmp.ErrSessionExpired
 	}
-	return h.liveSession(ctx, p, id), 0
+	sess := h.liveSession(ctx, p, id)
+	if sess == nil {
+		return nil, lookupClosing
+	}
+	return sess, 0
 }
 
-// liveSession returns the in-memory session id, building it with a fresh
-// Handler and Peer when this process has none (first request after a create,
-// a restart, an idle drop or a request that landed on another replica).
-// It returns nil when the handler is closed.
+// liveSession returns the in-memory session id with a reference held, building
+// it with a fresh Handler and Peer when this process has none (first request
+// after a create, a restart, an idle drop or a request that landed on another
+// replica). Construction is serialised per ID, so NewHandler runs once per
+// session. It returns nil when the handler is closed.
 func (h *ServerHandler) liveSession(ctx context.Context, p wmp.Principal, id string) *serverSession {
-	h.mu.RLock()
-	sess := h.sessions[id]
-	closed := h.secured.closed
-	h.mu.RUnlock()
-	if sess != nil || closed {
-		return sess
-	}
+	for {
+		h.mu.Lock()
+		if h.secured.closed {
+			h.mu.Unlock()
+			return nil
+		}
+		if sess := h.sessions[id]; sess != nil {
+			sess.acquire() // under h.mu: the idle sweep cannot drop it in between
+			h.mu.Unlock()
+			return sess
+		}
+		if b := h.secured.building[id]; b != nil {
+			h.mu.Unlock()
+			<-b.done
+			continue
+		}
+		b := &build{done: make(chan struct{})}
+		h.secured.building[id] = b
+		h.mu.Unlock()
 
-	handler, opts := h.secured.cfg.NewHandler(context.WithoutCancel(ctx), p, id)
-	built := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.MaxEvents)
-	built.owner = p.Key()
+		handler, opts := h.secured.cfg.NewHandler(context.WithoutCancel(ctx), p, id)
+		built := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.MaxEvents)
+		built.owner = p.Key()
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if cur := h.sessions[id]; cur != nil {
-		built.close() // lost the race; use the winner
-		return cur
+		h.mu.Lock()
+		delete(h.secured.building, id)
+		close(b.done)
+		if h.secured.closed {
+			h.mu.Unlock()
+			built.close()
+			return nil
+		}
+		h.sessions[id] = built
+		built.acquire()
+		h.mu.Unlock()
+		return built
 	}
-	if h.secured.closed {
-		built.close()
-		return nil
-	}
-	h.sessions[id] = built
-	return built
 }
 
 // sessionPeerOptions prepends the options the handler itself needs to the session's.
@@ -338,7 +437,11 @@ func (h *ServerHandler) getSecured(w http.ResponseWriter, r *http.Request, p wmp
 		http.Error(w, "missing or conflicting session id", http.StatusBadRequest)
 		return
 	}
-	sess, _ := h.lookup(wmp.ContextWithPrincipal(r.Context(), p), p, id, false)
+	sess, code := h.lookup(wmp.ContextWithPrincipal(r.Context(), p), p, id, false)
+	if code == lookupClosing {
+		http.Error(w, "server closing", http.StatusServiceUnavailable)
+		return
+	}
 	if sess == nil {
 		// Unknown, someone else's and expired sessions are answered alike.
 		w.Header().Set("Content-Type", "application/json")
@@ -346,6 +449,7 @@ func (h *ServerHandler) getSecured(w http.ResponseWriter, r *http.Request, p wmp
 		_ = json.NewEncoder(w).Encode(wmp.NewErrorResponse(nil, wmp.NewRPCError(wmp.ErrSessionNotFound, nil)))
 		return
 	}
+	defer sess.release()
 	h.stream(w, r, sess)
 }
 
@@ -404,27 +508,27 @@ func (h *ServerHandler) Close(ctx context.Context) error {
 		return nil
 	}
 	h.mu.Lock()
-	if st.closed {
-		h.mu.Unlock()
-		return nil
+	if !st.closed {
+		st.closed = true
+		sessions := h.sessions
+		h.sessions = make(map[string]*serverSession)
+		st.drained = make(chan struct{})
+		close(st.stop)
+		go func() {
+			for _, s := range sessions {
+				s.close()
+			}
+			st.sweepWG.Wait()
+			st.inflight.Wait()
+			close(st.drained)
+		}()
 	}
-	st.closed = true
-	sessions := h.sessions
-	h.sessions = make(map[string]*serverSession)
+	drained := st.drained
 	h.mu.Unlock()
 
-	close(st.stop)
-	for _, s := range sessions {
-		s.close()
-	}
-	done := make(chan struct{})
-	go func() {
-		st.sweepWG.Wait()
-		st.inflight.Wait()
-		close(done)
-	}()
+	// Every call, a retry after a timeout included, waits for the drain.
 	select {
-	case <-done:
+	case <-drained:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -474,12 +578,18 @@ func (h *ServerHandler) Sweep(ctx context.Context) {
 		if st.cfg.IdleTimeout <= 0 {
 			continue
 		}
-		h.mu.RLock()
+		// Decided under h.mu, where requests take their reference: a session
+		// with a request or stream in progress is never dropped.
+		h.mu.Lock()
 		sess := h.sessions[id]
-		h.mu.RUnlock()
-		if sess != nil && sess.clientCount() == 0 &&
-			now.Sub(time.Unix(0, sess.lastActive.Load())) > st.cfg.IdleTimeout {
-			h.Drop(id)
+		idle := sess != nil && sess.active.Load() == 0 &&
+			now.Sub(time.Unix(0, sess.lastActive.Load())) > st.cfg.IdleTimeout
+		if idle {
+			delete(h.sessions, id)
+		}
+		h.mu.Unlock()
+		if idle {
+			sess.close()
 		}
 	}
 }

@@ -323,6 +323,8 @@ type serverSession struct {
 	closeOnce sync.Once
 	// lastActive is the unix-nano time of the last request or stream activity.
 	lastActive atomic.Int64
+	// active counts the requests and streams using the session.
+	active atomic.Int32
 
 	// Active SSE clients for this session. Each channel carries the event
 	// ID assigned by the broadcast loop and the raw data.
@@ -355,6 +357,11 @@ func newServerSession(handler wmp.Handler, opts []wmp.PeerOption, maxEvents int)
 	go sess.broadcastLoop()
 	return sess
 }
+
+// acquire takes a reference for a request or stream; release gives it back and
+// restarts the idle interval, so idleness is measured from the last use ending.
+func (s *serverSession) acquire() { s.active.Add(1) }
+func (s *serverSession) release() { s.touch(); s.active.Add(-1) }
 
 // touch records activity for the idle timeout.
 func (s *serverSession) touch() { s.lastActive.Store(time.Now().UnixNano()) }
@@ -533,8 +540,21 @@ func (h *ServerHandler) session(sessionID string) *serverSession {
 // It is retained for backwards compatibility; ServerHandler now uses a
 // per-session Peer internally.
 func (h *ServerHandler) Transport(sessionID string) wmp.Transport {
+	if h.secured != nil {
+		// A transport made here would insert a session with no Handler and
+		// no owner into a secured handler. Sessions of a secured handler are
+		// made through its requests only.
+		return closedTransport{}
+	}
 	return newServerTransport(h.session(sessionID))
 }
+
+// closedTransport is the Transport of a session that cannot be reached.
+type closedTransport struct{}
+
+func (closedTransport) ReadMessage(context.Context) ([]byte, error) { return nil, io.EOF }
+func (closedTransport) WriteMessage(context.Context, []byte) error  { return errSessionClosed }
+func (closedTransport) Close() error                                { return nil }
 
 // ServeHTTP handles both POST (JSON-RPC) and GET (SSE) requests.
 func (h *ServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -641,6 +661,7 @@ func (h *ServerHandler) stream(w http.ResponseWriter, r *http.Request, sess *ser
 	}
 	defer sess.unregisterClient(clientCh)
 	sess.touch()
+	defer sess.touch() // the idle interval starts when the stream ends
 
 	flusher.Flush()
 

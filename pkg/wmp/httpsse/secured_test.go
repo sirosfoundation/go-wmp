@@ -608,3 +608,208 @@ func TestReplayEscapesLineBreaks(t *testing.T) {
 		t.Fatalf("replayed event lines %q", lines)
 	}
 }
+
+// blockingHandler blocks MessageDeliver until released or, if honourCtx, its
+// context ends.
+type blockingHandler struct {
+	wmp.SessionHandler
+	entered chan struct{}
+	release chan struct{}
+	honour  bool
+}
+
+func (b blockingHandler) MessageDeliver(ctx context.Context, _ *wmp.MessageDeliverParams) {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	if b.honour {
+		select {
+		case <-ctx.Done():
+		case <-b.release:
+		}
+		return
+	}
+	<-b.release
+}
+
+func newBlockingFixture(t *testing.T, honour bool, mutate func(*ServerConfig)) (*securedFixture, blockingHandler) {
+	var bh blockingHandler
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		bh = blockingHandler{SessionHandler: wmp.NewSessionHandler(c.Service), entered: make(chan struct{}, 4), release: make(chan struct{}), honour: honour}
+		c.NewHandler = func(context.Context, wmp.Principal, string) (wmp.Handler, []wmp.PeerOption) { return bh, nil }
+		if mutate != nil {
+			mutate(c)
+		}
+	})
+	return f, bh
+}
+
+func (f *securedFixture) postAsync(auth string, body any) <-chan rpcReply {
+	out := make(chan rpcReply, 1)
+	go func() { out <- f.post(auth, nil, body) }()
+	return out
+}
+
+func TestSecuredTransportMethodDoesNotInsertAHandlerlessSession(t *testing.T) {
+	f := newSecuredFixture(t, nil)
+	id, _ := f.create("Bearer alice")
+	tr := f.h.Transport(id)
+	if err := tr.WriteMessage(context.Background(), []byte(`{}`)); err == nil {
+		t.Fatal("Transport on a secured handler must not be usable")
+	}
+	f.h.mu.RLock()
+	sess := f.h.sessions[id]
+	f.h.mu.RUnlock()
+	if sess != nil && sess.peer == nil {
+		t.Fatal("a peer-less session was inserted")
+	}
+	// The next POST rebuilds through the secured path and works.
+	if r := f.post("Bearer alice", nil, rpc("1", wmp.MethodMessageDeliver, id, nil)); rpcCode(r) != 0 {
+		t.Fatalf("%s", r.Raw)
+	}
+}
+
+func TestSecuredConcurrentRebuildCallsNewHandlerOnce(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		inner := c.NewHandler
+		c.NewHandler = func(ctx context.Context, p wmp.Principal, id string) (wmp.Handler, []wmp.PeerOption) {
+			if id != "" {
+				time.Sleep(50 * time.Millisecond) // a slow factory widens the race
+			}
+			return inner(ctx, p, id)
+		}
+	})
+	id, _ := f.create("Bearer alice")
+	f.h.Drop(id)
+	f.mu.Lock()
+	before := len(f.handlers)
+	f.mu.Unlock()
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f.post("Bearer alice", nil, rpc("1", wmp.MethodMessageDeliver, id, nil))
+		}()
+	}
+	wg.Wait()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if n := len(f.handlers) - before; n != 1 {
+		t.Fatalf("NewHandler ran %d times for one session", n)
+	}
+}
+
+func TestSecuredCloseCancelsABlockedDispatch(t *testing.T) {
+	f, _ := newBlockingFixture(t, true, nil)
+	id, _ := f.create("Bearer alice")
+	reply := f.postAsync("Bearer alice", rpc("1", wmp.MethodMessageDeliver, id, nil))
+	time.Sleep(100 * time.Millisecond) // the dispatch is blocked in the handler
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := f.h.Close(ctx); err != nil {
+		t.Fatalf("Close did not drain a dispatch that waits: %v", err)
+	}
+	<-reply
+}
+
+func TestSecuredCloseRetryWaitsForTheDrain(t *testing.T) {
+	f, bh := newBlockingFixture(t, false, nil)
+	id, _ := f.create("Bearer alice")
+	reply := f.postAsync("Bearer alice", rpc("1", wmp.MethodMessageDeliver, id, nil))
+	<-bh.entered
+	short := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		return f.h.Close(ctx)
+	}
+	if short() == nil {
+		t.Fatal("Close returned while a request was in flight")
+	}
+	if short() == nil {
+		t.Fatal("a retried Close reported success before the drain finished")
+	}
+	close(bh.release)
+	<-reply
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := f.h.Close(ctx); err != nil {
+		t.Fatalf("Close after the request ended: %v", err)
+	}
+}
+
+func TestSecuredIdleSweepSparesSessionsInUse(t *testing.T) {
+	f, bh := newBlockingFixture(t, false, func(c *ServerConfig) { c.IdleTimeout = time.Millisecond })
+	id, _ := f.create("Bearer alice")
+	reply := f.postAsync("Bearer alice", rpc("1", wmp.MethodMessageDeliver, id, nil))
+	<-bh.entered
+	time.Sleep(20 * time.Millisecond)
+	f.h.Sweep(context.Background())
+	f.h.mu.RLock()
+	_, held := f.h.sessions[id]
+	f.h.mu.RUnlock()
+	if !held {
+		t.Fatal("the idle sweep dropped a session with a request in progress")
+	}
+	close(bh.release)
+	<-reply
+}
+
+func TestSecuredIdleClockStartsWhenTheStreamEnds(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) { c.IdleTimeout = 200 * time.Millisecond })
+	id, _ := f.create("Bearer alice")
+	resp := f.get("Bearer alice", "session_id="+id, nil)
+	time.Sleep(300 * time.Millisecond) // the stream outlives the idle timeout
+	resp.Body.Close()
+	time.Sleep(50 * time.Millisecond) // the server notices the disconnect
+	f.h.Sweep(context.Background())
+	f.h.mu.RLock()
+	_, held := f.h.sessions[id]
+	f.h.mu.RUnlock()
+	if !held {
+		t.Fatal("the session was dropped the moment its stream ended")
+	}
+}
+
+func TestSecuredHeaderOnlySessionIDIsPropagated(t *testing.T) {
+	f := newSecuredFixture(t, nil)
+	id, _ := f.create("Bearer alice")
+	body := map[string]any{"jsonrpc": "2.0", "method": wmp.MethodSessionClose,
+		"params": map[string]any{"wmp": map[string]any{"version": wmp.Version}, "reason": "user_requested"}}
+	f.post("Bearer alice", map[string]string{"Wmp-Session-Id": id}, body)
+	if _, ok := f.store.Get(id); ok {
+		t.Fatal("a close that named the session only in the header did nothing")
+	}
+}
+
+func TestWithSessionIDKeepsOtherMembers(t *testing.T) {
+	out := withSessionID([]byte(`{"jsonrpc":"2.0","id":"1","method":"m","params":{"x":1,"wmp":{"version":"0.1","sender":"s"}}}`), "ses-a")
+	var m struct {
+		Params struct {
+			X   int            `json:"x"`
+			WMP map[string]any `json:"wmp"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Params.X != 1 || m.Params.WMP["session_id"] != "ses-a" || m.Params.WMP["sender"] != "s" {
+		t.Fatalf("%s", out)
+	}
+	for _, in := range []string{`{"method":"m"}`, `{"method":"m","params":[1]}`, `nope`} {
+		if got := withSessionID([]byte(in), "x"); string(got) != in {
+			t.Errorf("%s was changed to %s", in, got)
+		}
+	}
+}
+
+func TestSecuredLookupWhileClosingIsNotAnError(t *testing.T) {
+	f := newSecuredFixture(t, nil)
+	id, _ := f.create("Bearer alice")
+	_ = f.h.Close(context.Background())
+	sess, code := f.h.lookup(context.Background(), wmp.Principal{Subject: "alice"}, id, false)
+	if sess != nil || code != lookupClosing {
+		t.Fatalf("lookup after Close: %v, %d", sess, code)
+	}
+}
