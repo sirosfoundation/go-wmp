@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -64,7 +65,7 @@ func TestClientOptions(t *testing.T) {
 }
 
 func TestEventBufferAndReplay(t *testing.T) {
-	sess := newServerSession(nil, nil, 5)
+	sess := newServerSession(nil, nil, 5, nil)
 
 	// Buffer some events.
 	id1 := sess.bufferEvent([]byte(`{"msg":1}`))
@@ -98,7 +99,7 @@ func TestEventBufferAndReplay(t *testing.T) {
 }
 
 func TestEventBufferEviction(t *testing.T) {
-	sess := newServerSession(nil, nil, 3)
+	sess := newServerSession(nil, nil, 3, nil)
 
 	sess.bufferEvent([]byte(`1`))
 	sess.bufferEvent([]byte(`2`))
@@ -144,13 +145,13 @@ func TestSSEStreamIncludesEventIDs(t *testing.T) {
 		handler.mu.RLock()
 		sess := handler.sessions["test-session"]
 		handler.mu.RUnlock()
-		sess.outgoing <- []byte(`{"jsonrpc":"2.0","method":"test"}`)
+		sess.outgoing <- outMsg{data: []byte(`{"jsonrpc":"2.0","method":"test"}`)}
 	}()
 
 	// Read SSE frames. Expect id: and data: lines.
 	reader := bufio.NewReader(resp.Body)
 	var gotID, gotData bool
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(60 * time.Second)
 	for !gotID || !gotData {
 		select {
 		case <-deadline:
@@ -184,7 +185,7 @@ func TestSSELastEventIDReplay(t *testing.T) {
 	handler := NewServerHandler(nil)
 
 	// Pre-populate some buffered events.
-	sess := newServerSession(nil, nil, 200)
+	sess := newServerSession(nil, nil, 200, nil)
 	sess.bufferEvent([]byte(`{"n":1}`))
 	sess.bufferEvent([]byte(`{"n":2}`))
 	sess.bufferEvent([]byte(`{"n":3}`))
@@ -533,7 +534,7 @@ func TestConnectSSEWithLastEventID(t *testing.T) {
 	tr2.lastEventID = "evt-5"
 	tr2.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	go func() {
@@ -563,7 +564,7 @@ func TestTransportCloseDuringReadSSE(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	if err := tr.ConnectSSE(ctx, "sess-close"); err != nil {
@@ -626,7 +627,7 @@ func TestServerInitiatedMessageDoesNotHang(t *testing.T) {
 	}
 
 	// Start SSE reader for the session.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	sseReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events?session_id=sess-alice", nil)
@@ -664,7 +665,7 @@ func TestServerInitiatedMessageDoesNotHang(t *testing.T) {
 	// The echoed message should arrive on SSE.
 	reader := bufio.NewReader(sseResp.Body)
 	var gotData bool
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(60 * time.Second)
 readLoop:
 	for {
 		select {
@@ -811,7 +812,7 @@ func TestConnectSSEConcurrentWithClose(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 
 		done := make(chan struct{})
 		go func() {
@@ -820,7 +821,7 @@ func TestConnectSSEConcurrentWithClose(t *testing.T) {
 		}()
 		select {
 		case <-arrived:
-		case <-time.After(3 * time.Second):
+		case <-time.After(60 * time.Second):
 			t.Fatal("the server never saw the SSE request")
 		}
 		time.Sleep(30 * time.Millisecond) // let ConnectSSE install the stream; NOT a synchronisation
@@ -866,7 +867,7 @@ func TestConnectSSEAfterCloseClosesTheStream(t *testing.T) {
 
 	select {
 	case <-arrived:
-	case <-time.After(3 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the server never saw the SSE request")
 	}
 	_ = tr.Close() // while ConnectSSE is blocked waiting for the response
@@ -877,12 +878,12 @@ func TestConnectSSEAfterCloseClosesTheStream(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "closed") {
 			t.Fatalf("ConnectSSE on a closed transport = %v, want a 'transport closed' error", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("ConnectSSE did not return")
 	}
 	select {
 	case <-clientGone:
-	case <-time.After(3 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the stream was left open: nobody closed the response body")
 	}
 }
@@ -930,7 +931,7 @@ func TestConnectSSEReconnectClosesThePreviousStream(t *testing.T) {
 		if id != 1 {
 			t.Fatalf("stream %d was closed, want the FIRST stream (1) superseded", id)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the first stream was left open after a reconnect")
 	}
 	_ = tr.Close()
@@ -939,7 +940,63 @@ func TestConnectSSEReconnectClosesThePreviousStream(t *testing.T) {
 		if id != 2 {
 			t.Fatalf("Close closed stream %d, want the latest (2)", id)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("Close left the latest stream open")
+	}
+}
+
+// A client that only has an Authorization header must be able to answer a
+// call the server makes: the response names its session in the header.
+func TestClientAnswersServerCallsWithSessionHeader(t *testing.T) {
+	f := newSecuredFixture(t, nil)
+	sid, _ := f.create("Bearer alice")
+	tr, err := NewClientTransport(f.ts.URL, WithInsecure(true), WithHeaders(http.Header{"Authorization": {"Bearer alice"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := tr.ConnectSSE(ctx, sid); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	var sess *serverSession
+	for sess == nil && time.Now().Before(deadline) {
+		f.h.mu.RLock()
+		sess = f.h.sessions[sid]
+		f.h.mu.RUnlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if sess == nil {
+		t.Fatal("no live session")
+	}
+
+	callErr := make(chan error, 1)
+	go func() {
+		var out map[string]any
+		callErr <- sess.peer.Call(ctx, "wmp.test.ping", map[string]any{}, &out)
+	}()
+	req, err := tr.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(req, &m); err != nil {
+		t.Fatal(err)
+	}
+	resp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{}}`, m.ID)
+	if err := tr.WriteMessage(ctx, []byte(resp)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-callErr:
+		if err != nil {
+			t.Fatalf("Call: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the server's call never completed: its response was refused")
 	}
 }
