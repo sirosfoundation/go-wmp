@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 )
 
 // Issuer entitlement (WMP OpenID4x Sections 3.1.6 and 7.8): the result of the
@@ -35,8 +36,9 @@ const (
 	EntitlementModeFail = "fail"
 )
 
-// Bounds of Section 7.8. Everything in an entitlement result comes from the
-// issuer or a registration certificate, so every value is bounded.
+// Bounds of Section 7.8, in Unicode code points (a finding code is ASCII, so
+// its count is the same in bytes). Everything in an entitlement result comes
+// from the issuer or a registration certificate, so every value is bounded.
 const (
 	MaxEntitlementFindings = 64
 	MaxEntitlements        = 64
@@ -83,6 +85,9 @@ type IssuerEntitlementPayload struct {
 	IssuerEntitlement IssuerEntitlement `json:"issuer_entitlement"`
 }
 
+// chars counts Unicode code points, as the schema's maxLength does.
+func chars(s string) int { return utf8.RuneCountInString(s) }
+
 func validCode(code string) bool {
 	if code == "" || len(code) > MaxFindingCodeLen || code[0] < 'a' || code[0] > 'z' {
 		return false
@@ -105,7 +110,7 @@ func validateFindings(findings []EntitlementFinding) error {
 		if !validCode(f.Code) {
 			return entitlementErr("finding %d has no valid code", i)
 		}
-		if len(f.CredentialType) > MaxCredentialTypeLen {
+		if chars(f.CredentialType) > MaxCredentialTypeLen {
 			return entitlementErr("finding %d credential_type exceeds %d", i, MaxCredentialTypeLen)
 		}
 	}
@@ -125,7 +130,7 @@ func (e IssuerEntitlement) Validate() error {
 		return entitlementErr("%d entitlements, at most %d", len(e.Entitlements), MaxEntitlements)
 	}
 	for i, v := range e.Entitlements {
-		if len(v) > MaxEntitlementLen {
+		if chars(v) > MaxEntitlementLen {
 			return entitlementErr("entitlement %d exceeds %d", i, MaxEntitlementLen)
 		}
 	}
@@ -146,7 +151,7 @@ func (e IssuerEntitlement) Bounded() IssuerEntitlement {
 		if !validCode(f.Code) {
 			continue
 		}
-		if len(f.CredentialType) > MaxCredentialTypeLen {
+		if chars(f.CredentialType) > MaxCredentialTypeLen {
 			f.CredentialType = ""
 		}
 		out.Findings = append(out.Findings, f)
@@ -155,7 +160,7 @@ func (e IssuerEntitlement) Bounded() IssuerEntitlement {
 		if len(out.Entitlements) == MaxEntitlements {
 			break
 		}
-		if len(v) <= MaxEntitlementLen {
+		if chars(v) <= MaxEntitlementLen {
 			out.Entitlements = append(out.Entitlements, v)
 		}
 	}
@@ -167,7 +172,7 @@ func (e IssuerEntitlement) Bounded() IssuerEntitlement {
 // the result is out of bounds; use Bounded first for a result built from issuer
 // data.
 func NewIssuerEntitlementPayload(issuer string, e IssuerEntitlement) (*IssuerEntitlementPayload, error) {
-	if issuer == "" || len(issuer) > MaxIssuerLen {
+	if issuer == "" || chars(issuer) > MaxIssuerLen {
 		return nil, entitlementErr("issuer is empty or exceeds %d", MaxIssuerLen)
 	}
 	if err := e.Validate(); err != nil {
@@ -206,6 +211,10 @@ func decodeFindings(raw json.RawMessage) ([]EntitlementFinding, error) {
 		m, ok := members(it)
 		if !ok {
 			return nil, entitlementErr("a finding is not an object")
+		}
+		// Section 7.8 forbids free text in a finding; other members are ignored.
+		if _, has := m["message"]; has {
+			return nil, entitlementErr("a finding carries a message member")
 		}
 		var f EntitlementFinding
 		member(m, "code", &f.Code)
@@ -249,7 +258,7 @@ func ParseIssuerEntitlementPayload(payload json.RawMessage) (p *IssuerEntitlemen
 		return nil, false, nil
 	}
 	out := IssuerEntitlementPayload{Evaluated: true}
-	if !member(m, "issuer", &out.Issuer) || out.Issuer == "" || len(out.Issuer) > MaxIssuerLen {
+	if !member(m, "issuer", &out.Issuer) || out.Issuer == "" || chars(out.Issuer) > MaxIssuerLen {
 		return nil, true, entitlementErr("issuer is missing or exceeds %d", MaxIssuerLen)
 	}
 	ent, err := decodeEntitlement(m["issuer_entitlement"])

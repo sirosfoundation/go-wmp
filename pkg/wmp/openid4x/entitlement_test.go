@@ -237,3 +237,44 @@ func TestEntitlementParsersMatchMemberNamesExactly(t *testing.T) {
 		t.Errorf("null lists: %+v %v %v", p, ok, err)
 	}
 }
+
+func TestEntitlementParsersRefuseAMessageMember(t *testing.T) {
+	finding := `{"code":"no_access_certificate","message":"issuer-controlled text"}`
+	payload := `{"issuer_entitlement_evaluated":true,"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true,"findings":[` + finding + `]}}`
+	if _, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(payload)); !ok || !errors.Is(err, ErrEntitlement) {
+		t.Errorf("payload: ok=%v err=%v", ok, err)
+	}
+	refusal := `{"reason":"untrusted_issuer","retryable":false,"findings":[` + finding + `]}`
+	if _, ok, err := ParseUntrustedIssuerData(json.RawMessage(refusal)); !ok || !errors.Is(err, ErrEntitlement) {
+		t.Errorf("refusal: ok=%v err=%v", ok, err)
+	}
+	// Other extension members of a finding are ignored.
+	other := `{"code":"no_access_certificate","x_other":1}`
+	if _, _, err := ParseUntrustedIssuerData(json.RawMessage(`{"reason":"untrusted_issuer","retryable":false,"findings":[` + other + `]}`)); err != nil {
+		t.Errorf("extension member refused: %v", err)
+	}
+}
+
+func TestEntitlementBoundsCountCodePoints(t *testing.T) {
+	two := func(n int) string { return strings.Repeat("\u00e9", n) }
+	e := okEntitlement()
+	e.Findings = []EntitlementFinding{{Code: "a", CredentialType: two(256)}}
+	e.Entitlements = []string{two(256)}
+	if err := e.Validate(); err != nil {
+		t.Errorf("256 two-byte characters refused: %v", err)
+	}
+	if _, err := NewIssuerEntitlementPayload(two(1025), e); err != nil {
+		t.Errorf("1025 two-byte issuer characters refused: %v", err)
+	}
+	e.Findings[0].CredentialType = two(257)
+	if e.Validate() == nil {
+		t.Error("257 characters accepted")
+	}
+	b := IssuerEntitlement{Mode: EntitlementModeWarn, Findings: []EntitlementFinding{{Code: "a", CredentialType: two(129)}}, Entitlements: []string{two(129)}}.Bounded()
+	if b.Findings[0].CredentialType != two(129) || len(b.Entitlements) != 1 {
+		t.Errorf("Bounded dropped a valid non-ASCII value: %+v", b)
+	}
+	if _, err := NewIssuerEntitlementPayload(two(2049), okEntitlement()); err == nil {
+		t.Error("2049 issuer characters accepted")
+	}
+}
