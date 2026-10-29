@@ -430,6 +430,10 @@ type Config struct {
 	// returned by CapabilityDescriptors. Nil to omit.
 	TransactionData *wmp.TransactionDataCap
 
+	// CredentialNotification configures the credential_notification capability
+	// descriptor returned by CapabilityDescriptors. Nil to omit.
+	CredentialNotification *CredentialNotificationCap
+
 	// OnVCIStart is called when an OID4VCI flow starts.
 	OnVCIStart FlowStartHandler
 
@@ -488,6 +492,8 @@ func (p *Profile) RequiredCapability(flowType string) string {
 		return CapabilityOID4VP
 	case FlowTypeMatch:
 		return CapabilityOID4VP
+	case FlowTypeCredentialNotification:
+		return CapabilityCredentialNotification
 	}
 	return ""
 }

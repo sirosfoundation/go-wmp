@@ -243,6 +243,12 @@ const (
 )
 
 // CredentialNotificationParams are the params for wmp.credential.notification.
+//
+// Note: wmp.credential.notification is not defined by the WMP
+// specification, has no result, and cannot ask the client for the DPoP proof an
+// issuer may require. The credential_notification flow (WMP OpenID4x Section
+// 3.4, openid4x.NotificationFlow) replaces it. The method keeps working.
+//
 // Carries an OID4VCI §10 credential lifecycle event from the client to the
 // server, which forwards it to the issuer's notification endpoint.
 type CredentialNotificationParams struct {

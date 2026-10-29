@@ -516,3 +516,87 @@ func TestConformanceMethodCoverage(t *testing.T) {
 		}
 	}
 }
+
+// TestConformanceCredentialNotification runs the credential_notification
+// vectors (WMP OpenID4x 3.4) of flow-lifecycle.json against the library: the
+// start params are parsed as an orchestrator does, and the terminal messages
+// must have the shapes NotificationFlow sends.
+func TestConformanceCredentialNotification(t *testing.T) {
+	var ran int
+	for _, v := range loadVectors(t, "flow-lifecycle.json") {
+		if !strings.HasPrefix(v.ID, "flow-credential-notification-") {
+			continue
+		}
+		ran++
+		t.Run(v.ID, func(t *testing.T) {
+			var msg genericRPC
+			if err := json.Unmarshal(v.Input, &msg); err != nil {
+				t.Fatal(err)
+			}
+			switch msg.Method {
+			case wmp.MethodFlowStart:
+				var ps struct {
+					FlowType string          `json:"flow_type"`
+					Params   json.RawMessage `json:"params"`
+				}
+				if err := json.Unmarshal(msg.Params, &ps); err != nil {
+					t.Fatal(err)
+				}
+				if ps.FlowType != openid4x.FlowTypeCredentialNotification {
+					return // the sign sub-flow: shape checked by the spec's schema tests
+				}
+				_, rpcErr := openid4x.ParseCredentialNotificationStart(ps.Params, nil)
+				switch {
+				case len(v.ExpectedError) == 0:
+					if rpcErr != nil {
+						t.Errorf("valid start refused: %v", rpcErr)
+					}
+				default:
+					var want struct {
+						Error rpcError `json:"error"`
+					}
+					if err := json.Unmarshal(v.ExpectedError, &want); err != nil {
+						t.Fatal(err)
+					}
+					if want.Error.Code != wmp.ErrInvalidParams {
+						return // -31005: the capability gate, not the parser
+					}
+					var wantData, gotData bytes.Buffer
+					if rpcErr == nil || json.Compact(&wantData, want.Error.Data) != nil || json.Compact(&gotData, rpcErr.Data) != nil ||
+						rpcErr.Code != want.Error.Code || gotData.String() != wantData.String() {
+						t.Errorf("refusal = %v, want %d %s", rpcErr, want.Error.Code, want.Error.Data)
+					}
+				}
+			case wmp.MethodFlowError:
+				var ps wmp.FlowErrorParams
+				if err := json.Unmarshal(msg.Params, &ps); err != nil {
+					t.Fatal(err)
+				}
+				var d openid4x.NotificationErrorData
+				if err := json.Unmarshal(ps.Data, &d); err != nil {
+					t.Fatal(err)
+				}
+				reason, retryable := d.Reason, d.Retryable
+				want := map[string]bool{
+					openid4x.NotificationReasonContextUnavailable: false, openid4x.NotificationReasonBusy: true,
+					openid4x.NotificationReasonSigningFailed: false, openid4x.NotificationReasonForwardFailed: false,
+				}
+				if r, ok := want[reason]; !ok || r != retryable || ps.Code != wmp.ErrFlowError || ps.Message != wmp.ErrorMessage(wmp.ErrFlowError) {
+					t.Errorf("error = %d %q %+v", ps.Code, ps.Message, d)
+				}
+			case wmp.MethodFlowComplete:
+				var ps wmp.FlowCompleteParams
+				if err := json.Unmarshal(msg.Params, &ps); err != nil {
+					t.Fatal(err)
+				}
+				var r openid4x.NotificationFlowResult
+				if err := json.Unmarshal(ps.Result, &r); err != nil || r.Status != openid4x.NotificationStatusForwarded || r.NotificationID == "" {
+					t.Errorf("result = %s", ps.Result)
+				}
+			}
+		})
+	}
+	if ran == 0 {
+		t.Skip("no credential_notification vectors in this checkout of the spec")
+	}
+}
