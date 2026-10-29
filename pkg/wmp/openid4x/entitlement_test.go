@@ -240,15 +240,12 @@ func TestIssuerNotEntitledDataParserRefusals(t *testing.T) {
 	}
 }
 
-func TestEntitlementParsersMatchMemberNamesExactly(t *testing.T) {
-	// A member whose name differs only in case is a different member: it neither
-	// satisfies a required one nor overrides it.
-	for _, raw := range []string{
-		`{"ISSUER_ENTITLEMENT_EVALUATED":true,"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true}}`,
-	} {
-		if p, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(raw)); p != nil || ok || err != nil {
-			t.Errorf("%s: %v %v %v", raw, p, ok, err)
-		}
+// A member whose name differs only in case is a different member: it neither
+// satisfies a required one nor overrides it.
+func TestEntitlementPayloadMatchesMemberNamesExactly(t *testing.T) {
+	raw := `{"ISSUER_ENTITLEMENT_EVALUATED":true,"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true}}`
+	if p, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(raw)); p != nil || ok || err != nil {
+		t.Errorf("%s: %v %v %v", raw, p, ok, err)
 	}
 	for _, raw := range []string{
 		`{"issuer_entitlement_evaluated":true,"ISSUER":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true}}`,
@@ -260,6 +257,9 @@ func TestEntitlementParsersMatchMemberNamesExactly(t *testing.T) {
 			t.Errorf("%s: ok=%v err=%v", raw, ok, err)
 		}
 	}
+}
+
+func TestUntrustedIssuerDataMatchesMemberNamesExactly(t *testing.T) {
 	if d, ok, err := ParseUntrustedIssuerData(json.RawMessage(`{"REASON":"untrusted_issuer","retryable":false}`)); d != nil || ok || err != nil {
 		t.Errorf("mis-cased reason: %v %v %v", d, ok, err)
 	}
@@ -271,7 +271,9 @@ func TestEntitlementParsersMatchMemberNamesExactly(t *testing.T) {
 			t.Errorf("%s: ok=%v err=%v", raw, ok, err)
 		}
 	}
-	// An explicit null findings or entitlements is absent.
+}
+
+func TestEntitlementNullListsAreAbsent(t *testing.T) {
 	p, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(`{"issuer_entitlement_evaluated":true,"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true,"findings":null,"entitlements":null}}`))
 	if err != nil || !ok || p.IssuerEntitlement.Findings != nil {
 		t.Errorf("null lists: %+v %v %v", p, ok, err)
