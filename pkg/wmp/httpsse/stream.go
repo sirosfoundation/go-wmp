@@ -532,38 +532,13 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-
-	// Under emitMu no event is emitted, so the replay set and the registration
-	// are one cut of the stream: everything up to it is replayed, everything
-	// after it arrives live, nothing twice.
-	var replay []Event
-	cur := cursor(r)
-	sess.emitMu.Lock()
-	if cur != "" {
-		evs, found, err := sess.log.After(sess.sid, cur)
-		if err != nil {
-			// The log could not be read: that says nothing about the cursor.
-			// Not a gap (410 would make the client resume); try again.
-			sess.emitMu.Unlock()
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		if !found {
-			sess.emitMu.Unlock()
-			// A gap: no part of the replay is delivered and no stream opens.
-			w.WriteHeader(http.StatusGone)
-			return
-		}
-		replay = evs
-	}
-	// Registered with its abort hook in one step: the emitter may give up on
-	// the stream the moment it is registered.
 	guard := &deadlineGuard{set: rc.SetWriteDeadline}
-	ch := sess.registerClient(cfg.ClientBuffer, guard.kill)
-	sess.emitMu.Unlock()
-	if ch == nil {
-		http.Error(w, "session closed", http.StatusNotFound)
+	ch, replay, status := attach(sess, cursor(r), cfg.ClientBuffer, guard.kill)
+	if status != 0 {
+		if status == http.StatusServiceUnavailable {
+			w.Header().Set("Retry-After", "1")
+		}
+		w.WriteHeader(status)
 		return
 	}
 	defer sess.unregisterClient(ch)
@@ -591,46 +566,80 @@ func (h *ServerHandler) streamSecured(w http.ResponseWriter, r *http.Request, se
 		}
 		return true
 	}
-
-	if !write("") { // headers
+	if !write("") || !writeReplay(replay, guard, write) { // headers, then the replay
 		return
 	}
+	pump(r.Context(), ch, guard, cfg.Heartbeat, write)
+}
+
+// attach opens one cut of the session's stream for a client with the given
+// cursor: the events to replay and the channel of live events. Under emitMu no
+// event is emitted, so the replay set and the registration are one cut:
+// everything up to it is replayed, everything after it arrives live, nothing
+// twice. kill is registered with the client in the same step (the emitter may
+// give up on the stream the moment it is registered). A non-zero status is the
+// HTTP status to answer instead of opening a stream.
+func attach(sess *serverSession, cur string, buffer int, kill func()) (ch chan serverEvent, replay []Event, status int) {
+	sess.emitMu.Lock()
+	defer sess.emitMu.Unlock()
+	if cur != "" {
+		evs, found, err := sess.log.After(sess.sid, cur)
+		switch {
+		case err != nil:
+			// The log could not be read: that says nothing about the cursor.
+			// Not a gap (410 would make the client resume); try again.
+			return nil, nil, http.StatusServiceUnavailable
+		case !found:
+			// A gap: no part of the replay is delivered and no stream opens.
+			return nil, nil, http.StatusGone
+		}
+		replay = evs
+	}
+	if ch = sess.registerClient(buffer, kill); ch == nil {
+		return nil, nil, http.StatusNotFound
+	}
+	return ch, replay, 0
+}
+
+// writeReplay writes the retained events; it reports whether to go on.
+func writeReplay(replay []Event, guard *deadlineGuard, write func(string) bool) bool {
 	for _, ev := range replay {
 		if guard.isKilled() {
-			return
+			return false
 		}
 		if ev.Data == nil {
 			continue // withheld: nothing to replay
 		}
 		if !write(formatEvent(ev.ID, ev.Data)) {
-			return
+			return false
 		}
 	}
+	return true
+}
 
+// pump writes live events and heartbeats until the stream ends.
+func pump(ctx context.Context, ch chan serverEvent, guard *deadlineGuard, heartbeat time.Duration, write func(string) bool) {
 	var beat <-chan time.Time
 	var ticker *time.Ticker
-	if cfg.Heartbeat > 0 {
-		ticker = time.NewTicker(cfg.Heartbeat)
+	if heartbeat > 0 {
+		ticker = time.NewTicker(heartbeat)
 		defer ticker.Stop()
 		beat = ticker.C
 	}
 	for {
 		select {
 		case ev, open := <-ch:
-			if !open || guard.isKilled() {
-				return
-			}
-			if !write(formatEvent(ev.ID, ev.Data)) {
+			if !open || guard.isKilled() || !write(formatEvent(ev.ID, ev.Data)) {
 				return
 			}
 			if ticker != nil {
-				ticker.Reset(cfg.Heartbeat) // only an idle stream needs a comment
+				ticker.Reset(heartbeat) // only an idle stream needs a comment
 			}
 		case <-beat:
 			if !write(heartbeatComment) {
 				return
 			}
-		case <-r.Context().Done():
+		case <-ctx.Done():
 			return
 		}
 	}

@@ -364,8 +364,8 @@ type serverSession struct {
 	// accepted and processed count queue items accepted and fully handled by
 	// the broadcast loop; equal means everything sent so far has been emitted.
 	accepted, processed atomic.Uint64
-	peer   *wmp.Peer
-	owner  string // Principal.Key of the owner; empty for legacy sessions
+	peer                *wmp.Peer
+	owner               string // Principal.Key of the owner; empty for legacy sessions
 
 	// done is closed by close. Writers and the broadcast loop stop on it.
 	done      chan struct{}
