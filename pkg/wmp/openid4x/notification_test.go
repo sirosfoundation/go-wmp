@@ -460,3 +460,57 @@ func TestNotificationHTU(t *testing.T) {
 		}
 	}
 }
+
+func TestNotificationFlowCancelledDuringSigningSendsNoTerminalMessage(t *testing.T) {
+	sign := &ClientAuthRequest{HTM: "POST", HTU: "https://i.example/n"}
+	fwd := &fakeForwarder{signs: sign}
+	r := newNotifyRig(t, fwd, NotificationFlowOptions{SignTimeout: 5 * time.Second})
+	// The wallet never answers the sign sub-flow; it cancels the notification
+	// flow instead.
+	r.answer = func(*wmp.FlowStartParams) {
+		_ = r.wallet.Call(r.ctx, wmp.MethodFlowCancel, &wmp.FlowCancelParams{
+			WMP: wmp.Metadata{SessionID: "ses-1"}, FlowID: "flow-cn-001", Reason: wmp.CancelReasonNoLongerNeeded}, nil)
+	}
+	if err := r.start(startParams(t, nil)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case c := <-r.complete:
+		t.Fatalf("completed after cancel: %s", c.Result)
+	case e := <-r.failed:
+		t.Fatalf("error after cancel: %d %s", e.Code, e.Data)
+	case <-time.After(700 * time.Millisecond):
+	}
+}
+
+func TestNotificationFlowCancelledAfterForwardingSendsNoCompletion(t *testing.T) {
+	fwd := &cancellingForwarder{}
+	r := newNotifyRig(t, fwd, NotificationFlowOptions{})
+	fwd.cancel = func() {
+		_ = r.wallet.Call(r.ctx, wmp.MethodFlowCancel, &wmp.FlowCancelParams{
+			WMP: wmp.Metadata{SessionID: "ses-1"}, FlowID: "flow-cn-001", Reason: wmp.CancelReasonNoLongerNeeded}, nil)
+	}
+	if err := r.start(startParams(t, nil)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case c := <-r.complete:
+		t.Fatalf("completed after cancel: %s", c.Result)
+	case e := <-r.failed:
+		t.Fatalf("error after cancel: %d %s", e.Code, e.Data)
+	case <-time.After(700 * time.Millisecond):
+	}
+}
+
+// cancellingForwarder has the wallet cancel the flow while it forwards, then
+// reports success (what a forwarder that does not look at its context does).
+type cancellingForwarder struct{ cancel func() }
+
+func (f *cancellingForwarder) ForwardNotification(ctx context.Context, _ NotificationRequest, _ ClientAuthSigner) error {
+	f.cancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+	}
+	return nil
+}

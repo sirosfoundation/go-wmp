@@ -292,7 +292,13 @@ func NotificationFlow(fwd NotificationForwarder, opts NotificationFlowOptions) w
 		sign := func(ctx context.Context, car ClientAuthRequest) (string, error) {
 			return requestClientAuth(ctx, fc, car, timeout)
 		}
-		if err := fwd.ForwardNotification(ctx, req, sign); err != nil {
+		err := fwd.ForwardNotification(ctx, req, sign)
+		// A flow that was cancelled (by the wallet or the end of the peer) is
+		// over: it sends no terminal message, whatever the forwarder returned.
+		if ctx.Err() != nil || errors.Is(err, wmp.ErrSubFlowCancelled) {
+			return context.Cause(ctx)
+		}
+		if err != nil {
 			reason, retryable := NotificationFailure(err)
 			return fc.Error(ctx, wmp.ErrFlowError, wmp.ErrorMessage(wmp.ErrFlowError),
 				NotificationErrorData{Reason: reason, Retryable: retryable})
