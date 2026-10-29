@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 )
@@ -25,7 +26,8 @@ const (
 	ActionSignClientAuth = "sign_client_auth"
 
 	// MaxNotificationIDLen and MaxFlowIDLen bound issuance_flow_id and
-	// notification_id; MaxEventDescriptionLen bounds event_description.
+	// notification_id; MaxEventDescriptionLen bounds event_description. All are
+	// counted in Unicode code points, as the schema's maxLength is.
 	MaxNotificationIDLen   = 256
 	MaxFlowIDLen           = 256
 	MaxEventDescriptionLen = 512
@@ -88,8 +90,9 @@ func ParseCredentialNotificationStart(params json.RawMessage, events []string) (
 		if !ok {
 			return "", !required
 		}
+		// An explicit null is not a string (Unmarshal would leave it empty).
 		var s string
-		if json.Unmarshal(raw, &s) != nil || len(s) > max || (required && s == "") {
+		if !isNotNull(raw) || json.Unmarshal(raw, &s) != nil || utf8.RuneCountInString(s) > max || (required && s == "") {
 			return "", false
 		}
 		return s, true
@@ -132,9 +135,11 @@ func printableASCII(s string) bool {
 	return true
 }
 
-// NotificationStartMiddleware refuses an invalid credential_notification
-// wmp.flow.start as the response to the request (Section 3.4.1), before the
-// flow exists. Register it with Peer.UseMiddleware. Other methods and flow
+// NotificationStartMiddleware refuses a credential_notification wmp.flow.start
+// as the response to the request, before the flow exists: -31005 when the
+// session did not negotiate the capability (an AsyncFlowProfile does not
+// consult RequiredCapability), -32602 when the params are invalid (Section
+// 3.4.1). Register it with Peer.UseMiddleware. Other methods and flow
 // types pass through. events is read on every start so that it can follow the
 // orchestrator's configuration.
 func NotificationStartMiddleware(events func() []string) wmp.Middleware {
@@ -145,6 +150,11 @@ func NotificationStartMiddleware(events func() []string) wmp.Middleware {
 				Params   json.RawMessage `json:"params"`
 			}
 			if json.Unmarshal(params, &ps) == nil && ps.FlowType == FlowTypeCredentialNotification {
+				// An AsyncFlowProfile does not consult RequiredCapability, so the
+				// negotiated capability is checked here (Section 2.4).
+				if sess := wmp.SessionFromContext(ctx); sess == nil || !sess.HasCapability(CapabilityCredentialNotification) {
+					return nil, wmp.NewUnsupportedError(FlowTypeCredentialNotification, map[string]any{"capability": CapabilityCredentialNotification})
+				}
 				var offered []string
 				if events != nil {
 					offered = events()
@@ -303,11 +313,11 @@ func requestClientAuth(ctx context.Context, fc *wmp.FlowContext, car ClientAuthR
 		// has neither); the cause is for the orchestrator's log.
 		return "", fmt.Errorf("%w: %w", ErrClientAuthSigning, err)
 	}
-	var r struct {
-		DPoPProof string `json:"dpop_proof"`
-	}
-	if json.Unmarshal(result, &r) != nil || r.DPoPProof == "" {
+	// The exact member name: a struct decode also matches "DPOP_PROOF".
+	var m map[string]json.RawMessage
+	var proof string
+	if json.Unmarshal(result, &m) != nil || json.Unmarshal(m["dpop_proof"], &proof) != nil || proof == "" {
 		return "", fmt.Errorf("%w: result carries no dpop_proof", ErrClientAuthSigning)
 	}
-	return r.DPoPProof, nil
+	return proof, nil
 }

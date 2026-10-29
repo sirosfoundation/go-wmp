@@ -56,6 +56,22 @@ func TestParseCredentialNotificationStart(t *testing.T) {
 	}
 }
 
+func TestParseCredentialNotificationStartCountsCodePoints(t *testing.T) {
+	// 128 two-byte characters are 256 characters and 256 bytes; 129 are 258 bytes
+	// but still a valid 129-character id, and 257 characters are one too many.
+	for n, want := range map[int]bool{128: true, 129: true, 256: true, 257: false} {
+		id := strings.Repeat("\u00e9", n)
+		_, err := ParseCredentialNotificationStart(startParams(t, func(m map[string]any) { m["notification_id"] = id }), nil)
+		if (err == nil) != want {
+			t.Errorf("%d characters: err = %v, want accepted %v", n, err, want)
+		}
+	}
+	desc := strings.Repeat("a", MaxEventDescriptionLen)
+	if _, err := ParseCredentialNotificationStart(startParams(t, func(m map[string]any) { m["event_description"] = desc }), nil); err != nil {
+		t.Errorf("description at the bound: %v", err)
+	}
+}
+
 func TestParseCredentialNotificationStartRefusals(t *testing.T) {
 	long := func(n int) string { return strings.Repeat("x", n) }
 	for _, tc := range []struct {
@@ -76,6 +92,7 @@ func TestParseCredentialNotificationStartRefusals(t *testing.T) {
 		{"long description", func(m map[string]any) { m["event_description"] = long(513) }, nil, "event_description"},
 		{"non-ascii description", func(m map[string]any) { m["event_description"] = "café" }, nil, "event_description"},
 		{"control character in description", func(m map[string]any) { m["event_description"] = "a\nb" }, nil, "event_description"},
+		{"description null", func(m map[string]any) { m["event_description"] = nil }, nil, "event_description"},
 		{"description not a string", func(m map[string]any) { m["event_description"] = []int{1} }, nil, "event_description"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -146,6 +163,16 @@ func (r *notifyRig) FlowError(_ context.Context, p *wmp.FlowErrorParams)       {
 
 func newNotifyRig(t *testing.T, fwd NotificationForwarder, opts NotificationFlowOptions) *notifyRig {
 	t.Helper()
+	return newNotifyRigWith(t, fwd, opts, wmp.Capabilities{CapabilityCredentialNotification: json.RawMessage(`{}`)})
+}
+
+func newNotifyRigCaps(t *testing.T, fwd NotificationForwarder, caps wmp.Capabilities) *notifyRig {
+	t.Helper()
+	return newNotifyRigWith(t, fwd, NotificationFlowOptions{}, caps)
+}
+
+func newNotifyRigWith(t *testing.T, fwd NotificationForwarder, opts NotificationFlowOptions, caps wmp.Capabilities) *notifyRig {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	tA, tB := wmp.NewChannelTransport(64, 64), wmp.NewChannelTransport(64, 64)
@@ -169,7 +196,7 @@ func newNotifyRig(t *testing.T, fwd NotificationForwarder, opts NotificationFlow
 	profile := wmp.NewAsyncFlowProfile("orch")
 	profile.Handle(FlowTypeCredentialNotification, NotificationFlow(fwd, opts))
 	store := wmp.NewMemorySessionStore()
-	if err := store.Create(&wmp.Session{ID: "ses-1", Capabilities: wmp.Capabilities{CapabilityCredentialNotification: json.RawMessage(`{}`)}}); err != nil {
+	if err := store.Create(&wmp.Session{ID: "ses-1", Capabilities: caps}); err != nil {
 		t.Fatal(err)
 	}
 	orch := wmp.NewPeer(tA, &wmp.BaseHandler{}, wmp.WithSessionIdentity("ses-1", "orchestrator"), wmp.WithSessionStore(store))
@@ -318,6 +345,8 @@ func TestNotificationFlowSigningFailures(t *testing.T) {
 			}
 		},
 		"no dpop_proof":    func(r *notifyRig) { r.answerSign(`{"dpop_key_id":"k"}`) },
+		"mis-cased member": func(r *notifyRig) { r.answerSign(`{"DPOP_PROOF":"a.b.c"}`) },
+		"null dpop_proof":  func(r *notifyRig) { r.answerSign(`{"dpop_proof":null}`) },
 		"empty dpop_proof": func(r *notifyRig) { r.answerSign(`{"dpop_proof":""}`) },
 		"proof not string": func(r *notifyRig) { r.answerSign(`{"dpop_proof":5}`) },
 		"no answer":        func(r *notifyRig) {},
@@ -361,6 +390,30 @@ func TestNotificationStartMiddlewareRefusesBeforeTheFlowExists(t *testing.T) {
 	// Another flow type passes through the middleware untouched.
 	if err := r.wallet.Call(r.ctx, wmp.MethodFlowStart, &wmp.FlowStartParams{FlowType: "nosuch", FlowID: "f"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != wmp.ErrCapabilityNotSupported {
 		t.Errorf("unknown flow type: %v", err)
+	}
+}
+
+func TestNotificationStartMiddlewareRequiresTheNegotiatedCapability(t *testing.T) {
+	fwd := &fakeForwarder{}
+	r := newNotifyRigCaps(t, fwd, wmp.Capabilities{"oid4vci": json.RawMessage(`{}`)})
+	err := r.start(startParams(t, nil))
+	var rpcErr *wmp.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != wmp.ErrCapabilityNotSupported {
+		t.Fatalf("start error = %v, want -31005", err)
+	}
+	var d map[string]string
+	_ = json.Unmarshal(rpcErr.Data, &d)
+	if d["unsupported"] != FlowTypeCredentialNotification || d["capability"] != CapabilityCredentialNotification {
+		t.Errorf("data = %s", rpcErr.Data)
+	}
+	// An unnegotiated session is refused before its params are looked at.
+	if err := r.start(json.RawMessage(`{}`)); !errors.As(err, &rpcErr) || rpcErr.Code != wmp.ErrCapabilityNotSupported {
+		t.Errorf("invalid params in an unnegotiated session: %v", err)
+	}
+	fwd.mu.Lock()
+	defer fwd.mu.Unlock()
+	if len(fwd.reqs) != 0 {
+		t.Errorf("forwarder called without the capability: %+v", fwd.reqs)
 	}
 }
 
