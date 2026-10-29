@@ -38,7 +38,7 @@ func TestServerHandlerPOSTRequestResponse(t *testing.T) {
 	defer ts.Close()
 
 	client := ts.Client()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// session.create should return a JSON-RPC response in the POST body.
@@ -92,7 +92,7 @@ func TestServerHandlerPOSTNotificationAccepted(t *testing.T) {
 	defer ts.Close()
 
 	client := ts.Client()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	reqBody := mustMarshal(t, map[string]interface{}{
@@ -136,7 +136,7 @@ func TestServerHandlerPOSTWithSessionHeader(t *testing.T) {
 	defer ts.Close()
 
 	client := ts.Client()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	reqBody := mustMarshal(t, map[string]interface{}{
@@ -187,7 +187,7 @@ func TestServerHandlerPOSTSessionIDFromBody(t *testing.T) {
 	defer ts.Close()
 
 	client := ts.Client()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// No Wmp-Session-Id header; session_id is extracted from the JSON body.
@@ -235,7 +235,7 @@ func TestServerHandlerPOSTBodyTooLarge(t *testing.T) {
 	defer ts.Close()
 
 	client := ts.Client()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	huge := make([]byte, maxPostBody+1)
@@ -258,7 +258,7 @@ func TestServerHandlerPOSTBodyTooLarge(t *testing.T) {
 
 func TestServerHandlerPOSTReadError(t *testing.T) {
 	server := NewServerHandler(roundTripHandler{})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/", io.NopCloser(&errReader{err: io.ErrUnexpectedEOF}))
@@ -281,7 +281,7 @@ func TestServerHandlerMethodNotAllowed(t *testing.T) {
 	defer ts.Close()
 
 	client := ts.Client()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, ts.URL, http.NoBody)

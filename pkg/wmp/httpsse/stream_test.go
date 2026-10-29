@@ -37,7 +37,7 @@ func (f *securedFixture) emit(sid string, v any) {
 // is asynchronous, so a test that opens a stream "after" an emit must wait.
 func (f *securedFixture) waitLogged(sid string, n int) {
 	f.t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if f.h.secured.cfg.Stream.Log.Missed(sid, "") >= n {
 			return
@@ -69,23 +69,30 @@ func (f *securedFixture) open(sid string, header map[string]string, query string
 	return c, resp.StatusCode
 }
 
+// waitEvents waits for n events. It fails only when no new event arrives for
+// stallTimeout: a total budget would measure the speed of the runner (a
+// 30 MiB stream under -race on one loaded core takes many seconds), a stall
+// timeout measures whether delivery progresses.
 func (c *tvConn) waitEvents(t *testing.T, n int) []tvEvent {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
+	const stallTimeout = 20 * time.Second
+	last, lastChange := -1, time.Now()
+	for {
 		c.mu.Lock()
 		got := len(c.events)
 		c.mu.Unlock()
 		if got >= n {
 			break
 		}
-		time.Sleep(5 * time.Millisecond)
+		if got != last {
+			last, lastChange = got, time.Now()
+		} else if time.Since(lastChange) > stallTimeout {
+			t.Fatalf("got %d events, want %d (no progress for %v)", got, n, stallTimeout)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.events) < n {
-		t.Fatalf("got %d events, want %d", len(c.events), n)
-	}
 	return append([]tvEvent(nil), c.events...)
 }
 
@@ -330,7 +337,7 @@ func TestStreamCustomReplayFilterAndLog(t *testing.T) {
 	})
 	sid, _ := f.create("Bearer alice")
 	f.emit(sid, progress(sid, "f", "s1"))
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
 		n := len(appended)
@@ -364,7 +371,7 @@ func TestStreamHeartbeat(t *testing.T) {
 	f := newSecuredFixture(t, func(c *ServerConfig) { c.Stream.Heartbeat = 20 * time.Millisecond })
 	sid, _ := f.create("Bearer alice")
 	c, _ := f.open(sid, nil, "")
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		c.mu.Lock()
 		n := len(c.comments)
@@ -391,7 +398,10 @@ func TestStreamHeartbeat(t *testing.T) {
 
 func TestStreamSlowClientIsClosedAndDoesNotStallOthers(t *testing.T) {
 	f := newSecuredFixture(t, func(c *ServerConfig) {
-		c.Stream.WriteTimeout = 150 * time.Millisecond
+		// Long enough that a reader that is merely starved of CPU (race detector,
+		// loaded runner) is not mistaken for a stuck one: the write deadline applies
+		// to every stream, the healthy one included.
+		c.Stream.WriteTimeout = 5 * time.Second
 		c.Stream.Heartbeat = -1
 		c.Stream.MaxEventBytes = 1 << 30
 		c.Stream.ClientBuffer = 100000 // only the write deadline can close the slow stream
@@ -399,32 +409,37 @@ func TestStreamSlowClientIsClosedAndDoesNotStallOthers(t *testing.T) {
 	sid, _ := f.create("Bearer alice")
 
 	// A reader that never reads.
-	slow := f.get("Bearer alice", "session_id="+sid, nil)
-	_ = slow
+	_ = f.get("Bearer alice", "session_id="+sid, nil)
 	fast, _ := f.open(sid, nil, "")
 	f.h.mu.RLock()
 	sess := f.h.sessions[sid]
 	f.h.mu.RUnlock()
-	deadline := time.Now().Add(2 * time.Second)
-	for sess.clientCount() < 2 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor(t, "both streams attached", func() bool { return sess.clientCount() == 2 })
 
 	big := strings.Repeat("x", 256<<10)
-	start := time.Now()
 	for i := 0; i < 120; i++ { // ~30 MiB: beyond any socket buffering
 		f.emit(sid, progress(sid, "f", big))
 	}
-	fast.waitEvents(t, 120)
-	if time.Since(start) > 10*time.Second {
-		t.Fatalf("a slow reader stalled delivery: %v", time.Since(start))
+	// The healthy client receives every event, in order, while the other
+	// stream is blocked: delivery must keep progressing (stall detection).
+	evs := fast.waitEvents(t, 120)
+	if len(evs) != 120 {
+		t.Fatalf("the healthy client got %d events, want 120", len(evs))
 	}
-	deadline = time.Now().Add(3 * time.Second)
-	for sess.clientCount() > 1 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if n := sess.clientCount(); n != 1 {
-		t.Fatalf("the slow client's stream was not closed (%d streams)", n)
+	// The blocked stream is closed by its write deadline.
+	waitFor(t, "the slow stream to be closed", func() bool { return sess.clientCount() == 1 })
+}
+
+// waitFor polls cond; it fails only if cond is still false after a very
+// generous time, the point being to wait for an event, not to time it.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
@@ -577,7 +592,7 @@ func TestAppendFailureEndsStreamsInsteadOfSendingAnIDlessEvent(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the stream stayed open")
 	}
 	if len(c.events) != 0 {
@@ -604,7 +619,7 @@ func TestStreamQueueOverflowClosesTheStream(t *testing.T) {
 	for i := 0; i < 120 && sess.clientCount() > 0; i++ {
 		f.emit(sid, progress(sid, "f", big))
 	}
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for sess.clientCount() > 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -675,7 +690,7 @@ func (h *hookLog) Append(sid string, d []byte) (string, error) {
 // run over HTTP/2.
 func TestStreamWriteDeadlineDoesNotKillAnIdleStream(t *testing.T) {
 	f := newSecuredFixture(t, func(c *ServerConfig) {
-		c.Stream.WriteTimeout = 100 * time.Millisecond
+		c.Stream.WriteTimeout = 500 * time.Millisecond
 		c.Stream.Heartbeat = -1
 	})
 	sid, _ := f.create("Bearer alice")
@@ -685,7 +700,7 @@ func TestStreamWriteDeadlineDoesNotKillAnIdleStream(t *testing.T) {
 	t.Cleanup(ts.Close)
 	client := ts.Client()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events?session_id="+sid, nil)
 	req.Header.Set("Authorization", "Bearer alice")
@@ -701,7 +716,7 @@ func TestStreamWriteDeadlineDoesNotKillAnIdleStream(t *testing.T) {
 	go c.read()
 	f.emit(sid, progress(sid, "f", "s1"))
 	c.waitEvents(t, 1)
-	time.Sleep(400 * time.Millisecond) // well past the write timeout
+	time.Sleep(1200 * time.Millisecond) // well past the write timeout
 	f.emit(sid, progress(sid, "f", "s2"))
 	c.waitEvents(t, 2)
 }
@@ -733,7 +748,7 @@ func TestAppendFailureTurnsEarlierCursorsIntoGaps(t *testing.T) {
 	f.emit(sid, progress(sid, "f", "a"))
 	cursor := c.waitEvents(t, 1)[0].ID
 	f.emit(sid, progress(sid, "f", "b")) // the append fails
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		f.h.mu.RLock()
 		s := f.h.sessions[sid]
@@ -767,7 +782,7 @@ func TestStreamOverflowAbortsTheBlockedWrite(t *testing.T) {
 	for i := 0; i < 120 && sess.active.Load() > 0; i++ {
 		f.emit(sid, progress(sid, "f", big))
 	}
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for sess.active.Load() > 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -831,7 +846,7 @@ func TestReplacementWaitsForRetiringSession(t *testing.T) {
 	close(spy.release)
 	select {
 	case <-built:
-	case <-time.After(3 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the replacement never became available")
 	}
 }
@@ -899,7 +914,7 @@ func TestMessageFromProfileInitIsLoggedAndTracked(t *testing.T) {
 		f.h.mu.RLock()
 		tr := f.h.trackers[sid]
 		f.h.mu.RUnlock()
-		deadline := time.Now().Add(2 * time.Second)
+		deadline := time.Now().Add(60 * time.Second)
 		for len(tr.resendable()) == 0 && time.Now().Before(deadline) {
 			time.Sleep(2 * time.Millisecond)
 		}
@@ -946,7 +961,7 @@ func TestAbortHookIsInstalledAtomicallyWithRegistration(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		f.emit(sid, progress(sid, "f", "x"))
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for kills.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}

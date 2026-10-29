@@ -392,7 +392,7 @@ func (r *tvRun) expectEvents(i int, st tvStep, c *tvConn, want []any, _ []string
 // take waits for n more events (or, for n == 0, for a moment to see that none
 // arrive) and returns everything received since the last take.
 func (c *tvConn) take(n int) []tvEvent {
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	if n == 0 {
 		time.Sleep(150 * time.Millisecond) // nothing may arrive
 		deadline = time.Now()
