@@ -16,9 +16,9 @@ import (
 
 // TestVector is the schema for a single WMP conformance test vector.
 type TestVector struct {
-	ID               string          `json:"id"`
-	Description      string          `json:"description"`
-	ConformanceLevel string          `json:"conformance_level"`
+	ID               string `json:"id"`
+	Description      string `json:"description"`
+	ConformanceLevel string `json:"conformance_level"`
 	// Setup configures the responder under test (spec vectors README); the
 	// RPC service harness honours supported_versions.
 	Setup struct {
@@ -30,7 +30,7 @@ type TestVector struct {
 	// MustRefuse marks a negative vector: the input is a message a conforming
 	// receiver MUST refuse, so the conformance check has to report a violation.
 	MustRefuse bool   `json:"must_refuse,omitempty"`
-	Notes            string          `json:"notes,omitempty"`
+	Notes      string `json:"notes,omitempty"`
 }
 
 // genericRPC is a loosely-typed JSON-RPC message for structural validation.
@@ -108,40 +108,45 @@ func knownMethods() map[string]bool {
 		wmp.MethodMessageStatus:       true,
 		wmp.MethodCapabilityUpdate:    true,
 		wmp.MethodCapabilityList:      true,
-		wmp.MethodFlowStart:          true,
-		wmp.MethodFlowProgress:       true,
-		wmp.MethodFlowAction:         true,
-		wmp.MethodFlowComplete:       true,
-		wmp.MethodFlowError:          true,
-		wmp.MethodFlowCancel:         true,
-		wmp.MethodResolve:            true,
-		wmp.MethodRelayRegister:      true,
+		wmp.MethodFlowStart:           true,
+		wmp.MethodFlowProgress:        true,
+		wmp.MethodFlowAction:          true,
+		wmp.MethodFlowComplete:        true,
+		wmp.MethodFlowError:           true,
+		wmp.MethodFlowCancel:          true,
+		wmp.MethodResolve:             true,
+		wmp.MethodRelayRegister:       true,
 	}
 }
 
 // knownErrors returns the set of all WMP + JSON-RPC error codes.
 func knownErrors() map[int]bool {
 	return map[int]bool{
-		wmp.ErrParseError:               true,
-		wmp.ErrInvalidRequest:           true,
-		wmp.ErrMethodNotFound:           true,
-		wmp.ErrInvalidParams:            true,
-		wmp.ErrInternalError:            true,
-		wmp.ErrSessionNotFound:          true,
-		wmp.ErrSessionExpired:           true,
-		wmp.ErrNotAuthorized:            true,
-		wmp.ErrEncryptionRequired:       true,
-		wmp.ErrMLSError:                 true,
-		wmp.ErrCapabilityNotSupported:   true,
-		wmp.ErrFlowError:                true,
-		wmp.ErrRateLimited:              true,
-		wmp.ErrParticipantNotFound:      true,
-		wmp.ErrEvidenceRequired:         true,
-		wmp.ErrSignatureInvalid:         true,
-		wmp.ErrTimestampInvalid:         true,
-		wmp.ErrIdentityAssertionInvalid: true,
-		wmp.ErrVersionNotSupported:      true,
-		wmp.ErrQueueFull:                true,
+		wmp.ErrParseError:                 true,
+		wmp.ErrInvalidRequest:             true,
+		wmp.ErrMethodNotFound:             true,
+		wmp.ErrInvalidParams:              true,
+		wmp.ErrInternalError:              true,
+		wmp.ErrSessionNotFound:            true,
+		wmp.ErrSessionExpired:             true,
+		wmp.ErrNotAuthorized:              true,
+		wmp.ErrEncryptionRequired:         true,
+		wmp.ErrMLSError:                   true,
+		wmp.ErrCapabilityNotSupported:     true,
+		wmp.ErrFlowError:                  true,
+		wmp.ErrRateLimited:                true,
+		wmp.ErrParticipantNotFound:        true,
+		wmp.ErrEvidenceRequired:           true,
+		wmp.ErrSignatureInvalid:           true,
+		wmp.ErrTimestampInvalid:           true,
+		wmp.ErrIdentityAssertionInvalid:   true,
+		wmp.ErrVersionNotSupported:        true,
+		wmp.ErrQueueFull:                  true,
+		wmp.ErrDelegationInvalid:          true,
+		wmp.ErrConsignmentModeUnsupported: true,
+		wmp.ErrAssuranceLevelUnsupported:  true,
+		wmp.ErrPolicyUnsupported:          true,
+		wmp.ErrPlaintextHashMismatch:      true,
 	}
 }
 
