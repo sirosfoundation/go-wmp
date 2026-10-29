@@ -384,10 +384,38 @@ func (fc *FlowContext) cancelSubFlow(ctx context.Context, sub *subFlow) {
 		}
 		cctx, cancel := context.WithTimeout(bg, 5*time.Second)
 		defer cancel()
-		_ = fc.peer.Call(cctx, MethodFlowCancel, &FlowCancelParams{
-			WMP: meta, FlowID: sub.id, Reason: CancelReasonNoLongerNeeded,
-		}, nil)
+		// A receiver whose start is still running refuses the cancel as
+		// "still starting": it is repeated, with a short back-off, within the
+		// 5 s the cancel has.
+		for delay := 50 * time.Millisecond; ; delay *= 2 {
+			err := fc.peer.Call(cctx, MethodFlowCancel, &FlowCancelParams{
+				WMP: meta, FlowID: sub.id, Reason: CancelReasonNoLongerNeeded,
+			}, nil)
+			if !stillStarting(err) {
+				return
+			}
+			select {
+			case <-time.After(delay):
+			case <-cctx.Done():
+				return
+			}
+		}
 	}()
+}
+
+// stillStarting reports whether err is the -31006 "flow is still starting"
+// refusal of a request that arrived before the flow existed.
+func stillStarting(err error) bool {
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError {
+		return false
+	}
+	var d map[string]json.RawMessage
+	if json.Unmarshal(rpcErr.Data, &d) != nil {
+		return false
+	}
+	var reason string
+	return json.Unmarshal(d["reason"], &reason) == nil && reason == "flow is still starting"
 }
 
 // subFlowParams returns params as a JSON object with parent_flow_id set.

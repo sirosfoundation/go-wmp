@@ -1,6 +1,7 @@
 package wmp
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -11,7 +12,6 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // generateRequestID creates a cryptographically random JSON-RPC request ID.
@@ -558,20 +558,40 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 	}
 }
 
-// startIdentity identifies a wmp.flow.start by what it asks for: the flow type
-// and its params. The same start sent again has the same identity.
+// startIdentity identifies a wmp.flow.start by what it asks for: the flow type,
+// its timeout and its params, the params compared as JSON values (member order
+// and whitespace do not matter, numbers keep their precision). The same start
+// sent again has the same identity.
 func startIdentity(ps *FlowStartParams) [32]byte {
 	h := sha256.New()
 	h.Write([]byte(ps.FlowType))
 	h.Write([]byte{0})
-	h.Write(ps.Params)
+	fmt.Fprintf(h, "%d", ps.Timeout)
+	h.Write([]byte{0})
+	h.Write(canonicalJSON(ps.Params))
 	var sum [32]byte
 	copy(sum[:], h.Sum(nil))
 	return sum
 }
 
-// maxStartWait bounds how long an action waits for the start of its flow.
-const maxStartWait = 30 * time.Second
+// canonicalJSON re-encodes raw with sorted object members and no insignificant
+// whitespace; raw that is not valid JSON is returned as is.
+func canonicalJSON(raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return raw
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return raw
+	}
+	return out
+}
 
 // dispatchFlowStart routes a wmp.flow.start to the profile that owns its flow
 // type, or to the Handler.
@@ -690,31 +710,26 @@ func (p *Peer) viaRoute(e flowEntry, fn func(e flowEntry)) bool {
 
 // dispatchFlowAction routes a wmp.flow.action to its flow.
 func (p *Peer) dispatchFlowAction(ctx context.Context, ps *FlowActionParams) (interface{}, error) {
-	// An action is a request the flow must answer, and the flow does not exist
-	// until its start has returned: a worker may well ask for an action (a
-	// progress notification) before that, so the action waits for the start,
-	// from the starting session only.
-	if startSession, starting := p.registry.startingSession(ps.FlowID); starting {
-		if startSession != "" && startSession != ps.WMP.SessionID {
-			return nil, NewRPCError(ErrNotAuthorized, nil)
-		}
-		wait := time.NewTimer(maxStartWait)
-		defer wait.Stop()
-		select {
-		case <-p.registry.startDone(ps.FlowID):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-wait.C:
+	e, routed := p.registry.lookupFlow(ps.FlowID)
+	if !routed {
+		// A flow whose start is running and has published no route (a fallback
+		// Handler.FlowStart) cannot take the action yet: refused, for the
+		// starting session only, to be repeated.
+		if startSession, starting := p.registry.startingSession(ps.FlowID); starting {
+			if startSession != "" && startSession != ps.WMP.SessionID {
+				return nil, NewRPCError(ErrNotAuthorized, nil)
+			}
 			return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow is still starting"})
 		}
-	}
-	e, ok := p.registry.lookupFlow(ps.FlowID)
-	if !ok {
 		return p.handler.FlowAction(ctx, ps)
 	}
 	if !e.allows(ps.WMP.SessionID) {
 		return nil, NewRPCError(ErrNotAuthorized, nil)
 	}
+	// A route that is published (its handler's StartFlow is running) is
+	// dispatched to at once: a worker that asked for an action before StartFlow
+	// returned must get it, and waiting for the start would deadlock a start
+	// that itself waits for the action.
 	var (
 		res  *FlowActionResult
 		rerr error
@@ -745,7 +760,7 @@ func (p *Peer) dispatchFlowCancel(ctx context.Context, ps *FlowCancelParams) (in
 		// published and its handler stops flows (FlowCanceller). Otherwise it
 		// is refused, not acknowledged and lost.
 		_, canStop := e.handler.(FlowCanceller)
-		if routed && canStop && p.registry.deferWhileStarting(ps.FlowID, deferCancel, func() { _, _ = p.applyCancel(ctx, e, ps) }) {
+		if routed && canStop && p.registry.deferWhileStarting(ps.FlowID, deferCancel, func() { _, _ = p.applyCancel(context.WithoutCancel(ctx), e, ps) }) {
 			return cancelled, nil
 		}
 		if !routed || !canStop {
@@ -762,6 +777,16 @@ func (p *Peer) dispatchFlowCancel(ctx context.Context, ps *FlowCancelParams) (in
 			// Handler would say about a flow it never saw.
 			return cancelled, nil
 		}
+		if e.managed || e.claimed {
+			return p.handler.FlowCancel(ctx, ps)
+		}
+		// An ordinary handler's flow that has no canceller: the Handler
+		// answers, and the route goes only if it accepted.
+		res, err := p.handler.FlowCancel(ctx, ps)
+		if err == nil {
+			p.registry.release(ps.FlowID, e.gen)
+		}
+		return res, err
 	}
 	return p.handler.FlowCancel(ctx, ps)
 }
@@ -777,7 +802,9 @@ func (p *Peer) applyCancel(ctx context.Context, e flowEntry, ps *FlowCancelParam
 		if fc, ok := e.handler.(FlowCanceller); ok {
 			stopped, err = fc.HandleCancel(withFlowGen(ctx, e.gen), ps)
 		}
-		if (stopped || !e.claimed) && !e.managed {
+		// The route of an ordinary handler's flow ends only once the handler
+		// has stopped it; one that refused (err) keeps its route.
+		if stopped && !e.managed {
 			p.registry.release(ps.FlowID, e.gen)
 		}
 	})
