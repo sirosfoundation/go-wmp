@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -33,6 +34,17 @@ type FlowContext struct {
 	doneCh   chan struct{}
 	mu       sync.Mutex
 	err      error
+
+	// profile is the AsyncFlowProfile that runs the flow; sub-flows are
+	// routed through it. Nil for a FlowContext built outside a profile.
+	profile *AsyncFlowProfile
+	// stop cancels the context the flow function runs under (see StartFlow).
+	stop context.CancelFunc
+	// gen is the generation of the flow's route and release ends exactly that
+	// route (both from the Peer, see flowRoute); zero and a no-op outside one.
+	gen      uint64
+	release  func()
+	terminal func()
 }
 
 // newFlowContext creates a FlowContext for a specific flow.
@@ -40,15 +52,21 @@ func newFlowContext(flowID, flowType string, params json.RawMessage, peer PeerCo
 	return newSessionFlowContext(flowID, flowType, params, peer, "")
 }
 
+// noop is the default release and terminal hook of a FlowContext that no Peer
+// routes (it has no route to end).
+func noop() { /* nothing to do: no route */ }
+
 func newSessionFlowContext(flowID, flowType string, params json.RawMessage, peer PeerContext, sessionID string) *FlowContext {
 	return &FlowContext{
+		release:   noop,
+		terminal:  noop,
 		FlowID:    flowID,
 		FlowType:  flowType,
 		Params:    params,
 		sessionID: sessionID,
 		peer:      peer,
-		actionCh: make(chan *FlowActionParams, 10),
-		doneCh:   make(chan struct{}),
+		actionCh:  make(chan *FlowActionParams, 10),
+		doneCh:    make(chan struct{}),
 	}
 }
 
@@ -107,11 +125,15 @@ func (fc *FlowContext) Complete(ctx context.Context, result interface{}) error {
 			return fmt.Errorf("marshal complete result: %w", err)
 		}
 	}
-	return fc.peer.Notify(ctx, MethodFlowComplete, &FlowCompleteParams{
+	err := fc.peer.Notify(ctx, MethodFlowComplete, &FlowCompleteParams{
 		WMP:    fc.meta(),
 		FlowID: fc.FlowID,
 		Result: raw,
 	})
+	if err == nil {
+		fc.cancel() // the flow is terminal: its sub-flows and its context end
+	}
+	return err
 }
 
 // Error sends a wmp.flow.error notification and marks the flow as failed.
@@ -124,29 +146,68 @@ func (fc *FlowContext) Error(ctx context.Context, code int, message string, data
 			return fmt.Errorf("marshal error data: %w", err)
 		}
 	}
-	return fc.peer.Notify(ctx, MethodFlowError, &FlowErrorParams{
+	err := fc.peer.Notify(ctx, MethodFlowError, &FlowErrorParams{
 		WMP:     fc.meta(),
 		FlowID:  fc.FlowID,
 		Code:    code,
 		Message: message,
 		Data:    raw,
 	})
+	if err == nil {
+		fc.cancel()
+	}
+	return err
 }
 
-// meta is the wmp object for the flow's notifications: just the originating
-// session. The Peer fills version and sender (WithSessionIdentity).
+// meta is the wmp object for the flow's messages: the version negotiated for
+// the flow's session (Version when the peer does not track one) and the
+// originating session. The Peer fills the sender (WithSessionIdentity).
+//
+// The version is set here, not only by the Peer's stamping, because a Peer
+// without WithSessionIdentity does not stamp: the message would then carry an
+// empty wmp.version, which core section 2.2.3 forbids.
 func (fc *FlowContext) meta() Metadata {
-	return Metadata{SessionID: fc.sessionID}
+	version := Version
+	if vf, ok := fc.peer.(interface{ versionFor(string) string }); ok {
+		version = vf.versionFor(fc.sessionID)
+	}
+	return Metadata{Version: version, SessionID: fc.sessionID}
 }
 
-// cancel signals the flow goroutine to stop.
-func (fc *FlowContext) cancel() {
+// terminate closes the done channel, which ends WaitForAction and any
+// pending sub-flow request. The flow is terminal: Complete and Error call it
+// once their notification went out.
+func (fc *FlowContext) terminate() {
 	fc.mu.Lock()
-	defer fc.mu.Unlock()
 	select {
 	case <-fc.doneCh:
 	default:
 		close(fc.doneCh)
+	}
+	fc.mu.Unlock()
+	fc.terminal()
+}
+
+// isTerminal reports whether the flow has ended: its terminal notification went
+// out, or it was cancelled.
+func (fc *FlowContext) isTerminal() bool {
+	select {
+	case <-fc.doneCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// cancel signals the flow goroutine to stop: it ends the flow (terminate) and
+// cancels the context the flow function runs under.
+func (fc *FlowContext) cancel() {
+	fc.terminate()
+	fc.mu.Lock()
+	stop := fc.stop
+	fc.mu.Unlock()
+	if stop != nil {
+		stop()
 	}
 }
 
@@ -164,10 +225,64 @@ func (fc *FlowContext) deliverAction(params *FlowActionParams) {
 type AsyncFlowProfile struct {
 	name     string
 	handlers map[string]FlowFunc
-	peer     PeerContext
+
+	// peer is the peer the profile was last initialised with (guarded by
+	// peerMu, apart from mu so that code holding mu can read it).
+	peerMu sync.RWMutex
+	peer   PeerContext
 
 	mu    sync.RWMutex
-	flows map[string]*FlowContext // keyed by flow ID
+	flows map[flowKey]*FlowContext // keyed by the dispatching peer and the flow ID
+
+	// children holds the sub-flows this profile started (RequestSubFlow),
+	// keyed by child flow ID, and childSeq orders them.
+	children map[flowKey]*subFlow
+	childSeq uint64
+
+	// afterStart, when set, runs at the end of StartFlow, just before it
+	// returns (a seam for tests of workers that end first).
+	afterStart func()
+}
+
+// managesFlowRoutes marks the profile as ending the route of each of its flows
+// itself (see routeManager).
+func (p *AsyncFlowProfile) managesFlowRoutes() { /* marker method: see routeManager */ }
+
+// flowKey identifies a flow of a profile shared by several peers (an HTTP+SSE
+// server gives each session its own Peer): the same flow_id on two peers is two
+// flows.
+type flowKey struct {
+	peer any
+	id   string
+}
+
+// peerCtxKey carries the dispatching Peer in the context of a flow message.
+type peerCtxKey struct{}
+
+// contextWithPeer returns ctx carrying the Peer that is dispatching.
+func contextWithPeer(ctx context.Context, p PeerContext) context.Context {
+	return context.WithValue(ctx, peerCtxKey{}, p)
+}
+
+// peerFor is the peer a flow message was dispatched on: the one in ctx, else
+// the peer the profile was last initialised with.
+func (p *AsyncFlowProfile) peerFor(ctx context.Context) PeerContext {
+	if pc, ok := ctx.Value(peerCtxKey{}).(PeerContext); ok {
+		return pc
+	}
+	p.peerMu.RLock()
+	defer p.peerMu.RUnlock()
+	return p.peer
+}
+
+// keyFor is the map key of flow id on the peer ctx names. A peer that is not a
+// comparable value cannot be told apart and shares the nil key.
+func (p *AsyncFlowProfile) keyFor(ctx context.Context, id string) flowKey {
+	pc := p.peerFor(ctx)
+	if pc != nil && reflect.TypeOf(pc).Comparable() {
+		return flowKey{peer: pc, id: id}
+	}
+	return flowKey{id: id}
 }
 
 // NewAsyncFlowProfile creates a profile that manages async flow goroutines.
@@ -175,7 +290,8 @@ func NewAsyncFlowProfile(name string) *AsyncFlowProfile {
 	return &AsyncFlowProfile{
 		name:     name,
 		handlers: make(map[string]FlowFunc),
-		flows:    make(map[string]*FlowContext),
+		flows:    make(map[flowKey]*FlowContext),
+		children: make(map[flowKey]*subFlow),
 	}
 }
 
@@ -186,10 +302,12 @@ func (p *AsyncFlowProfile) Handle(flowType string, fn FlowFunc) {
 
 // --- Profile interface ---
 
-func (p *AsyncFlowProfile) Name() string            { return p.name }
-func (p *AsyncFlowProfile) Capabilities() []string   { return nil }
+func (p *AsyncFlowProfile) Name() string           { return p.name }
+func (p *AsyncFlowProfile) Capabilities() []string { return nil }
 func (p *AsyncFlowProfile) Init(ctx PeerContext) error {
+	p.peerMu.Lock()
 	p.peer = ctx
+	p.peerMu.Unlock()
 	return nil
 }
 
@@ -206,9 +324,7 @@ func (p *AsyncFlowProfile) FlowTypes() []string {
 func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParams) (*FlowStartResult, error) {
 	fn, ok := p.handlers[params.FlowType]
 	if !ok {
-		return nil, NewRPCError(ErrFlowError, map[string]string{
-			"reason": "unknown flow type: " + params.FlowType,
-		})
+		return nil, NewUnsupportedError(params.FlowType, nil)
 	}
 
 	// The session the request arrived in: the store-resolved one if known,
@@ -217,39 +333,106 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	if sess := SessionFromContext(ctx); sess != nil {
 		sessionID = sess.ID
 	}
-	fc := newSessionFlowContext(params.FlowID, params.FlowType, params.Params, p.peer, sessionID)
+	// A start that names no session belongs to the peer's own (the session
+	// its identity names), as the Peer binds its route.
+	if sessionID == "" {
+		if d, ok := p.peerFor(ctx).(interface{ defaultSessionID() string }); ok {
+			sessionID = d.defaultSessionID()
+		}
+	}
+	// The peer the start was dispatched on, which a profile shared by several
+	// peers cannot take from its own field: the flow's messages, its sub-flow
+	// claims and its lifetime are that peer's.
+	peer := p.peerFor(ctx)
+	key := p.keyFor(ctx, params.FlowID)
+	fc := newSessionFlowContext(params.FlowID, params.FlowType, params.Params, peer, sessionID)
+	fc.profile = p
+
+	// The flow outlives the request that started it. ctx is the request's
+	// context: an HTTP transport cancels it when the response is written,
+	// which would end every flow the moment wmp.flow.start returned. Keep its
+	// values (session, sender, principal) but not its cancellation, and give
+	// the flow its own cancel, which CancelFlow, a remote wmp.flow.cancel and
+	// the end of the flow trigger.
+	flowCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+	fc.stop = stop
+	if route, ok := flowRouteFrom(ctx); ok {
+		fc.gen, fc.release, fc.terminal = route.gen, route.release, route.terminal
+	}
+	// ...but not the peer: closing the Peer, or the end of Serve, ends the
+	// whole flow, sub-flows included.
+	if lt, ok := peer.(interface{ Lifetime() <-chan struct{} }); ok {
+		go func() {
+			select {
+			case <-lt.Lifetime():
+				fc.cancel()
+			case <-fc.doneCh:
+			}
+		}()
+	}
+
 	p.mu.Lock()
-	p.flows[params.FlowID] = fc
+	p.flows[key] = fc
 	p.mu.Unlock()
 
 	// Run the flow handler in a goroutine.
 	go func() {
 		defer func() {
 			p.mu.Lock()
-			delete(p.flows, params.FlowID)
+			if p.flows[key] == fc {
+				delete(p.flows, key)
+			}
 			p.mu.Unlock()
 			fc.cancel()
+			// The flow is over: its route (this instance's, not a later
+			// flow's of the same ID) ends.
+			fc.release()
 		}()
 
-		if err := fn(ctx, fc); err != nil {
-			fc.Error(ctx, ErrFlowError, err.Error(), nil)
+		// A flow that was cancelled (by the remote peer, CancelFlow or the
+		// peer's end) is already over: its function returning an error
+		// because of that is not a failure to report.
+		if err := fn(flowCtx, fc); err != nil && flowCtx.Err() == nil && !fc.isTerminal() {
+			fc.Error(flowCtx, ErrFlowError, err.Error(), nil)
 		}
 	}()
 
+	if p.afterStart != nil {
+		p.afterStart()
+	}
 	return &FlowStartResult{
+		WMP:      Metadata{Version: fc.meta().Version, SessionID: sessionID},
 		FlowID:   params.FlowID,
 		FlowType: params.FlowType,
 	}, nil
 }
 
-func (p *AsyncFlowProfile) HandleAction(_ context.Context, params *FlowActionParams) (*FlowActionResult, error) {
+// flowOf returns the flow a message dispatched with ctx is for. A message
+// dispatched for one instance of a flow_id never reaches a later instance of it.
+func (p *AsyncFlowProfile) flowOf(ctx context.Context, id string) (flowKey, *FlowContext) {
+	key := p.keyFor(ctx, id)
 	p.mu.RLock()
-	fc, ok := p.flows[params.FlowID]
+	fc := p.flows[key]
 	p.mu.RUnlock()
-	if !ok {
+	if fc != nil {
+		if gen := flowGenFrom(ctx); gen != 0 && fc.gen != gen {
+			return key, nil
+		}
+	}
+	return key, fc
+}
+
+func (p *AsyncFlowProfile) HandleAction(ctx context.Context, params *FlowActionParams) (*FlowActionResult, error) {
+	_, fc := p.flowOf(ctx, params.FlowID)
+	if fc == nil {
 		return nil, NewRPCError(ErrFlowError, map[string]string{
 			"reason": "flow not found: " + params.FlowID,
 		})
+	}
+	// A flow that sent its terminal notification takes no more actions, though
+	// its worker may still be winding down.
+	if fc.isTerminal() {
+		return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "already_terminal"})
 	}
 
 	fc.deliverAction(params)
@@ -265,46 +448,83 @@ func (p *AsyncFlowProfile) HandleProgress(_ context.Context, params *FlowProgres
 	// Progress from remote peer — currently no routing needed for server-side flows.
 }
 
-func (p *AsyncFlowProfile) HandleComplete(_ context.Context, params *FlowCompleteParams) {
-	p.mu.Lock()
-	fc, ok := p.flows[params.FlowID]
-	if ok {
-		delete(p.flows, params.FlowID)
+func (p *AsyncFlowProfile) HandleComplete(ctx context.Context, params *FlowCompleteParams) {
+	if p.deliverSubFlow(p.keyFor(ctx, params.FlowID), subFlowOutcome{result: params.Result}) {
+		return
 	}
-	p.mu.Unlock()
-	if ok {
+	if _, fc := p.flowOf(ctx, params.FlowID); fc != nil {
 		fc.cancel()
 	}
 }
 
-func (p *AsyncFlowProfile) HandleError(_ context.Context, params *FlowErrorParams) {
-	p.mu.Lock()
-	fc, ok := p.flows[params.FlowID]
-	if ok {
-		delete(p.flows, params.FlowID)
+func (p *AsyncFlowProfile) HandleError(ctx context.Context, params *FlowErrorParams) {
+	failure := &SubFlowError{Code: params.Code, Message: params.Message, Data: params.Data}
+	if p.deliverSubFlow(p.keyFor(ctx, params.FlowID), subFlowOutcome{err: failure}) {
+		return
 	}
-	p.mu.Unlock()
-	if ok {
+	if _, fc := p.flowOf(ctx, params.FlowID); fc != nil {
 		fc.cancel()
 	}
 }
 
-// ActiveFlows returns the number of currently active flows.
+// HandleCancel implements FlowCanceller: a remote wmp.flow.cancel ends the
+// flow, and with it the sub-flows it is waiting for.
+func (p *AsyncFlowProfile) HandleCancel(ctx context.Context, params *FlowCancelParams) (bool, error) {
+	_, fc := p.flowOf(ctx, params.FlowID)
+	if fc != nil && fc.isTerminal() {
+		return false, NewRPCError(ErrFlowError, map[string]string{"reason": "already_terminal"})
+	}
+	return p.cancelFlowContext(fc), nil
+}
+
+// ActiveFlows returns the number of flows that have not ended. A flow that
+// completed, failed or was cancelled stays known (and answers -31006
+// already_terminal) until its worker has exited.
 func (p *AsyncFlowProfile) ActiveFlows() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return len(p.flows)
+	n := 0
+	for _, fc := range p.flows {
+		if !fc.isTerminal() {
+			n++
+		}
+	}
+	return n
 }
 
-// CancelFlow cancels a specific flow by ID.
+// CancelFlow cancels the flows with the given ID on every peer that runs one.
+// With a profile shared by several sessions that is rarely what is wanted:
+// CancelSessionFlow names the session.
 func (p *AsyncFlowProfile) CancelFlow(flowID string) {
-	p.mu.Lock()
-	fc, ok := p.flows[flowID]
-	if ok {
-		delete(p.flows, flowID)
+	p.cancelMatching(func(fc *FlowContext) bool { return fc.FlowID == flowID })
+}
+
+// CancelSessionFlow cancels the flow flowID of the session sessionID only.
+func (p *AsyncFlowProfile) CancelSessionFlow(sessionID, flowID string) {
+	p.cancelMatching(func(fc *FlowContext) bool { return fc.FlowID == flowID && fc.effectiveSession() == sessionID })
+}
+
+func (p *AsyncFlowProfile) cancelMatching(match func(*FlowContext) bool) {
+	p.mu.RLock()
+	var found []*FlowContext
+	for _, fc := range p.flows {
+		if match(fc) {
+			found = append(found, fc)
+		}
 	}
-	p.mu.Unlock()
-	if ok {
-		fc.cancel()
+	p.mu.RUnlock()
+	for _, fc := range found {
+		p.cancelFlowContext(fc)
 	}
+}
+
+// cancelFlowContext cancels one flow instance, reporting whether there was one.
+// Its flow_id stays reserved until the worker has exited: a flow of the same ID
+// cannot start, and the old worker cannot send under it, before that.
+func (p *AsyncFlowProfile) cancelFlowContext(fc *FlowContext) bool {
+	if fc == nil {
+		return false
+	}
+	fc.cancel()
+	return true
 }
