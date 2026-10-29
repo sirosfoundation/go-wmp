@@ -113,23 +113,46 @@ type flowEntry struct {
 	// "" accepts any session.
 	session string
 	claimed bool
-	// managed: the handler releases the route itself when the flow ends (see
-	// routeManager), so the Peer does not on an outgoing terminal notification.
+	// managed: the handler ends the route of each flow itself, when the flow's
+	// worker has exited (see routeManager). The route of any other handler's
+	// flow may be replaced by a start of the same flow_id from the same session.
 	managed bool
 	gen     uint64
+	// inflight counts the dispatches that are using the route; a route that
+	// is released meanwhile (ended) goes away when the last one is done.
+	inflight int
+	ended    bool
 }
 
+// Limits of what is held for a flow whose start is still running: a few
+// progress notifications, at most one terminal notification and one cancel.
+const maxDeferredProgress = 16
+
 // startState is a wmp.flow.start whose handler is running. Messages for the
-// flow that arrive meanwhile are held in deferred and applied, in order, once
-// the handler has returned and the flow exists.
-type startState struct{ deferred []func() }
+// flow that arrive meanwhile are held, within the limits above, and applied in
+// order once the handler has returned and the flow exists.
+type startState struct {
+	session  string
+	progress []func()
+	terminal func()
+	cancel   func()
+}
+
+// Kinds of message held while a flow starts.
+type deferKind int
+
+const (
+	deferProgress deferKind = iota
+	deferTerminal
+	deferCancel
+)
 
 // lookupFlow returns a snapshot of the route of flowID.
 func (r *registry) lookupFlow(flowID string) (flowEntry, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	e, ok := r.flows[flowID]
-	if !ok {
+	if !ok || e.ended {
 		return flowEntry{}, false
 	}
 	return *e, true
@@ -141,20 +164,52 @@ func (e flowEntry) allows(sessionID string) bool {
 	return e.session == "" || e.session == sessionID
 }
 
-// beginStart reserves flowID for a wmp.flow.start about to run a handler. It
-// fails when the flow_id is already routed (a claim, or a flow still running)
-// or another start of it is in progress: a start never replaces a live flow or
-// its session binding.
-func (r *registry) beginStart(flowID string) bool {
+// acquire marks one dispatch as using generation gen of flowID's route; it
+// fails when that route is gone, so a message for an old instance is dropped.
+// Every successful acquire is paired with done.
+func (r *registry) acquire(flowID string, gen uint64) (flowEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, owned := r.flows[flowID]; owned {
-		return false
+	e, ok := r.flows[flowID]
+	if !ok || e.gen != gen || e.ended {
+		return flowEntry{}, false
 	}
+	e.inflight++
+	return *e, true
+}
+
+// done ends the use acquire began.
+func (r *registry) done(flowID string, gen uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.flows[flowID]; ok && e.gen == gen {
+		e.inflight--
+		if e.ended && e.inflight <= 0 {
+			delete(r.flows, flowID)
+		}
+	}
+}
+
+// beginStart reserves flowID, for messages of sessionID, for a wmp.flow.start
+// about to run a handler. It fails when the flow_id is routed to a claim or to
+// a flow whose handler manages its own routes, to another session's flow, to
+// a route still in use, or when another start of it is in progress: a start
+// never replaces a live flow of that kind, or another session's. An ordinary
+// handler's flow is replaced by a start of the same flow_id from the same
+// session (a restart); its old route's dispatches have to be done first.
+func (r *registry) beginStart(flowID, sessionID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if _, busy := r.starting[flowID]; busy {
 		return false
 	}
-	r.starting[flowID] = &startState{}
+	if e, owned := r.flows[flowID]; owned {
+		if e.claimed || e.managed || e.session != sessionID || e.inflight > 0 {
+			return false
+		}
+		delete(r.flows, flowID)
+	}
+	r.starting[flowID] = &startState{session: sessionID}
 	return true
 }
 
@@ -169,20 +224,54 @@ func (r *registry) route(flowID, sessionID string, h FlowHandler) uint64 {
 	return r.nextGen
 }
 
-// deferWhileStarting holds fn until the start of flowID has returned, when
-// one is running, and reports whether it did. Otherwise the caller runs it.
-func (r *registry) deferWhileStarting(flowID string, fn func()) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// startingSession returns the session a running start of flowID is for.
+func (r *registry) startingSession(flowID string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	st, ok := r.starting[flowID]
-	if ok {
-		st.deferred = append(st.deferred, fn)
+	if !ok {
+		return "", false
 	}
+	return st.session, true
+}
+
+// isStarting reports whether a wmp.flow.start of flowID is still running.
+func (r *registry) isStarting(flowID string) bool {
+	_, ok := r.startingSession(flowID)
 	return ok
 }
 
-// takeDeferred returns the messages held for flowID; with none left it ends
-// the reservation (done is true), so nothing is applied out of order.
+// deferWhileStarting holds fn until the start of flowID has returned, when one
+// is running, and reports whether it did. Held messages are bounded: progress
+// beyond maxDeferredProgress is dropped, and of terminal notifications (and of
+// cancels) the first is kept. Without a running start the caller runs fn.
+func (r *registry) deferWhileStarting(flowID string, kind deferKind, fn func()) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st, ok := r.starting[flowID]
+	if !ok {
+		return false
+	}
+	switch kind {
+	case deferProgress:
+		if len(st.progress) < maxDeferredProgress {
+			st.progress = append(st.progress, fn)
+		}
+	case deferTerminal:
+		if st.terminal == nil {
+			st.terminal = fn
+		}
+	case deferCancel:
+		if st.cancel == nil {
+			st.cancel = fn
+		}
+	}
+	return true
+}
+
+// takeDeferred returns the messages held for flowID, in the order progress,
+// terminal, cancel; with none left it ends the reservation (done is true), so
+// nothing is applied out of order.
 func (r *registry) takeDeferred(flowID string) (ops []func(), done bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -190,11 +279,17 @@ func (r *registry) takeDeferred(flowID string) (ops []func(), done bool) {
 	if st == nil {
 		return nil, true
 	}
-	if len(st.deferred) == 0 {
+	ops = append(ops, st.progress...)
+	for _, fn := range []func(){st.terminal, st.cancel} {
+		if fn != nil {
+			ops = append(ops, fn)
+		}
+	}
+	st.progress, st.terminal, st.cancel = nil, nil, nil
+	if len(ops) == 0 {
 		delete(r.starting, flowID)
 		return nil, true
 	}
-	ops, st.deferred = st.deferred, nil
 	return ops, false
 }
 
@@ -226,32 +321,20 @@ func (r *registry) claimFlow(flowID, sessionID string, h FlowHandler) (release f
 }
 
 // release ends the route of generation gen of flowID; a later instance of the
-// same flow_id is untouched.
+// same flow_id is untouched. A route a dispatch is still using goes away when
+// that dispatch is done.
 func (r *registry) release(flowID string, gen uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.flows[flowID]; ok && e.gen == gen {
-		delete(r.flows, flowID)
+	e, ok := r.flows[flowID]
+	if !ok || e.gen != gen {
+		return
 	}
-}
-
-// releaseAfterTerminal ends the route of flowID when its own terminal
-// notification went out, for a flow whose handler does not release the route
-// itself, unless it is a claim (which only its claimant ends).
-func (r *registry) releaseAfterTerminal(flowID string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if e, ok := r.flows[flowID]; ok && !e.claimed && !e.managed {
-		delete(r.flows, flowID)
+	if e.inflight > 0 {
+		e.ended = true
+		return
 	}
-}
-
-// isStarting reports whether a wmp.flow.start of flowID is still running.
-func (r *registry) isStarting(flowID string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	_, ok := r.starting[flowID]
-	return ok
+	delete(r.flows, flowID)
 }
 
 // lookupMethod returns the method handler for a custom method.

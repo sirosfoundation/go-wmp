@@ -154,6 +154,8 @@ type subFlow struct {
 	sent chan struct{}
 	// release ends the claim on the sub-flow's flow_id.
 	release func()
+	// parentGen is the generation of the parent flow instance that started it.
+	parentGen uint64
 }
 
 type subFlowOutcome struct {
@@ -219,7 +221,7 @@ func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, para
 	}
 	sub := &subFlow{
 		id: childID, parentID: fc.FlowID, flowType: flowType,
-		sessionID: session, params: body,
+		sessionID: session, params: body, parentGen: fc.gen,
 		outcome: make(chan subFlowOutcome, 1),
 		sent:    make(chan struct{}),
 	}
@@ -377,7 +379,6 @@ func (fc *FlowContext) cancelSubFlow(ctx context.Context, sub *subFlow) {
 		case <-sub.sent:
 		case <-gone:
 			return
-		case <-time.After(10 * time.Minute):
 		}
 		cctx, cancel := context.WithTimeout(bg, 5*time.Second)
 		defer cancel()
@@ -482,7 +483,13 @@ func (p *AsyncFlowProfile) PendingSubFlows(ctx context.Context, parentID string)
 	if !ok || sess == nil || sess.ID == "" {
 		return nil
 	}
-	return p.pendingSubFlows(peer, sess.ID, parentID)
+	// The current instance of the parent only: children of an earlier flow of
+	// the same ID are not shown to its replacement.
+	_, parent := p.flowOf(contextWithPeer(ctx, peer), parentID)
+	if parent == nil {
+		return nil
+	}
+	return p.pendingSubFlows(peer, sess.ID, parentID, parent.gen)
 }
 
 // PendingSubFlows returns this flow's own sub-flows that have not completed or
@@ -492,15 +499,15 @@ func (fc *FlowContext) PendingSubFlows() []PendingSubFlow {
 	if fc.profile == nil || session == "" {
 		return nil
 	}
-	return fc.profile.pendingSubFlows(fc.peer, session, fc.FlowID)
+	return fc.profile.pendingSubFlows(fc.peer, session, fc.FlowID, fc.gen)
 }
 
-func (p *AsyncFlowProfile) pendingSubFlows(peer PeerContext, session, parentID string) []PendingSubFlow {
+func (p *AsyncFlowProfile) pendingSubFlows(peer PeerContext, session, parentID string, parentGen uint64) []PendingSubFlow {
 	want := p.subFlowKey(peer, "").peer
 	p.mu.RLock()
 	subs := make([]*subFlow, 0, len(p.children))
 	for key, sub := range p.children {
-		if sub.parentID != parentID || sub.delivered || key.peer != want {
+		if sub.parentID != parentID || sub.parentGen != parentGen || sub.delivered || key.peer != want {
 			continue
 		}
 		if sub.sessionID != session {

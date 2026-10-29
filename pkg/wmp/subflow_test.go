@@ -816,7 +816,7 @@ func TestFlowRouteSessionBindingAndGenerations(t *testing.T) {
 	if _, ok := r.claimFlow("open", "", h); !ok {
 		t.Fatal("claim without a session")
 	}
-	if !r.beginStart("started") {
+	if !r.beginStart("started", "ses-1") {
 		t.Fatal("beginStart")
 	}
 	gen := r.route("started", "ses-1", h)
@@ -863,26 +863,85 @@ func TestFlowRouteSessionBindingAndGenerations(t *testing.T) {
 	}
 }
 
-func TestReleaseAfterTerminalSkipsClaimsAndManagedHandlers(t *testing.T) {
+func TestBeginStartReplacementRules(t *testing.T) {
 	r := newRegistry()
 	managed := NewAsyncFlowProfile("m")
 	plain := &plainFlowHandler{}
-	r.beginStart("m1")
-	r.route("m1", "", managed)
-	r.beginStart("p1")
-	r.route("p1", "", plain)
-	r.claimFlow("c1", "", plain)
-	for _, id := range []string{"m1", "p1", "c1"} {
-		r.releaseAfterTerminal(id)
+	r.beginStart("m1", "ses-1")
+	r.route("m1", "ses-1", managed)
+	r.discardStart("m1")
+	r.beginStart("p1", "ses-1")
+	r.route("p1", "ses-1", plain)
+	r.discardStart("p1")
+	r.claimFlow("c1", "ses-1", plain)
+
+	if r.beginStart("m1", "ses-1") {
+		t.Error("a managed handler's live flow was replaced")
 	}
-	if _, owned := r.lookupFlow("m1"); !owned {
-		t.Error("a managed handler's route was released by the peer")
+	if r.beginStart("c1", "ses-1") {
+		t.Error("a claim was replaced")
 	}
-	if _, owned := r.lookupFlow("p1"); owned {
-		t.Error("an ordinary handler's route survived its terminal notification")
+	if r.beginStart("p1", "ses-2") {
+		t.Error("another session replaced an ordinary handler's flow")
 	}
-	if _, owned := r.lookupFlow("c1"); !owned {
-		t.Error("a claim was ended by a terminal notification")
+	if !r.beginStart("p1", "ses-1") {
+		t.Error("the same session could not restart an ordinary handler's flow")
+	}
+}
+
+func TestRouteInUseIsKeptUntilTheDispatchIsDone(t *testing.T) {
+	r := newRegistry()
+	h := &plainFlowHandler{}
+	r.beginStart("f", "ses-1")
+	gen := r.route("f", "ses-1", h)
+	r.discardStart("f")
+	e, ok := r.acquire("f", gen)
+	if !ok {
+		t.Fatal("acquire")
+	}
+	r.release("f", e.gen) // released while a dispatch is using it
+	if _, ok := r.lookupFlow("f"); ok {
+		t.Error("a released route is still routed to new messages")
+	}
+	if _, ok := r.acquire("f", gen); ok {
+		t.Error("a released route was acquired")
+	}
+	if r.beginStart("f", "ses-1") {
+		t.Error("the ID was reused under a dispatch that is still using the route")
+	}
+	r.done("f", gen)
+	if !r.beginStart("f", "ses-1") {
+		t.Error("the ID stayed taken after the last dispatch finished")
+	}
+}
+
+func TestDeferredMessagesAreBounded(t *testing.T) {
+	r := newRegistry()
+	r.beginStart("f", "ses-1")
+	var ran int
+	for i := 0; i < 1000; i++ {
+		r.deferWhileStarting("f", deferProgress, func() { ran++ })
+	}
+	terminals := 0
+	for i := 0; i < 5; i++ {
+		i := i
+		r.deferWhileStarting("f", deferTerminal, func() { terminals = i + 1 })
+	}
+	r.deferWhileStarting("f", deferCancel, func() { ran += 1000 })
+	for {
+		ops, done := r.takeDeferred("f")
+		if done {
+			break
+		}
+		for _, op := range ops {
+			op()
+		}
+	}
+	if ran != maxDeferredProgress+1000 {
+		t.Errorf("ran = %d: progress was not bounded to %d (plus one cancel)", ran, maxDeferredProgress)
+	}
+	if terminals != 1 {
+		t.Errorf("the first terminal notification should be the one kept, got %d", terminals)
 	}
 }
 
@@ -904,7 +963,7 @@ func (*plainFlowHandler) HandleError(context.Context, *FlowErrorParams)       {}
 func TestStartReservationBlocksClaim(t *testing.T) {
 	r := newRegistry()
 	h := NewAsyncFlowProfile("p")
-	if !r.beginStart("f") || r.beginStart("f") {
+	if !r.beginStart("f", "ses-1") || r.beginStart("f", "ses-1") {
 		t.Fatal("a start of a flow id can run once at a time")
 	}
 	if _, ok := r.claimFlow("f", "ses-1", h); ok {
@@ -914,7 +973,7 @@ func TestStartReservationBlocksClaim(t *testing.T) {
 	if _, ok := r.claimFlow("f", "ses-1", h); !ok {
 		t.Fatal("claim after the start ended")
 	}
-	if r.beginStart("f") {
+	if r.beginStart("f", "ses-1") {
 		t.Fatal("started a claimed flow id")
 	}
 }
@@ -922,12 +981,12 @@ func TestStartReservationBlocksClaim(t *testing.T) {
 func TestMessagesDuringStartAreHeldAndApplied(t *testing.T) {
 	r := newRegistry()
 	var order []int
-	if !r.beginStart("f") {
+	if !r.beginStart("f", "ses-1") {
 		t.Fatal("beginStart")
 	}
 	for i := 1; i <= 3; i++ {
 		i := i
-		if !r.deferWhileStarting("f", func() { order = append(order, i) }) {
+		if !r.deferWhileStarting("f", deferProgress, func() { order = append(order, i) }) {
 			t.Fatal("not deferred while starting")
 		}
 	}
@@ -943,7 +1002,7 @@ func TestMessagesDuringStartAreHeldAndApplied(t *testing.T) {
 	if len(order) != 3 || order[0] != 1 || order[2] != 3 {
 		t.Errorf("order = %v", order)
 	}
-	if r.deferWhileStarting("f", func() {}) || r.isStarting("f") {
+	if r.deferWhileStarting("f", deferProgress, func() {}) || r.isStarting("f") {
 		t.Error("the reservation outlived takeDeferred")
 	}
 }
@@ -1585,7 +1644,7 @@ func TestShortLivedFlowLeavesNoStaleRoute(t *testing.T) {
 	}
 }
 
-func TestWorkerCleanupDoesNotUnrouteAReplacement(t *testing.T) {
+func TestCancelledFlowIDStaysReservedUntilItsWorkerExits(t *testing.T) {
 	r := newSubFlowRig(t)
 	release := make(chan struct{})
 	var mu sync.Mutex
@@ -1596,7 +1655,8 @@ func TestWorkerCleanupDoesNotUnrouteAReplacement(t *testing.T) {
 		first := runs == 1
 		mu.Unlock()
 		if first {
-			<-release // the first flow ignores its cancellation for a while
+			<-release // the first worker ignores its cancellation for a while
+			// ... and would still send under the ID if it were reusable.
 			return nil
 		}
 		<-ctx.Done()
@@ -1604,12 +1664,14 @@ func TestWorkerCleanupDoesNotUnrouteAReplacement(t *testing.T) {
 	})
 	r.startParent(t, "flow-p")
 	r.profile.CancelFlow("flow-p")
-	r.startParent(t, "flow-p") // the replacement
-	close(release)             // the old worker now exits
-	time.Sleep(150 * time.Millisecond)
-	if h, owned := r.orch.registry.lookupFlowOwner("flow-p"); !owned || h != FlowHandler(r.profile) {
-		t.Fatal("the old worker's cleanup unrouted the replacement flow")
+	// Cancelled but still running: the ID is not yet free for a new flow.
+	var rpcErr *RPCError
+	if err := r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "parent", FlowID: "flow-p"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError {
+		t.Fatalf("restart while the old worker runs: err = %v, want -31006", err)
 	}
+	close(release) // the worker exits and releases exactly its own route
+	waitFor(t, func() bool { _, owned := r.orch.registry.lookupFlowOwner("flow-p"); return !owned })
+	r.startParent(t, "flow-p")
 	if r.profile.ActiveFlows() != 1 {
 		t.Errorf("active = %d, want the replacement only", r.profile.ActiveFlows())
 	}
@@ -1940,22 +2002,27 @@ func (*terminalProfile) HandleProgress(context.Context, *FlowProgressParams) {}
 func (*terminalProfile) HandleComplete(context.Context, *FlowCompleteParams) {}
 func (*terminalProfile) HandleError(context.Context, *FlowErrorParams)       {}
 
-func TestOrdinaryHandlerFlowIDIsReleasedByItsTerminalNotification(t *testing.T) {
+func TestOrdinaryHandlerFlowCanBeRestartedBySameSessionOnly(t *testing.T) {
 	r := newSubFlowRig(t)
 	tp := &terminalProfile{}
 	if err := r.orch.Use(tp); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
-		if err := r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "terminal", FlowID: "t1"}, nil); err != nil {
-			t.Fatalf("start %d: %v", i, err)
-		}
-		if err := tp.peer.Notify(r.ctx, MethodFlowComplete, &FlowCompleteParams{FlowID: "t1", Result: json.RawMessage(`{}`)}); err != nil {
-			t.Fatal(err)
-		}
-		if _, owned := r.orch.registry.lookupFlowOwner("t1"); owned {
-			t.Fatalf("round %d: the flow's own completion left its route", i)
-		}
+	start := func(session string) error {
+		return r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{WMP: Metadata{SessionID: session}, FlowType: "terminal", FlowID: "t1"}, nil)
+	}
+	if err := start("ses-1"); err != nil {
+		t.Fatal(err)
+	}
+	// An ordinary handler's flow ends without the Peer being told (it
+	// completes through its own PeerContext): the same session may start it
+	// again, another session may not take it over.
+	if err := start("ses-1"); err != nil {
+		t.Fatalf("restart by the same session: %v", err)
+	}
+	var rpcErr *RPCError
+	if err := start("ses-evil"); !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError {
+		t.Fatalf("takeover by another session: err = %v, want -31006", err)
 	}
 }
 
@@ -2054,5 +2121,94 @@ func TestPeerLifetimeIsAChannelNotAStoredContext(t *testing.T) {
 	case <-peer.Lifetime():
 	default:
 		t.Fatal("lifetime did not end with Close")
+	}
+}
+
+// fallbackHandler is a Handler whose FlowStart blocks and which records the
+// flow messages it gets: no profile owns the flow type, so no route is ever
+// published.
+type fallbackHandler struct {
+	BaseHandler
+	in, release chan struct{}
+	completes   chan string
+	cancels     chan string
+}
+
+func (h *fallbackHandler) FlowStart(_ context.Context, p *FlowStartParams) (*FlowStartResult, error) {
+	close(h.in)
+	<-h.release
+	return &FlowStartResult{WMP: p.WMP, FlowID: p.FlowID, FlowType: p.FlowType}, nil
+}
+func (h *fallbackHandler) FlowComplete(_ context.Context, p *FlowCompleteParams) {
+	h.completes <- p.FlowID
+}
+func (h *fallbackHandler) FlowCancel(_ context.Context, p *FlowCancelParams) (*FlowCancelResult, error) {
+	h.cancels <- p.FlowID
+	return &FlowCancelResult{FlowID: p.FlowID, Status: "cancelled"}, nil
+}
+
+func TestFallbackHandlerStartHoldsMessagesAndRefusesCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	h := &fallbackHandler{in: make(chan struct{}), release: make(chan struct{}), completes: make(chan string, 4), cancels: make(chan string, 4)}
+	tA, tB := NewChannelTransport(64, 64), NewChannelTransport(64, 64)
+	bridge(ctx, tA, tB)
+	bridge(ctx, tB, tA)
+	handlerPeer := NewPeer(tA, h, WithSessionIdentity("ses-1", "h"))
+	remote := NewPeer(tB, &BaseHandler{}, WithSessionIdentity("ses-1", "r"))
+	go handlerPeer.Serve(ctx)
+	go remote.Serve(ctx)
+
+	started := make(chan error, 1)
+	go func() {
+		started <- remote.Call(ctx, MethodFlowStart, &FlowStartParams{FlowType: "anything", FlowID: "fb"}, nil)
+	}()
+	<-h.in
+	// No route exists, yet a message for the starting flow must not reach the
+	// Handler before the start has returned, and a cancel cannot be honoured:
+	// it is refused, not acknowledged and then lost.
+	_ = remote.Notify(ctx, MethodFlowComplete, &FlowCompleteParams{FlowID: "fb", Result: json.RawMessage(`{}`)})
+	var rpcErr *RPCError
+	// Before any route exists the start is already bound to its session.
+	if err := remote.Call(ctx, MethodFlowCancel, &FlowCancelParams{WMP: Metadata{SessionID: "ses-evil"}, FlowID: "fb"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrNotAuthorized {
+		t.Fatalf("cancel from another session during a start: err = %v, want -31002", err)
+	}
+	if err := remote.Call(ctx, MethodFlowCancel, &FlowCancelParams{FlowID: "fb"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError {
+		t.Fatalf("cancel during a fallback start: err = %v, want -31006", err)
+	}
+	select {
+	case id := <-h.completes:
+		t.Fatalf("completion of %s reached the handler before its start returned", id)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(h.release)
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case id := <-h.completes:
+		if id != "fb" {
+			t.Errorf("completion for %q", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the held completion was lost")
+	}
+	select {
+	case id := <-h.cancels:
+		t.Fatalf("a refused cancel reached the handler: %s", id)
+	default:
+	}
+}
+
+func TestPendingSubFlowsAreFilteredByParentGeneration(t *testing.T) {
+	p := NewAsyncFlowProfile("p")
+	peer := &mockPeerContext{}
+	key := p.subFlowKey(peer, "c1")
+	p.children[key] = &subFlow{id: "c1", parentID: "flow-p", parentGen: 1, sessionID: "ses-1", params: json.RawMessage(`{}`)}
+	if got := p.pendingSubFlows(peer, "ses-1", "flow-p", 1); len(got) != 1 {
+		t.Fatalf("own generation: %d", len(got))
+	}
+	if got := p.pendingSubFlows(peer, "ses-1", "flow-p", 2); len(got) != 0 {
+		t.Fatalf("a later instance of the parent sees the earlier one's child: %d", len(got))
 	}
 }

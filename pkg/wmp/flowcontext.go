@@ -477,14 +477,14 @@ func (p *AsyncFlowProfile) CancelFlow(flowID string) {
 	}
 }
 
-// cancelFlowContext cancels one flow instance and unroutes it, reporting
-// whether there was one.
+// cancelFlowContext cancels one flow instance, reporting whether there was one.
+// Its flow_id stays reserved until the worker has exited: a flow of the same ID
+// cannot start, and the old worker cannot send under it, before that.
 func (p *AsyncFlowProfile) cancelFlowContext(key flowKey, fc *FlowContext) bool {
 	if fc == nil {
 		return false
 	}
 	p.endFlow(key, fc)
 	fc.cancel()
-	fc.release()
 	return true
 }
