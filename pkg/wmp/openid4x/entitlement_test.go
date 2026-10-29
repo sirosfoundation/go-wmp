@@ -60,8 +60,9 @@ func TestIssuerEntitlementValidate(t *testing.T) {
 		"code with space":       func(e *IssuerEntitlement) { e.Findings[0].Code = "no access" },
 		"code starts with 1":    func(e *IssuerEntitlement) { e.Findings[0].Code = "1a" },
 		"code too long":         func(e *IssuerEntitlement) { e.Findings[0].Code = strings.Repeat("a", 65) },
-		"credential_type long":  func(e *IssuerEntitlement) { e.Findings[0].CredentialType = long(257) },
-		"too many findings":     func(e *IssuerEntitlement) { e.Findings = many(65) },
+		"credential_type long":  func(e *IssuerEntitlement) { e.Findings[0].CredentialType = long(129) },
+		"message long":          func(e *IssuerEntitlement) { e.Findings[0].Message = long(257) },
+		"too many findings":     func(e *IssuerEntitlement) { e.Findings = many(17) },
 		"too many entitlements": func(e *IssuerEntitlement) { e.Entitlements = make([]string, 65) },
 		"entitlement long":      func(e *IssuerEntitlement) { e.Entitlements = []string{long(257)} },
 	} {
@@ -88,8 +89,9 @@ func TestIssuerEntitlementValidate(t *testing.T) {
 	}
 	// The bounds themselves are allowed.
 	e := okEntitlement()
-	e.Findings = many(64)
-	e.Findings[0].CredentialType = long(256)
+	e.Findings = many(16)
+	e.Findings[0].CredentialType = long(128)
+	e.Findings[0].Message = long(256)
 	e.Entitlements = []string{long(256)}
 	if err := e.Validate(); err != nil {
 		t.Errorf("at the bounds: %v", err)
@@ -109,14 +111,20 @@ func TestIssuerEntitlementBounded(t *testing.T) {
 		e.Entitlements = append(e.Entitlements, "ent")
 	}
 	e.Findings[0].CredentialType = strings.Repeat("t", 300)
+	e.Findings[2].Message = strings.Repeat("m", 300)
 	e.Findings[1] = EntitlementFinding{Code: "Bad Code"}
 	e.Entitlements[0] = strings.Repeat("e", 300)
 	b := e.Bounded()
 	if err := b.Validate(); err != nil {
 		t.Fatalf("bounded result invalid: %v", err)
 	}
-	if len(b.Findings) != 64 || len(b.Entitlements) != 64 {
-		t.Errorf("counts = %d, %d", len(b.Findings), len(b.Entitlements))
+	if len(b.Findings) != 16 || len(b.Entitlements) != 64 || !b.FindingsTruncated {
+		t.Errorf("counts = %d, %d, truncated %v", len(b.Findings), len(b.Entitlements), b.FindingsTruncated)
+	}
+	for _, f := range b.Findings {
+		if len(f.Message) > MaxFindingMessageLen {
+			t.Error("over-long message kept")
+		}
 	}
 	if b.Findings[0].Code != "ok_code" || b.Findings[0].CredentialType != "" {
 		t.Errorf("over-long credential_type kept or finding dropped: %+v", b.Findings[0])
@@ -192,50 +200,80 @@ func TestUntrustedIssuerData(t *testing.T) {
 	}
 }
 
+func refusalDecision() IssuerEntitlement {
+	return IssuerEntitlement{Allowed: false, Mode: EntitlementModeFail, Evaluated: true,
+		Findings: []EntitlementFinding{{Code: EntitlementNotProvider, Message: "The issuer is not a provider.", CredentialType: "https://c.example/id"}}}
+}
+
 func TestIssuerNotEntitledData(t *testing.T) {
 	if wmp.ErrIssuerNotEntitled != -31020 || wmp.ErrorMessage(wmp.ErrIssuerNotEntitled) != IssuerNotEntitledMessage {
 		t.Fatalf("code/message = %d %q", wmp.ErrIssuerNotEntitled, wmp.ErrorMessage(wmp.ErrIssuerNotEntitled))
 	}
-	d, err := NewIssuerNotEntitledData([]EntitlementFinding{{Code: EntitlementNotProvider, CredentialType: "https://c.example/id"}})
+	d, err := NewIssuerNotEntitledData("https://issuer.example.com", refusalDecision())
 	if err != nil {
 		t.Fatal(err)
 	}
 	b, _ := json.Marshal(d)
-	if string(b) != `{"retryable":false,"findings":[{"code":"not_an_attestation_provider","credential_type":"https://c.example/id"}]}` {
+	want := `{"issuer":"https://issuer.example.com","issuer_entitlement":{"allowed":false,"mode":"fail","evaluated":true,` +
+		`"findings":[{"code":"not_an_attestation_provider","message":"The issuer is not a provider.","credential_type":"https://c.example/id"}]}}`
+	if string(b) != want {
 		t.Errorf("wire = %s", b)
 	}
 	got, err := ParseIssuerNotEntitledData(b)
-	if err != nil || len(got.Findings) != 1 || got.Findings[0].Code != EntitlementNotProvider {
+	if err != nil || got.Issuer != "https://issuer.example.com" || len(got.IssuerEntitlement.Findings) != 1 || got.IssuerEntitlement.Findings[0].Message == "" {
 		t.Errorf("round trip = %+v %v", got, err)
+	}
+	// An explicit retryable false is allowed (spec: optional).
+	if _, err := ParseIssuerNotEntitledData(json.RawMessage(`{"issuer":"i","retryable":false,"issuer_entitlement":{"allowed":false,"mode":"fail","evaluated":true,"findings":[{"code":"future_code"}]}}`)); err != nil {
+		t.Errorf("retryable false / unknown code refused: %v", err)
 	}
 }
 
 func TestIssuerNotEntitledDataBuilderRefusals(t *testing.T) {
-	if _, err := NewIssuerNotEntitledData(nil); !errors.Is(err, ErrEntitlement) {
-		t.Errorf("no findings accepted: %v", err)
-	}
-	if _, err := NewIssuerNotEntitledData([]EntitlementFinding{{Code: "Bad"}}); !errors.Is(err, ErrEntitlement) {
-		t.Errorf("bad code accepted: %v", err)
-	}
-	many := make([]EntitlementFinding, 65)
-	for i := range many {
-		many[i] = EntitlementFinding{Code: "a"}
-	}
-	if _, err := NewIssuerNotEntitledData(many); !errors.Is(err, ErrEntitlement) {
-		t.Errorf("65 findings accepted: %v", err)
+	ok := refusalDecision()
+	for name, tc := range map[string]struct {
+		issuer string
+		mut    func(e *IssuerEntitlement)
+	}{
+		"no issuer":      {"", func(e *IssuerEntitlement) {}},
+		"allowed":        {"i", func(e *IssuerEntitlement) { e.Allowed = true }},
+		"warn mode":      {"i", func(e *IssuerEntitlement) { e.Mode = EntitlementModeWarn }},
+		"no findings":    {"i", func(e *IssuerEntitlement) { e.Findings = nil }},
+		"bad code":       {"i", func(e *IssuerEntitlement) { e.Findings = []EntitlementFinding{{Code: "Bad"}} }},
+		"17 findings":    {"i", func(e *IssuerEntitlement) { e.Findings = make([]EntitlementFinding, 17) }},
+		"issuer too big": {strings.Repeat("i", 2049), func(e *IssuerEntitlement) {}},
+	} {
+		e := ok
+		e.Findings = append([]EntitlementFinding(nil), ok.Findings...)
+		tc.mut(&e)
+		if _, err := NewIssuerNotEntitledData(tc.issuer, e); !errors.Is(err, ErrEntitlement) {
+			t.Errorf("%s accepted: %v", name, err)
+		}
 	}
 }
 
 func TestIssuerNotEntitledDataParserRefusals(t *testing.T) {
-	for _, raw := range []string{
-		`null`, `[]`, `{"retryable":false}`, `{"retryable":false,"findings":null}`, `{"retryable":false,"findings":[]}`,
-		`{"retryable":true,"findings":[{"code":"a"}]}`, `{"findings":[{"code":"a"}]}`, `{"retryable":null,"findings":[{"code":"a"}]}`,
-		`{"retryable":false,"FINDINGS":[{"code":"a"}]}`, `{"retryable":false,"findings":[{"Code":"a"}]}`,
-		`{"retryable":false,"findings":[{"code":"a","message":"free text"}]}`,
-		`{"retryable":false,"findings":[{"code":"a\n"}]}`,
+	dec := `{"allowed":false,"mode":"fail","evaluated":true,"findings":[{"code":"a"}]}`
+	for name, raw := range map[string]string{
+		"null":              `null`,
+		"array":             `[]`,
+		"no issuer":         `{"issuer_entitlement":` + dec + `}`,
+		"empty issuer":      `{"issuer":"","issuer_entitlement":` + dec + `}`,
+		"no decision":       `{"issuer":"i"}`,
+		"retryable true":    `{"issuer":"i","retryable":true,"issuer_entitlement":` + dec + `}`,
+		"retryable string":  `{"issuer":"i","retryable":"no","issuer_entitlement":` + dec + `}`,
+		"allowed":           `{"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"fail","evaluated":true,"findings":[{"code":"a"}]}}`,
+		"warn":              `{"issuer":"i","issuer_entitlement":{"allowed":false,"mode":"warn","evaluated":true,"findings":[{"code":"a"}]}}`,
+		"no findings":       `{"issuer":"i","issuer_entitlement":{"allowed":false,"mode":"fail","evaluated":true}}`,
+		"empty findings":    `{"issuer":"i","issuer_entitlement":{"allowed":false,"mode":"fail","evaluated":true,"findings":[]}}`,
+		"mis-cased":         `{"ISSUER":"i","issuer_entitlement":` + dec + `}`,
+		"mis-cased finding": `{"issuer":"i","issuer_entitlement":{"allowed":false,"mode":"fail","evaluated":true,"findings":[{"Code":"a"}]}}`,
+		"newline in code":   `{"issuer":"i","issuer_entitlement":{"allowed":false,"mode":"fail","evaluated":true,"findings":[{"code":"a\n"}]}}`,
+		"mistyped message":  `{"issuer":"i","issuer_entitlement":{"allowed":false,"mode":"fail","evaluated":true,"findings":[{"code":"a","message":5}]}}`,
+		"long message":      `{"issuer":"i","issuer_entitlement":{"allowed":false,"mode":"fail","evaluated":true,"findings":[{"code":"a","message":"` + strings.Repeat("m", 257) + `"}]}}`,
 	} {
 		if _, err := ParseIssuerNotEntitledData(json.RawMessage(raw)); !errors.Is(err, ErrEntitlement) {
-			t.Errorf("%s: err=%v", raw, err)
+			t.Errorf("%s: err=%v", name, err)
 		}
 	}
 }
@@ -280,27 +318,19 @@ func TestEntitlementNullListsAreAbsent(t *testing.T) {
 	}
 }
 
-func TestEntitlementParsersRefuseAMessageMember(t *testing.T) {
-	finding := `{"code":"no_access_certificate","message":"issuer-controlled text"}`
-	payload := `{"issuer_entitlement_evaluated":true,"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true,"findings":[` + finding + `]}}`
-	if _, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(payload)); !ok || !errors.Is(err, ErrEntitlement) {
-		t.Errorf("payload: ok=%v err=%v", ok, err)
-	}
-	refusal := `{"retryable":false,"findings":[` + finding + `]}`
-	if _, err := ParseIssuerNotEntitledData(json.RawMessage(refusal)); !errors.Is(err, ErrEntitlement) {
-		t.Errorf("refusal: err=%v", err)
-	}
-	// Other extension members of a finding are ignored.
-	other := `{"code":"no_access_certificate","x_other":1}`
-	if _, err := ParseIssuerNotEntitledData(json.RawMessage(`{"retryable":false,"findings":[` + other + `]}`)); err != nil {
-		t.Errorf("extension member refused: %v", err)
+func TestEntitlementFindingMessageIsCarriedAndExtensionMembersIgnored(t *testing.T) {
+	payload := `{"issuer_entitlement_evaluated":true,"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true,"findings_truncated":true,` +
+		`"findings":[{"code":"no_access_certificate","message":"fixed text","x_other":1}]}}`
+	p, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(payload))
+	if err != nil || !ok || p.IssuerEntitlement.Findings[0].Message != "fixed text" || !p.IssuerEntitlement.FindingsTruncated {
+		t.Errorf("payload = %+v ok=%v err=%v", p, ok, err)
 	}
 }
 
 func TestEntitlementBoundsCountCodePoints(t *testing.T) {
 	two := func(n int) string { return strings.Repeat("\u00e9", n) }
 	e := okEntitlement()
-	e.Findings = []EntitlementFinding{{Code: "a", CredentialType: two(256)}}
+	e.Findings = []EntitlementFinding{{Code: "a", CredentialType: two(128), Message: two(256)}}
 	e.Entitlements = []string{two(256)}
 	if err := e.Validate(); err != nil {
 		t.Errorf("256 two-byte characters refused: %v", err)
@@ -308,12 +338,12 @@ func TestEntitlementBoundsCountCodePoints(t *testing.T) {
 	if _, err := NewIssuerEntitlementPayload(two(1025), e); err != nil {
 		t.Errorf("1025 two-byte issuer characters refused: %v", err)
 	}
-	e.Findings[0].CredentialType = two(257)
+	e.Findings[0].CredentialType = two(129)
 	if e.Validate() == nil {
 		t.Error("257 characters accepted")
 	}
-	b := IssuerEntitlement{Mode: EntitlementModeWarn, Findings: []EntitlementFinding{{Code: "a", CredentialType: two(129)}}, Entitlements: []string{two(129)}}.Bounded()
-	if b.Findings[0].CredentialType != two(129) || len(b.Entitlements) != 1 {
+	b := IssuerEntitlement{Mode: EntitlementModeWarn, Findings: []EntitlementFinding{{Code: "a", CredentialType: two(65)}}, Entitlements: []string{two(129)}}.Bounded()
+	if b.Findings[0].CredentialType != two(65) || len(b.Entitlements) != 1 {
 		t.Errorf("Bounded dropped a valid non-ASCII value: %+v", b)
 	}
 	if _, err := NewIssuerEntitlementPayload(two(2049), okEntitlement()); err == nil {
@@ -337,11 +367,14 @@ func TestEntitlementParsersRefuseMalformedKnownMembers(t *testing.T) {
 			t.Errorf("%s: ok=%v err=%v", name, ok, err)
 		}
 	}
-	if _, err := ParseIssuerNotEntitledData(json.RawMessage(`{"retryable":false,"findings":[{"code":"a","credential_type":5}]}`)); !errors.Is(err, ErrEntitlement) {
+	dec := func(finding string) string {
+		return `{"issuer":"i","issuer_entitlement":{"allowed":false,"mode":"fail","evaluated":true,"findings":[` + finding + `]}}`
+	}
+	if _, err := ParseIssuerNotEntitledData(json.RawMessage(dec(`{"code":"a","credential_type":5}`))); !errors.Is(err, ErrEntitlement) {
 		t.Errorf("not-entitled with a mistyped credential_type: %v", err)
 	}
 	// An absent or null credential_type is simply absent.
-	if _, err := ParseIssuerNotEntitledData(json.RawMessage(`{"retryable":false,"findings":[{"code":"a","credential_type":null}]}`)); err != nil {
+	if _, err := ParseIssuerNotEntitledData(json.RawMessage(dec(`{"code":"a","credential_type":null}`))); err != nil {
 		t.Errorf("null credential_type refused: %v", err)
 	}
 }

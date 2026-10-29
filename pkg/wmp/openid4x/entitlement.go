@@ -19,15 +19,18 @@ const ReasonUntrustedIssuer = "untrusted_issuer"
 // Finding codes defined by Section 7.8. A receiver accepts any code of the
 // right form: an unknown one is shown generically.
 const (
-	EntitlementNoAccessCertificate   = "no_access_certificate"
-	EntitlementNotWRPAC              = "access_certificate_not_wrpac"
-	EntitlementNoRegistrationCert    = "no_registration_certificate"
-	EntitlementRegistrationMalformed = "registration_certificate_malformed"
-	EntitlementRegistrationExpired   = "registration_certificate_expired"
-	EntitlementRegistrationOverlong  = "registration_certificate_validity_too_long"
-	EntitlementBindingMismatch       = "registration_certificate_not_bound"
-	EntitlementNotProvider           = "not_an_attestation_provider"
-	EntitlementTypeNotRegistered     = "attestation_type_not_registered"
+	EntitlementNoAccessCertificate    = "no_access_certificate"
+	EntitlementNotWRPAC               = "access_certificate_not_wrpac"
+	EntitlementAccessNotTrusted       = "access_certificate_not_trusted"
+	EntitlementNoRegistrationCert     = "no_registration_certificate"
+	EntitlementRegistrationUnverified = "registration_certificate_unverified"
+	EntitlementRegistrarNotTrusted    = "registrar_not_trusted"
+	EntitlementRegistrationMalformed  = "registration_certificate_malformed"
+	EntitlementRegistrationExpired    = "registration_certificate_expired"
+	EntitlementRegistrationOverlong   = "registration_certificate_validity_too_long"
+	EntitlementBindingMismatch        = "registration_certificate_not_bound"
+	EntitlementNotProvider            = "not_an_attestation_provider"
+	EntitlementTypeNotRegistered      = "attestation_type_not_registered"
 )
 
 // Modes of the entitlement check.
@@ -40,10 +43,11 @@ const (
 // its count is the same in bytes). Everything in an entitlement result comes
 // from the issuer or a registration certificate, so every value is bounded.
 const (
-	MaxEntitlementFindings = 64
+	MaxEntitlementFindings = 16
 	MaxEntitlements        = 64
 	MaxEntitlementLen      = 256
-	MaxCredentialTypeLen   = 256
+	MaxCredentialTypeLen   = 128
+	MaxFindingMessageLen   = 256
 	MaxFindingCodeLen      = 64
 	MaxIssuerLen           = 2048
 )
@@ -55,10 +59,13 @@ func entitlementErr(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrEntitlement, fmt.Sprintf(format, args...))
 }
 
-// EntitlementFinding is one thing that did not check out. It has no free text:
-// a wallet shows its own text for Code.
+// EntitlementFinding is one thing that did not check out. Its optional Message
+// is fixed per code, not free text from the issuer.
 type EntitlementFinding struct {
 	Code string `json:"code"`
+	// Message is a fixed text the orchestrator chooses for Code, never derived
+	// from issuer data. A wallet shows its own text for a code it knows.
+	Message string `json:"message,omitempty"`
 	// CredentialType names the offered vct or doctype the finding is about.
 	CredentialType string `json:"credential_type,omitempty"`
 }
@@ -72,9 +79,11 @@ type IssuerEntitlement struct {
 	Mode string `json:"mode"`
 	// Evaluated is false when there was nothing to evaluate against. It is
 	// distinct from Allowed: "not checked" is never "checked and fine".
-	Evaluated    bool                 `json:"evaluated"`
-	Findings     []EntitlementFinding `json:"findings,omitempty"`
-	Entitlements []string             `json:"entitlements,omitempty"`
+	Evaluated bool                 `json:"evaluated"`
+	Findings  []EntitlementFinding `json:"findings,omitempty"`
+	// FindingsTruncated is true when more findings arose than Findings lists.
+	FindingsTruncated bool     `json:"findings_truncated,omitempty"`
+	Entitlements      []string `json:"entitlements,omitempty"`
 }
 
 // IssuerEntitlementPayload is the payload of the trust_evaluated progress that
@@ -113,6 +122,9 @@ func validateFindings(findings []EntitlementFinding) error {
 		if chars(f.CredentialType) > MaxCredentialTypeLen {
 			return entitlementErr("finding %d credential_type exceeds %d", i, MaxCredentialTypeLen)
 		}
+		if chars(f.Message) > MaxFindingMessageLen {
+			return entitlementErr("finding %d message exceeds %d", i, MaxFindingMessageLen)
+		}
 	}
 	return nil
 }
@@ -143,9 +155,10 @@ func (e IssuerEntitlement) Validate() error {
 // and a finding whose code is not of the defined form. Allowed, Mode and
 // Evaluated are kept.
 func (e IssuerEntitlement) Bounded() IssuerEntitlement {
-	out := IssuerEntitlement{Allowed: e.Allowed, Mode: e.Mode, Evaluated: e.Evaluated}
+	out := IssuerEntitlement{Allowed: e.Allowed, Mode: e.Mode, Evaluated: e.Evaluated, FindingsTruncated: e.FindingsTruncated}
 	for _, f := range e.Findings {
 		if len(out.Findings) == MaxEntitlementFindings {
+			out.FindingsTruncated = true
 			break
 		}
 		if !validCode(f.Code) {
@@ -153,6 +166,9 @@ func (e IssuerEntitlement) Bounded() IssuerEntitlement {
 		}
 		if chars(f.CredentialType) > MaxCredentialTypeLen {
 			f.CredentialType = ""
+		}
+		if chars(f.Message) > MaxFindingMessageLen {
+			f.Message = ""
 		}
 		out.Findings = append(out.Findings, f)
 	}
@@ -243,12 +259,11 @@ func decodeFindings(raw json.RawMessage) ([]EntitlementFinding, error) {
 		if !ok {
 			return nil, entitlementErr("a finding is not an object")
 		}
-		// Section 7.8 forbids free text in a finding; other members are ignored.
-		if _, has := m["message"]; has {
-			return nil, entitlementErr("a finding carries a message member")
-		}
 		var f EntitlementFinding
 		if err := optional(m, "code", &f.Code); err != nil {
+			return nil, err
+		}
+		if err := optional(m, "message", &f.Message); err != nil {
 			return nil, err
 		}
 		if err := optional(m, "credential_type", &f.CredentialType); err != nil {
@@ -268,6 +283,9 @@ func decodeEntitlement(raw json.RawMessage) (IssuerEntitlement, error) {
 	var e IssuerEntitlement
 	if !member(m, "allowed", &e.Allowed) || !member(m, "mode", &e.Mode) || !member(m, "evaluated", &e.Evaluated) {
 		return IssuerEntitlement{}, entitlementErr("issuer_entitlement lacks allowed, mode or evaluated")
+	}
+	if err := optional(m, "findings_truncated", &e.FindingsTruncated); err != nil {
+		return IssuerEntitlement{}, err
 	}
 	if raw, ok := m["findings"]; ok && isNotNull(raw) {
 		f, err := decodeFindings(raw)
@@ -350,56 +368,65 @@ func ParseUntrustedIssuerData(data json.RawMessage) (d *UntrustedIssuerData, ok 
 
 // IssuerNotEntitledData is the data of the -31020 (wmp.ErrIssuerNotEntitled)
 // wmp.flow.error that refuses an oid4vci flow for an issuer that is not
-// registered to issue what it offers (Section 3.1.6). Its message is
-// IssuerNotEntitledMessage. Findings is required: 1 to 64 entries.
+// registered to issue what it offers (Section 3.1.6): the issuer and the
+// decision of the entitlement progress, with Allowed false, Mode fail and at
+// least one finding. Its message is IssuerNotEntitledMessage. Retryable is
+// omitted from the wire (absent means false).
 type IssuerNotEntitledData struct {
-	Retryable bool                 `json:"retryable"`
-	Findings  []EntitlementFinding `json:"findings"`
+	Issuer            string            `json:"issuer"`
+	IssuerEntitlement IssuerEntitlement `json:"issuer_entitlement"`
 }
 
 // IssuerNotEntitledMessage is the fixed message of the -31020 error.
 const IssuerNotEntitledMessage = "Issuer not entitled"
 
-// NewIssuerNotEntitledData builds the data of the -31020 refusal. It is refused
-// when findings is empty or out of bounds; use IssuerEntitlement.Bounded first
-// for findings built from issuer data.
-func NewIssuerNotEntitledData(findings []EntitlementFinding) (*IssuerNotEntitledData, error) {
-	if len(findings) == 0 {
-		return nil, entitlementErr("a not-entitled refusal needs at least one finding")
+// validateRefusalDecision checks that a decision can be the one of a refusal.
+func validateRefusalDecision(e IssuerEntitlement) error {
+	if err := e.Validate(); err != nil {
+		return err
 	}
-	if err := validateFindings(findings); err != nil {
+	if e.Allowed || e.Mode != EntitlementModeFail || len(e.Findings) == 0 {
+		return entitlementErr("a not-entitled refusal needs allowed false, mode fail and at least one finding")
+	}
+	return nil
+}
+
+// NewIssuerNotEntitledData builds the data of the -31020 refusal for issuer and
+// the decision that refused it. It is refused when the decision is not a refusal
+// or is out of bounds; use IssuerEntitlement.Bounded first for a decision built
+// from issuer data.
+func NewIssuerNotEntitledData(issuer string, e IssuerEntitlement) (*IssuerNotEntitledData, error) {
+	if issuer == "" || chars(issuer) > MaxIssuerLen {
+		return nil, entitlementErr("issuer is empty or exceeds %d", MaxIssuerLen)
+	}
+	if err := validateRefusalDecision(e); err != nil {
 		return nil, err
 	}
-	return &IssuerNotEntitledData{Retryable: false, Findings: findings}, nil
+	return &IssuerNotEntitledData{Issuer: issuer, IssuerEntitlement: e}, nil
 }
 
 // ParseIssuerNotEntitledData decodes and validates the data of a -31020 error.
+// An optional retryable member must be false.
 func ParseIssuerNotEntitledData(data json.RawMessage) (*IssuerNotEntitledData, error) {
 	m, ok := members(data)
 	if !ok {
 		return nil, entitlementErr("data is not an object")
 	}
 	var out IssuerNotEntitledData
-	if !member(m, "retryable", &out.Retryable) {
-		return nil, entitlementErr("retryable is missing or not a boolean")
+	if !member(m, "issuer", &out.Issuer) || out.Issuer == "" || chars(out.Issuer) > MaxIssuerLen {
+		return nil, entitlementErr("issuer is missing or exceeds %d", MaxIssuerLen)
 	}
-	if out.Retryable {
-		return nil, entitlementErr("a not-entitled refusal is not retryable")
+	var retryable bool
+	if err := optional(m, "retryable", &retryable); err != nil || retryable {
+		return nil, entitlementErr("retryable is not a boolean or is true")
 	}
-	raw, present := m["findings"]
-	if !present || !isNotNull(raw) {
-		return nil, entitlementErr("findings is required")
-	}
-	f, err := decodeFindings(raw)
+	ent, err := decodeEntitlement(m["issuer_entitlement"])
 	if err != nil {
 		return nil, err
 	}
-	if len(f) == 0 {
-		return nil, entitlementErr("findings is empty")
-	}
-	if err := validateFindings(f); err != nil {
+	if err := validateRefusalDecision(ent); err != nil {
 		return nil, err
 	}
-	out.Findings = f
+	out.IssuerEntitlement = ent
 	return &out, nil
 }
