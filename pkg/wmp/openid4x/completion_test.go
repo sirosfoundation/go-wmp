@@ -118,42 +118,50 @@ func TestValidateCompletionResult_ErrorDoesNotLeakValues(t *testing.T) {
 	}
 }
 
-func TestValidateCompletionResult_VPToken(t *testing.T) {
-	tests := []struct {
-		name  string
-		token string
-		ok    bool
-	}{
-		{"string", `"eyJ0ZXN0"`, true},
-		{"string array", `["a","b"]`, true},
-		{"dcql object", `{"pid":["a"],"mdl":["b","c"]}`, true},
-		{"boolean", `true`, false},
-		{"number", `123`, false},
-		{"null", `null`, false},
-		{"empty string", `""`, false},
-		{"empty array", `[]`, false},
-		{"array non-string entry", `["a",1]`, false},
-		{"array empty entry", `["a",""]`, false},
-		{"empty object", `{}`, false},
-		{"object empty array", `{"pid":[]}`, false},
-		{"object string value", `{"pid":"a"}`, false},
-		{"object array non-string", `{"pid":[1]}`, false},
-		{"nested array", `[["a"]]`, false},
+var vpTokenCases = []struct {
+	name  string
+	token string
+	ok    bool
+}{
+	{"string", `"eyJ0ZXN0"`, true},
+	{"string array", `["a","b"]`, true},
+	{"dcql object", `{"pid":["a"],"mdl":["b","c"]}`, true},
+	{"boolean", `true`, false},
+	{"number", `123`, false},
+	{"null", `null`, false},
+	{"empty string", `""`, false},
+	{"empty array", `[]`, false},
+	{"array non-string entry", `["a",1]`, false},
+	{"array empty entry", `["a",""]`, false},
+	{"empty object", `{}`, false},
+	{"object empty array", `{"pid":[]}`, false},
+	{"object string value", `{"pid":"a"}`, false},
+	{"object array non-string", `{"pid":[1]}`, false},
+	{"nested array", `[["a"]]`, false},
+}
+
+// checkVPTokenRefusal asserts that err refuses a vp_token with
+// ErrCompletionResult and without echoing the value.
+func checkVPTokenRefusal(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrCompletionResult) {
+		t.Fatalf("err = %v, want ErrCompletionResult", err)
 	}
-	for _, tc := range tests {
+	if strings.Contains(err.Error(), "eyJ") || strings.Contains(err.Error(), "123") {
+		t.Fatalf("error echoes the value: %v", err)
+	}
+}
+
+func TestValidateCompletionResult_VPToken(t *testing.T) {
+	for _, tc := range vpTokenCases {
 		t.Run(tc.name, func(t *testing.T) {
 			result := json.RawMessage(`{"vp_token":` + tc.token + `}`)
 			err := ValidateCompletionResult(result)
-			if tc.ok && err != nil {
+			switch {
+			case tc.ok && err != nil:
 				t.Fatalf("ValidateCompletionResult: %v", err)
-			}
-			if !tc.ok {
-				if !errors.Is(err, ErrCompletionResult) {
-					t.Fatalf("err = %v, want ErrCompletionResult", err)
-				}
-				if strings.Contains(err.Error(), "eyJ") || strings.Contains(err.Error(), "123") {
-					t.Fatalf("error echoes the value: %v", err)
-				}
+			case !tc.ok:
+				checkVPTokenRefusal(t, err)
 			}
 			// The sign-result path applies the same rule.
 			if got := ValidateSignResult(SignSubFlowParams{}, result); (got == nil) != tc.ok {
@@ -161,6 +169,9 @@ func TestValidateCompletionResult_VPToken(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateCompletionResult_VPTokenAbsent(t *testing.T) {
 	if err := ValidateCompletionResult(json.RawMessage(`{"credentials":[]}`)); err != nil {
 		t.Fatalf("absent vp_token: %v", err)
 	}
