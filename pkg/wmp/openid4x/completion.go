@@ -71,7 +71,10 @@ func resultErr(format string, args ...any) error {
 //     no credentials or credential_metadata;
 //   - a response_jwe is a compact JWE of five base64url segments (only the
 //     encrypted key may be empty), at most MaxResponseJWELen long, and never
-//     accompanies a vp_token.
+//     accompanies a vp_token;
+//   - a vp_token is a non-empty string, a non-empty array of non-empty
+//     strings or a non-empty object whose values are non-empty arrays of
+//     non-empty strings (the DCQL form).
 //
 // Members it does not know are ignored (Core Section 9.5).
 func ValidateCompletionResult(result json.RawMessage) error {
@@ -96,6 +99,9 @@ func ValidateCompletionResult(result json.RawMessage) error {
 		return err
 	}
 	if err := validateDecryptResult(m); err != nil {
+		return err
+	}
+	if err := validateVPToken(m); err != nil {
 		return err
 	}
 	return validateResponseJWE(m)
@@ -216,6 +222,56 @@ func validateAbsentInterval(m map[string]json.RawMessage) error {
 		return resultErr("interval without transaction_id")
 	}
 	return nil
+}
+
+// validateVPToken refuses a vp_token that is not one of the three forms of
+// openid4x Section 3.2.4. The error names the rule, never the value.
+func validateVPToken(m map[string]json.RawMessage) error {
+	raw, ok := m["vp_token"]
+	if !ok {
+		return nil
+	}
+	raw = bytes.TrimSpace(raw)
+	if len(raw) > 0 {
+		var v any
+		if json.Unmarshal(raw, &v) == nil && validVPToken(v) {
+			return nil
+		}
+	}
+	return resultErr("vp_token is not a non-empty string, an array of non-empty strings or an object of arrays of non-empty strings")
+}
+
+func validVPToken(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return t != ""
+	case []any:
+		return nonEmptyStrings(t)
+	case map[string]any:
+		if len(t) == 0 {
+			return false
+		}
+		for _, e := range t {
+			a, ok := e.([]any)
+			if !ok || !nonEmptyStrings(a) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func nonEmptyStrings(a []any) bool {
+	if len(a) == 0 {
+		return false
+	}
+	for _, e := range a {
+		if s, ok := e.(string); !ok || s == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func validateResponseJWE(m map[string]json.RawMessage) error {
