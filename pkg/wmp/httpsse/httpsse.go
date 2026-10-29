@@ -361,6 +361,9 @@ type serverSession struct {
 	// drain looked.
 	enqMu  sync.RWMutex
 	sealed bool
+	// accepted and processed count queue items accepted and fully handled by
+	// the broadcast loop; equal means everything sent so far has been emitted.
+	accepted, processed atomic.Uint64
 	peer   *wmp.Peer
 	owner  string // Principal.Key of the owner; empty for legacy sessions
 
@@ -496,6 +499,7 @@ func (s *serverSession) broadcastLoop() {
 		}
 		if s.log != nil {
 			s.handle(msg)
+			s.processed.Add(1)
 			continue
 		}
 		data := msg.data
@@ -536,6 +540,7 @@ func (s *serverSession) drain() {
 		select {
 		case msg := <-s.outgoing:
 			s.handle(msg)
+			s.processed.Add(1)
 		default:
 			return
 		}
@@ -843,6 +848,7 @@ func (s *serverSession) enqueue(ctx context.Context, msg outMsg) error {
 	case <-s.done:
 		return errSessionClosed
 	case s.outgoing <- msg:
+		s.accepted.Add(1)
 		return nil
 	}
 }

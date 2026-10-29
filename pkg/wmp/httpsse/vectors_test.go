@@ -546,7 +546,24 @@ func tvEmit(h *ServerHandler, sessionID string, msg map[string]any) error {
 		return fmt.Errorf("no live session %q", sessionID)
 	}
 	method, _ := msg["method"].(string)
-	return s.peer.Notify(context.Background(), method, msg["params"])
+	if err := s.peer.Notify(context.Background(), method, msg["params"]); err != nil {
+		return err
+	}
+	// Notify only queues the message: wait until it has been emitted, so the
+	// next step (opening a stream, say) sees the session after it.
+	return quiesce(s)
+}
+
+// quiesce waits until the broadcast loop has handled everything accepted so far.
+func quiesce(s *serverSession) error {
+	deadline := time.Now().Add(60 * time.Second)
+	for s.processed.Load() != s.accepted.Load() {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the broadcast loop did not catch up")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return nil
 }
 
 // tvIdle turns the vector's simulated seconds into a short real wait: the
@@ -557,3 +574,26 @@ func tvIdle(seconds float64) time.Duration {
 
 // tvConfigure applies harness-specific settings to the handler config.
 func tvConfigure(c *ServerConfig) { c.Stream.Heartbeat = 40 * time.Millisecond }
+
+type slowLog struct{ EventLog }
+
+func (s slowLog) Append(sid string, d []byte) (string, error) {
+	time.Sleep(100 * time.Millisecond)
+	return s.EventLog.Append(sid, d)
+}
+
+// tvEmit returns only after the event was emitted, so a stream opened by the
+// next step does not receive it live (the race that failed the event-ids
+// vector on a slow runner).
+func TestVectorEmitIsCompleteWhenItReturns(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) { c.Stream.Log = slowLog{NewMemoryEventLog(10, 0)} })
+	sid, _ := f.create("Bearer alice")
+	if err := tvEmit(f.h, sid, progress(sid, "f", "s1")); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := f.open(sid, nil, "")
+	time.Sleep(300 * time.Millisecond)
+	if got := c.steps(t); len(got) != 0 {
+		t.Fatalf("an event emitted before the stream opened arrived on it: %v", got)
+	}
+}
