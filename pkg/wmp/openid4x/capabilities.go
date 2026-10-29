@@ -13,6 +13,9 @@ type CapabilityConfig struct {
 	OID4VCI         *OID4VCICapability
 	OID4VP          *OID4VPCapability
 	TransactionData *wmp.TransactionDataCap
+	// CredentialNotification advertises the credential_notification capability
+	// (Section 2.4); its members are optional, so a non-nil empty value is valid.
+	CredentialNotification *CredentialNotificationCap
 }
 
 // CapabilityDescriptors builds the wmp.Capabilities map for session
@@ -54,6 +57,13 @@ func CapabilityDescriptors(cfg CapabilityConfig) (wmp.Capabilities, error) {
 		}
 		caps[wmp.CapabilityTransactionData] = raw
 	}
+	if cfg.CredentialNotification != nil {
+		raw, err := json.Marshal(cfg.CredentialNotification)
+		if err != nil {
+			return nil, err
+		}
+		caps[CapabilityCredentialNotification] = raw
+	}
 	return caps, nil
 }
 
@@ -61,9 +71,10 @@ func CapabilityDescriptors(cfg CapabilityConfig) (wmp.Capabilities, error) {
 // (OID4VCI, OID4VP and TransactionData).
 func (p *Profile) CapabilityDescriptors() (wmp.Capabilities, error) {
 	return CapabilityDescriptors(CapabilityConfig{
-		OID4VCI:         p.config.OID4VCI,
-		OID4VP:          p.config.OID4VP,
-		TransactionData: p.config.TransactionData,
+		OID4VCI:                p.config.OID4VCI,
+		OID4VP:                 p.config.OID4VP,
+		TransactionData:        p.config.TransactionData,
+		CredentialNotification: p.config.CredentialNotification,
 	})
 }
 
