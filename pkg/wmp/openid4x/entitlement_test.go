@@ -182,6 +182,9 @@ func TestUntrustedIssuerData(t *testing.T) {
 		`{"reason":"untrusted_issuer","retryable":true}`,
 		`{"reason":"untrusted_issuer","retryable":"no"}`,
 		`{"reason":"untrusted_issuer"}`,
+		// findings belong to -31020; they are refused, not dropped
+		`{"reason":"untrusted_issuer","retryable":false,"findings":[{"code":"a"}]}`,
+		`{"reason":"untrusted_issuer","retryable":false,"findings":null}`,
 	} {
 		if _, ok, err := ParseUntrustedIssuerData(json.RawMessage(raw)); !ok || !errors.Is(err, ErrEntitlement) {
 			t.Errorf("%s: ok=%v err=%v", raw, ok, err)

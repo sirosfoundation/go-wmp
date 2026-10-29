@@ -333,6 +333,11 @@ func ParseUntrustedIssuerData(data json.RawMessage) (d *UntrustedIssuerData, ok 
 	if !isObject || !member(m, "reason", &reason) || reason != ReasonUntrustedIssuer {
 		return nil, false, nil
 	}
+	// Findings belong to -31020 and the schema forbids them here; accepting the
+	// refusal would silently drop the reasons.
+	if _, has := m["findings"]; has {
+		return nil, true, entitlementErr("an untrusted_issuer refusal carries no findings")
+	}
 	out := UntrustedIssuerData{Reason: reason}
 	if !member(m, "retryable", &out.Retryable) {
 		return nil, true, entitlementErr("retryable is missing or not a boolean")
