@@ -401,3 +401,61 @@ func TestRequestMatchRefusesASessionThatIsNotTheFlows(t *testing.T) {
 	default:
 	}
 }
+
+// The whole exchange of Sections 3.3 and 3.2.3.1 to 3.2.5: the wallet's match
+// result carries a handle, the user's select_credentials hands it back, and the
+// orchestrator carries it, unchanged, in the sign request with the consented
+// query ids and nothing else.
+func TestMatchSelectSignRoundTrip(t *testing.T) {
+	dcql := json.RawMessage(`{"credentials":[{"id":"pid"},{"id":"mdl"}]}`)
+	w := newWalletSide()
+	matchResult := `{"satisfiable":true,"satisfiable_query_ids":["pid","mdl"],"selection_handle":"` + goodHandle + `"}`
+	w.answer = func(p *wmp.FlowStartParams) {
+		if p.FlowType == FlowTypeMatch {
+			w.complete(p, matchResult)
+			return
+		}
+		w.complete(p, `{"vp_token":"vp"}`)
+	}
+	o := runOrchestrator(t, w, func(ctx context.Context, fc *wmp.FlowContext) outcome {
+		res, err := RequestMatch(ctx, fc, MatchSubFlowParams{DCQLQuery: dcql}, 2*time.Second)
+		if err != nil {
+			return outcome{err: err}
+		}
+		var m MatchResult
+		if err := json.Unmarshal(res, &m); err != nil {
+			return outcome{err: err}
+		}
+		// The wallet's select_credentials, as it arrives on the wire.
+		action := json.RawMessage(`{"consent":true,"selections":[{"query_id":"pid","selection_handle":"` + m.SelectionHandle + `"}]}`)
+		sel, err := ParseSelectCredentials(action)
+		if err != nil {
+			return outcome{err: err}
+		}
+		if err := sel.Check([]string{"pid", "mdl"}, m.SelectionHandle); err != nil {
+			return outcome{err: err}
+		}
+		refs, handle := sel.SignInclusion()
+		r, err := RequestSign(ctx, fc, SignSubFlowParams{
+			Action: "sign_presentation", Nonce: "n", Audience: "https://v",
+			CredentialsToInclude: refs, SelectionHandle: handle,
+		}, 2*time.Second)
+		return outcome{r, err}
+	})
+	if o.err != nil || string(o.res) != `{"vp_token":"vp"}` {
+		t.Fatalf("outcome = %+v", o)
+	}
+	<-w.started // the match start
+	sign := <-w.started
+	if sign.FlowType != "sign" {
+		t.Fatalf("second flow = %s", sign.FlowType)
+	}
+	var sent map[string]json.RawMessage
+	_ = json.Unmarshal(sign.Params, &sent)
+	if string(sent["selection_handle"]) != `"`+goodHandle+`"` {
+		t.Errorf("selection_handle = %s, want the match result's, unchanged", sent["selection_handle"])
+	}
+	if string(sent["credentials_to_include"]) != `[{"credential_query_id":"pid"}]` {
+		t.Errorf("credentials_to_include = %s", sent["credentials_to_include"])
+	}
+}

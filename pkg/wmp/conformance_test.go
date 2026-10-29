@@ -307,6 +307,16 @@ func assertFlowMessage(t *testing.T, raw json.RawMessage, v TestVector, id strin
 		} else {
 			violation = openid4x.ValidateCompletionResult(p.Result)
 		}
+	case wmp.MethodFlowAction:
+		var p struct {
+			Action string          `json:"action"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.Unmarshal(msg.Params, &p); err != nil || p.Action != openid4x.ActionSelectCredentials {
+			break
+		}
+		checked = true
+		_, violation = openid4x.ParseSelectCredentials(p.Params)
 	case wmp.MethodFlowStart:
 		checked = true
 		seen.record(msg.Params)

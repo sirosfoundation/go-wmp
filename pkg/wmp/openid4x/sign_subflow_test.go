@@ -73,12 +73,11 @@ func TestSignSubFlowParams_ClientAuthWireNames(t *testing.T) {
 // sends.
 func TestSignSubFlowParams_VerifierSessionAndCredentials(t *testing.T) {
 	in := SignSubFlowParams{
-		Action:            "sign_presentation",
-		Audience:          "https://verifier.example.com",
-		VerifierSessionID: "vs-1",
-		CredentialsToInclude: []CredentialSelection{
-			{CredentialID: "cred-1", CredentialQueryID: "q1", DisclosedClaims: []string{"given_name"}},
-		},
+		Action:               "sign_presentation",
+		Audience:             "https://verifier.example.com",
+		VerifierSessionID:    "vs-1",
+		CredentialsToInclude: []CredentialQueryRef{{CredentialQueryID: "q1"}},
+		SelectionHandle:      "Zm9yLXRoZS13YWxsZXQtb25seQ",
 	}
 	data, err := json.Marshal(in)
 	if err != nil {
@@ -91,8 +90,16 @@ func TestSignSubFlowParams_VerifierSessionAndCredentials(t *testing.T) {
 	if got, _ := wire["verifier_session_id"].(string); got != "vs-1" {
 		t.Errorf("verifier_session_id = %q, want %q", got, "vs-1")
 	}
-	if _, present := wire["credentials_to_include"]; !present {
-		t.Fatal("expected credentials_to_include on the wire")
+	if got, _ := wire["selection_handle"].(string); got != in.SelectionHandle {
+		t.Errorf("selection_handle = %q, want %q", got, in.SelectionHandle)
+	}
+	refs, _ := wire["credentials_to_include"].([]any)
+	if len(refs) != 1 {
+		t.Fatalf("credentials_to_include = %v", wire["credentials_to_include"])
+	}
+	// An entry is the query id and nothing else: no credential id, no claims.
+	if ref, _ := refs[0].(map[string]any); len(ref) != 1 || ref["credential_query_id"] != "q1" {
+		t.Errorf("credentials_to_include[0] = %v", refs[0])
 	}
 
 	var out SignSubFlowParams
@@ -115,7 +122,7 @@ func TestSignSubFlowParams_VerifierSessionAndCredentials(t *testing.T) {
 	if err := json.Unmarshal(data, &wire); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"verifier_session_id", "credentials_to_include"} {
+	for _, k := range []string{"verifier_session_id", "credentials_to_include", "selection_handle"} {
 		if _, present := wire[k]; present {
 			t.Errorf("unexpected %s on a generate_proof request", k)
 		}
