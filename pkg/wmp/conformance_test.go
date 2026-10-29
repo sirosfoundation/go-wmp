@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -514,5 +515,69 @@ func TestConformanceMethodCoverage(t *testing.T) {
 		if !methods[m] {
 			t.Errorf("Vector method %q not in known method constants", m)
 		}
+	}
+}
+
+// TestConformanceIssuerEntitlement runs the issuer entitlement vectors (WMP
+// OpenID4x 3.1.6 and 7.8) of flow-lifecycle.json against the validators.
+func TestConformanceIssuerEntitlement(t *testing.T) {
+	var ran int
+	for _, v := range loadVectors(t, "flow-lifecycle.json") {
+		if !strings.HasPrefix(v.ID, "flow-vci-issuer-entitlement-") && !strings.HasPrefix(v.ID, "flow-vci-refused-untrusted-issuer") {
+			continue
+		}
+		ran++
+		t.Run(v.ID, func(t *testing.T) {
+			var msg genericRPC
+			if err := json.Unmarshal(v.Input, &msg); err != nil {
+				t.Fatal(err)
+			}
+			switch msg.Method {
+			case wmp.MethodFlowProgress:
+				var ps wmp.FlowProgressParams
+				if err := json.Unmarshal(msg.Params, &ps); err != nil {
+					t.Fatal(err)
+				}
+				p, ok, err := openid4x.ParseIssuerEntitlementPayload(ps.Payload)
+				if err != nil || !ok || ps.Step != openid4x.StepTrustEvaluated {
+					t.Fatalf("payload refused: ok=%v err=%v step=%s", ok, err, ps.Step)
+				}
+				// What this library sends for the same result is the vector's payload.
+				built, err := openid4x.NewIssuerEntitlementPayload(p.Issuer, p.IssuerEntitlement)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, _ := json.Marshal(built)
+				var a, b map[string]any
+				_ = json.Unmarshal(got, &a)
+				_ = json.Unmarshal(ps.Payload, &b)
+				if !reflect.DeepEqual(a, b) {
+					t.Errorf("built %s, vector %s", got, ps.Payload)
+				}
+			case wmp.MethodFlowError:
+				var ps wmp.FlowErrorParams
+				if err := json.Unmarshal(msg.Params, &ps); err != nil {
+					t.Fatal(err)
+				}
+				d, ok, err := openid4x.ParseUntrustedIssuerData(ps.Data)
+				if err != nil || !ok || ps.Code != wmp.ErrFlowError || ps.Message != wmp.ErrorMessage(wmp.ErrFlowError) {
+					t.Fatalf("error refused: ok=%v err=%v code=%d message=%q", ok, err, ps.Code, ps.Message)
+				}
+				built, err := openid4x.NewUntrustedIssuerData(d.Findings)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, _ := json.Marshal(built)
+				var a, b map[string]any
+				_ = json.Unmarshal(got, &a)
+				_ = json.Unmarshal(ps.Data, &b)
+				if !reflect.DeepEqual(a, b) {
+					t.Errorf("built %s, vector %s", got, ps.Data)
+				}
+			}
+		})
+	}
+	if ran == 0 {
+		t.Skip("no issuer entitlement vectors in this checkout of the spec")
 	}
 }
