@@ -233,12 +233,32 @@ func RequestSign(ctx context.Context, fc *wmp.FlowContext, p SignSubFlowParams, 
 	return result, nil
 }
 
+// checkDecryptionAnswer requires the control-only answer to a
+// decrypt_credential_response request: credential_count or transaction_id, with
+// interval, and no other member (the credentials stay in the wallet).
+func checkDecryptionAnswer(m map[string]json.RawMessage) error {
+	_, hasCount := m["credential_count"]
+	_, hasTx := m["transaction_id"]
+	if !hasCount && !hasTx {
+		return resultErr("decryption request answered without credential_count or transaction_id")
+	}
+	for k := range m {
+		switch k {
+		case "credential_count", "transaction_id", "interval":
+		default:
+			return resultErr("decryption request answered with a member beyond its control members")
+		}
+	}
+	return nil
+}
+
 // ValidateSignResult checks the result of a sign sub-flow started with p: the
 // rules of ValidateCompletionResult, which look only at the result, and those
 // that depend on what was asked.
 //
 //   - A decrypt_credential_response request is answered with a control result
-//     only: credential_count or transaction_id, never the credentials.
+//     only: credential_count or transaction_id (and interval), and no other
+//     member, never the credentials.
 //   - A request that carried response_encryption (direct_post.jwt) is answered
 //     with response_jwe: the vp_token stays in the wallet.
 func ValidateSignResult(p SignSubFlowParams, result json.RawMessage) error {
@@ -248,10 +268,8 @@ func ValidateSignResult(p SignSubFlowParams, result json.RawMessage) error {
 	var m map[string]json.RawMessage
 	_ = json.Unmarshal(result, &m) // an object: ValidateCompletionResult checked
 	if p.Action == "decrypt_credential_response" {
-		_, hasCount := m["credential_count"]
-		_, hasTx := m["transaction_id"]
-		if !hasCount && !hasTx {
-			return resultErr("decryption request answered without credential_count or transaction_id")
+		if err := checkDecryptionAnswer(m); err != nil {
+			return err
 		}
 	}
 	if len(p.ResponseEncryption) > 0 && isNotNull(p.ResponseEncryption) {

@@ -3,6 +3,7 @@ package wmp
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // generateRequestID creates a cryptographically random JSON-RPC request ID.
@@ -556,6 +558,21 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 	}
 }
 
+// startIdentity identifies a wmp.flow.start by what it asks for: the flow type
+// and its params. The same start sent again has the same identity.
+func startIdentity(ps *FlowStartParams) [32]byte {
+	h := sha256.New()
+	h.Write([]byte(ps.FlowType))
+	h.Write([]byte{0})
+	h.Write(ps.Params)
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
+}
+
+// maxStartWait bounds how long an action waits for the start of its flow.
+const maxStartWait = 30 * time.Second
+
 // dispatchFlowStart routes a wmp.flow.start to the profile that owns its flow
 // type, or to the Handler.
 func (p *Peer) dispatchFlowStart(ctx context.Context, ps *FlowStartParams) (interface{}, error) {
@@ -564,8 +581,17 @@ func (p *Peer) dispatchFlowStart(ctx context.Context, ps *FlowStartParams) (inte
 	// wmp.flow.start. Reserving it here, before the handler runs, keeps a
 	// claim made meanwhile from being overwritten.
 	session := p.flowSession(ctx, ps.WMP.SessionID)
-	if !p.registry.beginStart(ps.FlowID, session) {
+	startID := startIdentity(ps)
+	switch p.registry.beginStart(ps.FlowID, session, startID) {
+	case startRefused:
 		return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow_id in use"})
+	case startDuplicate:
+		// The same start again (a re-issue after a resume): the flow exists,
+		// and a second worker is not launched.
+		return &FlowStartResult{
+			WMP:    Metadata{Version: p.versionFor(session), SessionID: session},
+			FlowID: ps.FlowID, FlowType: ps.FlowType,
+		}, nil
 	}
 	fh, ok := p.registry.lookupFlowHandler(ps.FlowType)
 	if !ok {
@@ -588,11 +614,14 @@ func (p *Peer) dispatchFlowStart(ctx context.Context, ps *FlowStartParams) (inte
 	// Route the flow's messages before its worker can run, under a generation
 	// of its own: a worker that finishes first releases exactly this route,
 	// and messages that arrive while StartFlow runs are held until it returns.
-	gen := p.registry.route(ps.FlowID, session, fh)
+	gen, replaced := p.registry.route(ps.FlowID, session, fh, startID)
 	release := func() { p.registry.release(ps.FlowID, gen) }
-	result, err := fh.StartFlow(contextWithFlowRoute(ctx, flowRoute{gen: gen, release: release}), ps)
+	terminal := func() { p.registry.markTerminal(ps.FlowID, gen) }
+	result, err := fh.StartFlow(contextWithFlowRoute(ctx, flowRoute{gen: gen, release: release, terminal: terminal}), ps)
 	if err != nil || result == nil {
-		release()
+		// The flow did not start: its route goes, and the one it was to
+		// replace (an ordinary handler's earlier flow) is routed again.
+		p.registry.abandonRoute(ps.FlowID, gen, replaced)
 		p.registry.discardStart(ps.FlowID)
 		return result, err
 	}
@@ -661,17 +690,30 @@ func (p *Peer) viaRoute(e flowEntry, fn func(e flowEntry)) bool {
 
 // dispatchFlowAction routes a wmp.flow.action to its flow.
 func (p *Peer) dispatchFlowAction(ctx context.Context, ps *FlowActionParams) (interface{}, error) {
+	// An action is a request the flow must answer, and the flow does not exist
+	// until its start has returned: a worker may well ask for an action (a
+	// progress notification) before that, so the action waits for the start,
+	// from the starting session only.
+	if startSession, starting := p.registry.startingSession(ps.FlowID); starting {
+		if startSession != "" && startSession != ps.WMP.SessionID {
+			return nil, NewRPCError(ErrNotAuthorized, nil)
+		}
+		wait := time.NewTimer(maxStartWait)
+		defer wait.Stop()
+		select {
+		case <-p.registry.startDone(ps.FlowID):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-wait.C:
+			return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow is still starting"})
+		}
+	}
 	e, ok := p.registry.lookupFlow(ps.FlowID)
 	if !ok {
 		return p.handler.FlowAction(ctx, ps)
 	}
 	if !e.allows(ps.WMP.SessionID) {
 		return nil, NewRPCError(ErrNotAuthorized, nil)
-	}
-	// An action is a request the flow must answer, and the flow does not
-	// exist until its start has returned.
-	if p.registry.isStarting(ps.FlowID) {
-		return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow is still starting"})
 	}
 	var (
 		res  *FlowActionResult
@@ -703,39 +745,43 @@ func (p *Peer) dispatchFlowCancel(ctx context.Context, ps *FlowCancelParams) (in
 		// published and its handler stops flows (FlowCanceller). Otherwise it
 		// is refused, not acknowledged and lost.
 		_, canStop := e.handler.(FlowCanceller)
-		if routed && canStop && p.registry.deferWhileStarting(ps.FlowID, deferCancel, func() { p.applyCancel(ctx, ps) }) {
+		if routed && canStop && p.registry.deferWhileStarting(ps.FlowID, deferCancel, func() { _, _ = p.applyCancel(ctx, e, ps) }) {
 			return cancelled, nil
 		}
 		if !routed || !canStop {
 			return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow is still starting"})
 		}
 	}
-	if routed && p.applyCancel(ctx, ps) {
-		// The profile stopped the flow: that is the answer, whatever the
-		// Handler would say about a flow it never saw.
-		return cancelled, nil
+	if routed {
+		stopped, err := p.applyCancel(ctx, e, ps)
+		if err != nil {
+			return nil, err
+		}
+		if stopped {
+			// The profile stopped the flow: that is the answer, whatever the
+			// Handler would say about a flow it never saw.
+			return cancelled, nil
+		}
 	}
 	return p.handler.FlowCancel(ctx, ps)
 }
 
-// applyCancel lets the handler of a flow's route stop it, and reports whether
-// it did. A handler that manages its own routes unroutes the flow when its
-// worker has exited; for any other the route ends with the cancel.
-func (p *Peer) applyCancel(ctx context.Context, ps *FlowCancelParams) bool {
-	e, ok := p.registry.lookupFlow(ps.FlowID)
-	if !ok {
-		return false
-	}
-	stopped := false
+// applyCancel lets the handler of the authorized route e stop its flow, and
+// reports whether it did, or the error that says it cannot (the flow is already
+// terminal). Only the route's own generation is acted on: if that flow has
+// ended and the ID is reused, the cancel is not applied to the replacement. A
+// handler that manages its own routes unroutes the flow when its worker has
+// exited; for any other the route ends with the cancel.
+func (p *Peer) applyCancel(ctx context.Context, e flowEntry, ps *FlowCancelParams) (stopped bool, err error) {
 	p.viaRoute(e, func(e flowEntry) {
-		if fc, ok := e.handler.(FlowCanceller); ok && fc.HandleCancel(withFlowGen(ctx, e.gen), ps) {
-			stopped = true
+		if fc, ok := e.handler.(FlowCanceller); ok {
+			stopped, err = fc.HandleCancel(withFlowGen(ctx, e.gen), ps)
 		}
 		if (stopped || !e.claimed) && !e.managed {
 			p.registry.release(ps.FlowID, e.gen)
 		}
 	})
-	return stopped
+	return stopped, err
 }
 
 // endRoutedFlow runs the handler's terminal callback for e and then ends the

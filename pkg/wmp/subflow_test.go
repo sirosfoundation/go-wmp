@@ -30,6 +30,8 @@ type walletHandler struct {
 	BaseHandler
 	started chan *FlowStartParams
 	cancels chan *FlowCancelParams
+	// onProgress, when set, is called for each wmp.flow.progress the wallet gets.
+	onProgress func(*FlowProgressParams)
 	// start, when set, answers a wmp.flow.start (return nil for an accepted
 	// start); onStart, when set, runs after the start was accepted.
 	start   func(*FlowStartParams) error
@@ -48,6 +50,12 @@ func (h *walletHandler) FlowStart(_ context.Context, p *FlowStartParams) (*FlowS
 		go h.onStart(p)
 	}
 	return &FlowStartResult{WMP: p.WMP, FlowID: p.FlowID, FlowType: p.FlowType}, nil
+}
+
+func (h *walletHandler) FlowProgress(_ context.Context, p *FlowProgressParams) {
+	if h.onProgress != nil {
+		go h.onProgress(p)
+	}
 }
 
 func (h *walletHandler) FlowCancel(_ context.Context, p *FlowCancelParams) (*FlowCancelResult, error) {
@@ -164,8 +172,8 @@ func (r *subFlowRig) runParent(t *testing.T, id string, fn FlowFunc) {
 // pendingSubFlows is PendingSubFlows as a resume hook sees it: the context
 // names the dispatching peer and the session.
 func (r *subFlowRig) pendingSubFlows(parentID string) []PendingSubFlow {
-	ctx := ContextWithSession(contextWithPeer(r.ctx, r.orch), &Session{ID: "ses-1"})
-	return r.profile.PendingSubFlows(ctx, parentID)
+	ctx := contextWithPeer(r.ctx, r.orch)
+	return r.profile.PendingSubFlows(ctx, "ses-1", parentID)
 }
 
 func recvStart(t *testing.T, h *walletHandler) *FlowStartParams {
@@ -543,7 +551,7 @@ func TestSubFlowFirstOutcomeWins(t *testing.T) {
 	if len(sub.outcome) != 0 {
 		t.Error("a later outcome was queued")
 	}
-	if len(profile.PendingSubFlows(context.Background(), "")) != 0 {
+	if len(profile.PendingSubFlows(context.Background(), "ses-1", "")) != 0 {
 		t.Error("a sub-flow with an outcome is still listed as pending")
 	}
 }
@@ -816,10 +824,10 @@ func TestFlowRouteSessionBindingAndGenerations(t *testing.T) {
 	if _, ok := r.claimFlow("open", "", h); !ok {
 		t.Fatal("claim without a session")
 	}
-	if !r.beginStart("started", "ses-1") {
+	if !begin(r, "started", "ses-1") {
 		t.Fatal("beginStart")
 	}
-	gen := r.route("started", "ses-1", h)
+	gen, _ := r.route("started", "ses-1", h, noStart)
 	for _, tc := range []struct {
 		flow, session string
 		want          bool
@@ -867,24 +875,24 @@ func TestBeginStartReplacementRules(t *testing.T) {
 	r := newRegistry()
 	managed := NewAsyncFlowProfile("m")
 	plain := &plainFlowHandler{}
-	r.beginStart("m1", "ses-1")
-	r.route("m1", "ses-1", managed)
+	begin(r, "m1", "ses-1")
+	r.route("m1", "ses-1", managed, noStart)
 	r.discardStart("m1")
-	r.beginStart("p1", "ses-1")
-	r.route("p1", "ses-1", plain)
+	begin(r, "p1", "ses-1")
+	r.route("p1", "ses-1", plain, noStart)
 	r.discardStart("p1")
 	r.claimFlow("c1", "ses-1", plain)
 
-	if r.beginStart("m1", "ses-1") {
+	if begin(r, "m1", "ses-1") {
 		t.Error("a managed handler's live flow was replaced")
 	}
-	if r.beginStart("c1", "ses-1") {
+	if begin(r, "c1", "ses-1") {
 		t.Error("a claim was replaced")
 	}
-	if r.beginStart("p1", "ses-2") {
+	if begin(r, "p1", "ses-2") {
 		t.Error("another session replaced an ordinary handler's flow")
 	}
-	if !r.beginStart("p1", "ses-1") {
+	if !begin(r, "p1", "ses-1") {
 		t.Error("the same session could not restart an ordinary handler's flow")
 	}
 }
@@ -892,8 +900,8 @@ func TestBeginStartReplacementRules(t *testing.T) {
 func TestRouteInUseIsKeptUntilTheDispatchIsDone(t *testing.T) {
 	r := newRegistry()
 	h := &plainFlowHandler{}
-	r.beginStart("f", "ses-1")
-	gen := r.route("f", "ses-1", h)
+	begin(r, "f", "ses-1")
+	gen, _ := r.route("f", "ses-1", h, noStart)
 	r.discardStart("f")
 	e, ok := r.acquire("f", gen)
 	if !ok {
@@ -906,18 +914,18 @@ func TestRouteInUseIsKeptUntilTheDispatchIsDone(t *testing.T) {
 	if _, ok := r.acquire("f", gen); ok {
 		t.Error("a released route was acquired")
 	}
-	if r.beginStart("f", "ses-1") {
+	if begin(r, "f", "ses-1") {
 		t.Error("the ID was reused under a dispatch that is still using the route")
 	}
 	r.done("f", gen)
-	if !r.beginStart("f", "ses-1") {
+	if !begin(r, "f", "ses-1") {
 		t.Error("the ID stayed taken after the last dispatch finished")
 	}
 }
 
 func TestDeferredMessagesAreBounded(t *testing.T) {
 	r := newRegistry()
-	r.beginStart("f", "ses-1")
+	begin(r, "f", "ses-1")
 	var ran int
 	for i := 0; i < 1000; i++ {
 		r.deferWhileStarting("f", deferProgress, func() { ran++ })
@@ -963,7 +971,7 @@ func (*plainFlowHandler) HandleError(context.Context, *FlowErrorParams)       {}
 func TestStartReservationBlocksClaim(t *testing.T) {
 	r := newRegistry()
 	h := NewAsyncFlowProfile("p")
-	if !r.beginStart("f", "ses-1") || r.beginStart("f", "ses-1") {
+	if !begin(r, "f", "ses-1") || begin(r, "f", "ses-1") {
 		t.Fatal("a start of a flow id can run once at a time")
 	}
 	if _, ok := r.claimFlow("f", "ses-1", h); ok {
@@ -973,7 +981,7 @@ func TestStartReservationBlocksClaim(t *testing.T) {
 	if _, ok := r.claimFlow("f", "ses-1", h); !ok {
 		t.Fatal("claim after the start ended")
 	}
-	if r.beginStart("f", "ses-1") {
+	if begin(r, "f", "ses-1") {
 		t.Fatal("started a claimed flow id")
 	}
 }
@@ -981,7 +989,7 @@ func TestStartReservationBlocksClaim(t *testing.T) {
 func TestMessagesDuringStartAreHeldAndApplied(t *testing.T) {
 	r := newRegistry()
 	var order []int
-	if !r.beginStart("f", "ses-1") {
+	if !begin(r, "f", "ses-1") {
 		t.Fatal("beginStart")
 	}
 	for i := 1; i <= 3; i++ {
@@ -1449,7 +1457,7 @@ func TestSharedProfileKeepsFlowsOfDifferentPeersApart(t *testing.T) {
 	}
 }
 
-func TestStartOfAnOwnedFlowIDIsRefused(t *testing.T) {
+func TestStartOfAnOwnedFlowIDIsRefusedExceptTheSameStartAgain(t *testing.T) {
 	r := newSubFlowRig(t)
 	var mu sync.Mutex
 	workers := 0
@@ -1462,11 +1470,20 @@ func TestStartOfAnOwnedFlowIDIsRefused(t *testing.T) {
 	})
 	r.startParent(t, "flow-p")
 	var rpcErr *RPCError
-	// Same session, same type: no second worker, no idempotent re-launch.
-	if err := r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "parent", FlowID: "flow-p"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError {
-		t.Fatalf("reissue: err = %v, want -31006", err)
+	// The same start again (a re-issue after a resume): acknowledged, and no
+	// second worker is launched.
+	var again FlowStartResult
+	if err := r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "parent", FlowID: "flow-p"}, &again); err != nil {
+		t.Fatalf("repeated start: %v", err)
 	}
-	// Another session: same refusal, and the original binding stands.
+	if again.FlowID != "flow-p" || again.FlowType != "parent" || again.WMP.Version != Version || again.WMP.SessionID != "ses-1" {
+		t.Errorf("acknowledgement = %+v", again)
+	}
+	// A different start for the ID is a conflict.
+	if err := r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "parent", FlowID: "flow-p", Params: json.RawMessage(`{"other":1}`)}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError {
+		t.Fatalf("different start: err = %v, want -31006", err)
+	}
+	// Another session: the same refusal, and the original binding stands.
 	if err := r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{WMP: Metadata{SessionID: "ses-evil"}, FlowType: "parent", FlowID: "flow-p"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError {
 		t.Fatalf("other session: err = %v, want -31006", err)
 	}
@@ -1686,7 +1703,7 @@ type slowCancelProfile struct {
 	release chan struct{}
 }
 
-func (s *slowCancelProfile) HandleCancel(ctx context.Context, p *FlowCancelParams) bool {
+func (s *slowCancelProfile) HandleCancel(ctx context.Context, p *FlowCancelParams) (bool, error) {
 	close(s.in)
 	<-s.release
 	return s.AsyncFlowProfile.HandleCancel(ctx, p)
@@ -1797,23 +1814,23 @@ func TestPendingSubFlowsAreScopedToThePeer(t *testing.T) {
 	}
 	// The profile-level lookup is scoped by the dispatching peer in ctx.
 	for _, rig := range []*subFlowRig{a, b} {
-		ctx := ContextWithSession(contextWithPeer(context.Background(), rig.orch), &Session{ID: "ses-1"})
-		if got := shared.PendingSubFlows(ctx, "flow-1"); len(got) != 1 {
+		ctx := contextWithPeer(context.Background(), rig.orch)
+		if got := shared.PendingSubFlows(ctx, "ses-1", "flow-1"); len(got) != 1 {
 			t.Fatalf("peer-scoped pending = %d, want 1", len(got))
 		}
-		// Without the peer, or without the session, nothing is shown.
-		if got := shared.PendingSubFlows(contextWithPeer(context.Background(), rig.orch), "flow-1"); len(got) != 0 {
+		// Without the peer, or without the session id, nothing is shown.
+		if got := shared.PendingSubFlows(contextWithPeer(context.Background(), rig.orch), "", "flow-1"); len(got) != 0 {
 			t.Fatalf("pending without a session = %d, want 0", len(got))
 		}
-		if got := shared.PendingSubFlows(ContextWithSession(context.Background(), &Session{ID: "ses-1"}), "flow-1"); len(got) != 0 {
+		if got := shared.PendingSubFlows(context.Background(), "ses-1", "flow-1"); len(got) != 0 {
 			t.Fatalf("pending without a peer = %d, want 0", len(got))
 		}
 		// The returned params are a copy.
-		got := shared.PendingSubFlows(ctx, "flow-1")
+		got := shared.PendingSubFlows(ctx, "ses-1", "flow-1")
 		for i := range got[0].Params {
 			got[0].Params[i] = 'x'
 		}
-		if again := shared.PendingSubFlows(ctx, "flow-1"); !json.Valid(again[0].Params) {
+		if again := shared.PendingSubFlows(ctx, "ses-1", "flow-1"); !json.Valid(again[0].Params) {
 			t.Fatal("editing the returned params changed the sub-flow's own")
 		}
 	}
@@ -1965,6 +1982,13 @@ func TestCompletionDuringStartIsHeldNotLost(t *testing.T) {
 	waitFor(t, func() bool { return slow.ActiveFlows() == 0 })
 }
 
+var noStart [32]byte
+
+// begin is beginStart as a bool: whether the flow_id was reserved.
+func begin(r *registry, flowID, session string) bool {
+	return r.beginStart(flowID, session, noStart) == startReserved
+}
+
 // lookupFlowOwner is the handler routed for flowID (a test convenience).
 func (r *registry) lookupFlowOwner(flowID string) (FlowHandler, bool) {
 	e, ok := r.lookupFlow(flowID)
@@ -2094,7 +2118,7 @@ func TestMessageForAnOlderInstanceNeverReachesTheReplacement(t *testing.T) {
 	}
 	r.profile.HandleComplete(stale, &FlowCompleteParams{FlowID: "flow-p"})
 	r.profile.HandleError(stale, &FlowErrorParams{FlowID: "flow-p"})
-	if r.profile.HandleCancel(stale, &FlowCancelParams{FlowID: "flow-p"}) {
+	if stopped, _ := r.profile.HandleCancel(stale, &FlowCancelParams{FlowID: "flow-p"}); stopped {
 		t.Error("a cancel for the old instance stopped the replacement")
 	}
 	if r.profile.ActiveFlows() != 1 {
@@ -2102,8 +2126,8 @@ func TestMessageForAnOlderInstanceNeverReachesTheReplacement(t *testing.T) {
 	}
 	// The same messages for the current instance do work.
 	fresh := withFlowGen(contextWithPeer(r.ctx, r.orch), cur.gen)
-	if !r.profile.HandleCancel(fresh, &FlowCancelParams{FlowID: "flow-p"}) {
-		t.Error("a cancel for the current instance was refused")
+	if stopped, err := r.profile.HandleCancel(fresh, &FlowCancelParams{FlowID: "flow-p"}); !stopped || err != nil {
+		t.Errorf("a cancel for the current instance: %v, %v", stopped, err)
 	}
 }
 
@@ -2210,5 +2234,214 @@ func TestPendingSubFlowsAreFilteredByParentGeneration(t *testing.T) {
 	}
 	if got := p.pendingSubFlows(peer, "ses-1", "flow-p", 2); len(got) != 0 {
 		t.Fatalf("a later instance of the parent sees the earlier one's child: %d", len(got))
+	}
+}
+
+// --- fifth review round ---
+
+func TestCancelIsAppliedOnlyToTheAuthorizedInstance(t *testing.T) {
+	r := newSubFlowRig(t)
+	r.setParent(func(ctx context.Context, fc *FlowContext) error { <-ctx.Done(); return nil })
+	r.startParent(t, "flow-p")
+	old, _ := r.orch.registry.lookupFlow("flow-p")
+	r.profile.CancelFlow("flow-p")
+	waitFor(t, func() bool { _, owned := r.orch.registry.lookupFlowOwner("flow-p"); return !owned })
+	r.startParent(t, "flow-p") // another instance of the ID
+
+	// A cancel authorized against the old route, applied late (as a deferred
+	// one is), must not stop the replacement.
+	stopped, err := r.orch.applyCancel(r.ctx, old, &FlowCancelParams{FlowID: "flow-p"})
+	if stopped || err != nil {
+		t.Errorf("stale cancel: stopped=%v err=%v", stopped, err)
+	}
+	if r.profile.ActiveFlows() != 1 {
+		t.Fatalf("active = %d: the replacement was stopped", r.profile.ActiveFlows())
+	}
+	r.profile.CancelFlow("flow-p")
+}
+
+func TestTerminalFlowTakesNoActionsAndNoCancel(t *testing.T) {
+	r := newSubFlowRig(t)
+	completed := make(chan struct{})
+	r.setParent(func(ctx context.Context, fc *FlowContext) error {
+		if err := fc.Complete(ctx, map[string]string{"ok": "y"}); err != nil {
+			return err
+		}
+		close(completed)
+		time.Sleep(time.Hour) // the worker winds down slowly
+		return nil
+	})
+	r.startParent(t, "flow-p")
+	<-completed
+	var rpcErr *RPCError
+	if err := r.wallet.Call(r.ctx, MethodFlowAction, &FlowActionParams{FlowID: "flow-p", Action: "x"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError || !strings.Contains(string(rpcErr.Data), "already_terminal") {
+		t.Fatalf("action after completion: err = %v, want -31006 already_terminal", err)
+	}
+	if err := r.wallet.Call(r.ctx, MethodFlowCancel, &FlowCancelParams{FlowID: "flow-p"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError || !strings.Contains(string(rpcErr.Data), "already_terminal") {
+		t.Fatalf("cancel after completion: err = %v, want -31006 already_terminal", err)
+	}
+	// Its ID is still reserved, and a repeated start is not acknowledged.
+	if err := r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "parent", FlowID: "flow-p"}, nil); !errors.As(err, &rpcErr) {
+		t.Fatalf("repeated start of a terminal flow: err = %v, want a refusal", err)
+	}
+}
+
+func TestFallbackActionDuringStartIsAuthorizedAndWaits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	h := &fallbackActionHandler{fallbackHandler: fallbackHandler{in: make(chan struct{}), release: make(chan struct{}), completes: make(chan string, 4), cancels: make(chan string, 4)}, actions: make(chan string, 4)}
+	tA, tB := NewChannelTransport(64, 64), NewChannelTransport(64, 64)
+	bridge(ctx, tA, tB)
+	bridge(ctx, tB, tA)
+	hp := NewPeer(tA, h, WithSessionIdentity("ses-1", "h"))
+	remote := NewPeer(tB, &BaseHandler{}, WithSessionIdentity("ses-1", "r"))
+	go hp.Serve(ctx)
+	go remote.Serve(ctx)
+	started := make(chan error, 1)
+	go func() {
+		started <- remote.Call(ctx, MethodFlowStart, &FlowStartParams{FlowType: "x", FlowID: "fa"}, nil)
+	}()
+	<-h.in
+	var rpcErr *RPCError
+	if err := remote.Call(ctx, MethodFlowAction, &FlowActionParams{WMP: Metadata{SessionID: "ses-evil"}, FlowID: "fa", Action: "go"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrNotAuthorized {
+		t.Fatalf("action from another session during a start: err = %v, want -31002", err)
+	}
+	// The starting session's action waits for the start and is then handled.
+	actionDone := make(chan error, 1)
+	go func() {
+		actionDone <- remote.Call(ctx, MethodFlowAction, &FlowActionParams{FlowID: "fa", Action: "go"}, nil)
+	}()
+	select {
+	case a := <-h.actions:
+		t.Fatalf("action %s reached the handler before the start returned", a)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(h.release)
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-actionDone; err != nil {
+		t.Fatalf("action after the start: %v", err)
+	}
+	select {
+	case <-h.actions:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the waiting action was lost")
+	}
+}
+
+type fallbackActionHandler struct {
+	fallbackHandler
+	actions chan string
+}
+
+func (h *fallbackActionHandler) FlowAction(_ context.Context, p *FlowActionParams) (*FlowActionResult, error) {
+	h.actions <- p.Action
+	return &FlowActionResult{FlowID: p.FlowID, Action: p.Action, Status: "accepted"}, nil
+}
+
+func TestWorkerActionRequestBeforeStartReturnsIsNotLost(t *testing.T) {
+	r := newSubFlowRig(t)
+	got := make(chan string, 1)
+	slow := NewAsyncFlowProfile("slow")
+	release := make(chan struct{})
+	slow.afterStart = func() { <-release } // StartFlow has launched the worker but has not returned
+	slow.Handle("slow", func(ctx context.Context, fc *FlowContext) error {
+		a, err := fc.RequestAction(ctx, "ask", nil, 5*time.Second)
+		if err != nil {
+			got <- "error: " + err.Error()
+			return nil
+		}
+		got <- a.Action
+		return fc.Complete(ctx, nil)
+	})
+	r.handler.onProgress = func(p *FlowProgressParams) {
+		// The wallet answers the worker's request at once, before the start
+		// has returned to it.
+		_ = r.wallet.Call(r.ctx, MethodFlowAction, &FlowActionParams{FlowID: p.FlowID, Action: "answer"}, nil)
+	}
+	if err := r.orch.Use(slow); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan error, 1)
+	go func() {
+		started <- r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "slow", FlowID: "w1"}, nil)
+	}()
+	time.Sleep(200 * time.Millisecond) // the worker's request and the wallet's action are in
+	close(release)
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case a := <-got:
+		if a != "answer" {
+			t.Fatalf("worker got %q", a)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the worker never got its action")
+	}
+}
+
+func TestFailedReplacementStartKeepsTheOriginalRoute(t *testing.T) {
+	r := newSubFlowRig(t)
+	tp := &terminalProfile{}
+	if err := r.orch.Use(tp); err != nil {
+		t.Fatal(err)
+	}
+	start := func() error {
+		return r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "terminal", FlowID: "t1"}, nil)
+	}
+	if err := start(); err != nil {
+		t.Fatal(err)
+	}
+	tp.fail = true // the replacement start fails
+	if err := start(); err == nil {
+		t.Fatal("failing start succeeded")
+	}
+	if _, owned := r.orch.registry.lookupFlowOwner("t1"); !owned {
+		t.Fatal("a failed restart unrouted the flow it was to replace")
+	}
+}
+
+func TestDeferredMessagesKeepArrivalOrder(t *testing.T) {
+	r := newRegistry()
+	r.beginStart("f", "ses-1", noStart)
+	var order []string
+	r.deferWhileStarting("f", deferCancel, func() { order = append(order, "cancel") })
+	r.deferWhileStarting("f", deferTerminal, func() { order = append(order, "terminal") })
+	r.deferWhileStarting("f", deferProgress, func() { order = append(order, "progress") })
+	for {
+		ops, done := r.takeDeferred("f")
+		if done {
+			break
+		}
+		for _, op := range ops {
+			op()
+		}
+	}
+	if strings.Join(order, ",") != "cancel,terminal,progress" {
+		t.Errorf("order = %v, want arrival order", order)
+	}
+}
+
+func TestRepeatedStartIsRecognisedOnlyForALiveManagedFlow(t *testing.T) {
+	r := newRegistry()
+	h := NewAsyncFlowProfile("m")
+	id := [32]byte{1}
+	r.beginStart("m1", "ses-1", id)
+	r.route("m1", "ses-1", h, id)
+	r.discardStart("m1")
+	if got := r.beginStart("m1", "ses-1", id); got != startDuplicate {
+		t.Fatalf("same start: %v, want startDuplicate", got)
+	}
+	if got := r.beginStart("m1", "ses-1", [32]byte{2}); got != startRefused {
+		t.Fatalf("different start: %v, want startRefused", got)
+	}
+	if got := r.beginStart("m1", "ses-2", id); got != startRefused {
+		t.Fatalf("other session: %v, want startRefused", got)
+	}
+	r.markTerminal("m1", 0)
+	if got := r.beginStart("m1", "ses-1", id); got != startRefused {
+		t.Fatalf("terminal flow: %v, want startRefused", got)
 	}
 }

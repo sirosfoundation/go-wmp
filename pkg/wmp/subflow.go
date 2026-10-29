@@ -97,8 +97,9 @@ type routeManager interface{ managesFlowRoutes() }
 // is starting: the generation of the route and the function that ends exactly
 // that route.
 type flowRoute struct {
-	gen     uint64
-	release func()
+	gen      uint64
+	release  func()
+	terminal func() // the flow has ended; its route stays until release
 }
 
 type (
@@ -130,10 +131,11 @@ func flowGenFrom(ctx context.Context) uint64 {
 // FlowCanceller is an optional interface for a FlowHandler. The Peer calls
 // HandleCancel for a wmp.flow.cancel that names a flow the handler owns, and
 // answers the cancel itself (status "cancelled") when it returns true, that is
-// when the handler stopped a flow of its own. On false the Handler's FlowCancel
-// answers.
+// when the handler stopped a flow of its own. An error is the answer when the
+// handler cannot stop the flow (for example -31006 already_terminal). On false
+// the Handler's FlowCancel answers.
 type FlowCanceller interface {
-	HandleCancel(ctx context.Context, params *FlowCancelParams) bool
+	HandleCancel(ctx context.Context, params *FlowCancelParams) (bool, error)
 }
 
 // subFlow is a sub-flow in flight.
@@ -471,16 +473,17 @@ func (p *AsyncFlowProfile) deliverSubFlow(key flowKey, out subFlowOutcome) bool 
 // session resume a flow function can use it to re-issue the sub-flows whose
 // start or result the interrupted connection may have lost.
 //
-// ctx must name both the peer it was dispatched on (as the context of a
-// session hook or a resume hook run by the Peer does) and the session (a
-// session in the context, which the Peer sets from its SessionStore); without
-// either the result is empty, so a profile shared by several peers never shows
-// one session's sub-flows, and the verifier data in their params, to another.
-// A flow function can use FlowContext.PendingSubFlows instead.
-func (p *AsyncFlowProfile) PendingSubFlows(ctx context.Context, parentID string) []PendingSubFlow {
+// ctx must be the context the Peer dispatched the call with (a resume hook's
+// is) so that it names the peer, and sessionID is the session whose sub-flows
+// are wanted (a resume hook has the validated session as its argument; a
+// session named only in the top-level session_id of a resume is not in the
+// context). Without the peer, or with an empty sessionID, the result is empty,
+// so a profile shared by several peers never shows one session's sub-flows, and
+// the verifier data in their params, to another. A flow function can use
+// FlowContext.PendingSubFlows instead.
+func (p *AsyncFlowProfile) PendingSubFlows(ctx context.Context, sessionID, parentID string) []PendingSubFlow {
 	peer, ok := ctx.Value(peerCtxKey{}).(PeerContext)
-	sess := SessionFromContext(ctx)
-	if !ok || sess == nil || sess.ID == "" {
+	if !ok || sessionID == "" {
 		return nil
 	}
 	// The current instance of the parent only: children of an earlier flow of
@@ -489,7 +492,7 @@ func (p *AsyncFlowProfile) PendingSubFlows(ctx context.Context, parentID string)
 	if parent == nil {
 		return nil
 	}
-	return p.pendingSubFlows(peer, sess.ID, parentID, parent.gen)
+	return p.pendingSubFlows(peer, sessionID, parentID, parent.gen)
 }
 
 // PendingSubFlows returns this flow's own sub-flows that have not completed or

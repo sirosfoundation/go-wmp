@@ -366,6 +366,9 @@ func TestValidateSignResult(t *testing.T) {
 		"decrypt with transaction":           {SignSubFlowParams{Action: "decrypt_credential_response"}, `{"transaction_id":"t"}`, true},
 		"decrypt with credentials only":      {SignSubFlowParams{Action: "decrypt_credential_response"}, `{"credentials":[{"credential":"secret"}]}`, false},
 		"decrypt with nothing":               {SignSubFlowParams{Action: "decrypt_credential_response"}, `{}`, false},
+		"decrypt with count and a token":     {SignSubFlowParams{Action: "decrypt_credential_response"}, `{"credential_count":1,"vp_token":"secret"}`, false},
+		"decrypt with transaction+interval":  {SignSubFlowParams{Action: "decrypt_credential_response"}, `{"transaction_id":"t","interval":5}`, true},
+		"decrypt with an extra member":       {SignSubFlowParams{Action: "decrypt_credential_response"}, `{"transaction_id":"t","credential_metadata":{}}`, false},
 		"non-conforming result rule applies": {SignSubFlowParams{Action: "sign_presentation"}, `{"vp_token":"x","response_jwe":"` + jwe + `"}`, false},
 	} {
 		t.Run(name, func(t *testing.T) {

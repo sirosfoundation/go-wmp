@@ -42,8 +42,9 @@ type FlowContext struct {
 	stop context.CancelFunc
 	// gen is the generation of the flow's route and release ends exactly that
 	// route (both from the Peer, see flowRoute); zero and a no-op outside one.
-	gen     uint64
-	release func()
+	gen      uint64
+	release  func()
+	terminal func()
 }
 
 // newFlowContext creates a FlowContext for a specific flow.
@@ -54,6 +55,7 @@ func newFlowContext(flowID, flowType string, params json.RawMessage, peer PeerCo
 func newSessionFlowContext(flowID, flowType string, params json.RawMessage, peer PeerContext, sessionID string) *FlowContext {
 	return &FlowContext{
 		release:   func() {},
+		terminal:  func() {},
 		FlowID:    flowID,
 		FlowType:  flowType,
 		Params:    params,
@@ -173,11 +175,23 @@ func (fc *FlowContext) meta() Metadata {
 // once their notification went out.
 func (fc *FlowContext) terminate() {
 	fc.mu.Lock()
-	defer fc.mu.Unlock()
 	select {
 	case <-fc.doneCh:
 	default:
 		close(fc.doneCh)
+	}
+	fc.mu.Unlock()
+	fc.terminal()
+}
+
+// isTerminal reports whether the flow has ended: its terminal notification went
+// out, or it was cancelled.
+func (fc *FlowContext) isTerminal() bool {
+	select {
+	case <-fc.doneCh:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -332,7 +346,7 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	flowCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
 	fc.stop = stop
 	if route, ok := flowRouteFrom(ctx); ok {
-		fc.gen, fc.release = route.gen, route.release
+		fc.gen, fc.release, fc.terminal = route.gen, route.release, route.terminal
 	}
 	// ...but not the peer: closing the Peer, or the end of Serve, ends the
 	// whole flow, sub-flows included.
@@ -413,6 +427,11 @@ func (p *AsyncFlowProfile) HandleAction(ctx context.Context, params *FlowActionP
 			"reason": "flow not found: " + params.FlowID,
 		})
 	}
+	// A flow that sent its terminal notification takes no more actions, though
+	// its worker may still be winding down.
+	if fc.isTerminal() {
+		return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "already_terminal"})
+	}
 
 	fc.deliverAction(params)
 
@@ -450,9 +469,12 @@ func (p *AsyncFlowProfile) HandleError(ctx context.Context, params *FlowErrorPar
 
 // HandleCancel implements FlowCanceller: a remote wmp.flow.cancel ends the
 // flow, and with it the sub-flows it is waiting for.
-func (p *AsyncFlowProfile) HandleCancel(ctx context.Context, params *FlowCancelParams) bool {
+func (p *AsyncFlowProfile) HandleCancel(ctx context.Context, params *FlowCancelParams) (bool, error) {
 	key, fc := p.flowOf(ctx, params.FlowID)
-	return p.cancelFlowContext(key, fc)
+	if fc != nil && fc.isTerminal() {
+		return false, NewRPCError(ErrFlowError, map[string]string{"reason": "already_terminal"})
+	}
+	return p.cancelFlowContext(key, fc), nil
 }
 
 // ActiveFlows returns the number of currently active flows.
