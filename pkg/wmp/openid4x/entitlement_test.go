@@ -205,6 +205,9 @@ func TestIssuerNotEntitledData(t *testing.T) {
 	if err != nil || len(got.Findings) != 1 || got.Findings[0].Code != EntitlementNotProvider {
 		t.Errorf("round trip = %+v %v", got, err)
 	}
+}
+
+func TestIssuerNotEntitledDataBuilderRefusals(t *testing.T) {
 	if _, err := NewIssuerNotEntitledData(nil); !errors.Is(err, ErrEntitlement) {
 		t.Errorf("no findings accepted: %v", err)
 	}
@@ -218,6 +221,9 @@ func TestIssuerNotEntitledData(t *testing.T) {
 	if _, err := NewIssuerNotEntitledData(many); !errors.Is(err, ErrEntitlement) {
 		t.Errorf("65 findings accepted: %v", err)
 	}
+}
+
+func TestIssuerNotEntitledDataParserRefusals(t *testing.T) {
 	for _, raw := range []string{
 		`null`, `[]`, `{"retryable":false}`, `{"retryable":false,"findings":null}`, `{"retryable":false,"findings":[]}`,
 		`{"retryable":true,"findings":[{"code":"a"}]}`, `{"findings":[{"code":"a"}]}`, `{"retryable":null,"findings":[{"code":"a"}]}`,
