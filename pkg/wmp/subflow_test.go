@@ -2616,3 +2616,24 @@ func (p *stillStartingPeer) cancelCalls() int {
 	defer p.mu.Unlock()
 	return p.n
 }
+
+func TestCancelSessionFlowFindsAFlowOfThePeersDefaultSession(t *testing.T) {
+	local, _ := newChanTransportPair()
+	peer := NewPeer(local, &BaseHandler{}, WithSessionIdentity("ses-1", "me"))
+	profile := NewAsyncFlowProfile("p")
+	profile.Handle("parent", func(ctx context.Context, fc *FlowContext) error { <-ctx.Done(); return nil })
+	if err := peer.Use(profile); err != nil {
+		t.Fatal(err)
+	}
+	// The start names no session: the flow is the default session's.
+	start := `{"jsonrpc":"2.0","id":"1","method":"wmp.flow.start","params":{"wmp":{"version":"0.1"},"flow_type":"parent","flow_id":"fp"}}`
+	if resp, err := peer.HandleRequestSync(context.Background(), []byte(start)); err != nil || strings.Contains(string(resp), `"error"`) {
+		t.Fatalf("start: %s, %v", resp, err)
+	}
+	profile.CancelSessionFlow("ses-other", "fp")
+	if profile.ActiveFlows() != 1 {
+		t.Fatal("another session's CancelSessionFlow stopped the flow")
+	}
+	profile.CancelSessionFlow("ses-1", "fp")
+	waitFor(t, func() bool { return profile.ActiveFlows() == 0 })
+}
