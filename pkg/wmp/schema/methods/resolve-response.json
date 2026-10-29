@@ -44,8 +44,7 @@
                       "display": {},
                       "claims": {},
                       "schema": {}
-                    },
-                    "additionalProperties": false
+                    }
                   }
                 ]
               }

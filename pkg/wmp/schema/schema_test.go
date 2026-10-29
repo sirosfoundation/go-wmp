@@ -339,6 +339,7 @@ func TestValidateResolveResponseVCTM(t *testing.T) {
 	for _, ok := range []string{
 		`"metadata":{"vct":"https://c.example/id","name":"N","display":[],"claims":[],"schema":{}}`,
 		`"metadata":null`,
+		`"metadata":{"vct":"v","extends":"x"}`, // Core 9.5: schemas are open
 	} {
 		if err := v.ValidateResponse("wmp.resolve", resp(ok)); err != nil {
 			t.Errorf("%s: %v", ok, err)
@@ -346,7 +347,6 @@ func TestValidateResolveResponseVCTM(t *testing.T) {
 	}
 	for _, bad := range []string{
 		`"metadata":{"name":"N"}`,
-		`"metadata":{"vct":"v","extends":"x"}`,
 		`"metadata":[]`,
 		`"content_type":"application/vctm+json","body":{"vct":"v"}`,
 	} {
