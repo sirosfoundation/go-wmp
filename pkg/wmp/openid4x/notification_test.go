@@ -439,3 +439,24 @@ func TestCredentialNotificationCapability(t *testing.T) {
 		t.Errorf("RequiredCapability = %q", got)
 	}
 }
+
+func TestNotificationHTU(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://issuer.example.com/notification":              "https://issuer.example.com/notification",
+		"https://issuer.example.com/notification?tenant=a":     "https://issuer.example.com/notification",
+		"https://issuer.example.com/notification?":             "https://issuer.example.com/notification",
+		"https://issuer.example.com/n/o?x=1&y=2#frag":          "https://issuer.example.com/n/o",
+		"https://issuer.example.com:8443/notification#frag":    "https://issuer.example.com:8443/notification",
+		"https://issuer.example.com/notification%2Fx?tenant=a": "https://issuer.example.com/notification%2Fx",
+	} {
+		got, err := NotificationHTU(in)
+		if err != nil || got != want {
+			t.Errorf("NotificationHTU(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "notification", "/notification", "https://", "://x"} {
+		if _, err := NotificationHTU(in); err == nil {
+			t.Errorf("NotificationHTU(%q) accepted", in)
+		}
+	}
+}

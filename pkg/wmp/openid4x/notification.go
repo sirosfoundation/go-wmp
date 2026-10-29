@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 	"unicode/utf8"
 
@@ -194,7 +195,8 @@ type NotificationRequest struct {
 // ClientAuthRequest describes the DPoP proof the forwarder needs from the wallet
 // (Section 3.4.3).
 type ClientAuthRequest struct {
-	// HTM and HTU are the method and URL of the request the proof covers.
+	// HTM and HTU are the method and URL of the request the proof covers; HTU is
+	// the notification endpoint without query and fragment (NotificationHTU).
 	HTM, HTU string
 	// ATH is base64url(SHA-256(access_token)), DPoPNonce the issuer's DPoP nonce
 	// when there is one, KeyID the dpop_key_id the wallet reported at issuance,
@@ -214,10 +216,12 @@ type ClientAuthSigner func(ctx context.Context, req ClientAuthRequest) (dpopProo
 // sendNotification.
 //
 // ForwardNotification looks up the context for req.IssuanceFlowID in
-// req.SessionID, bound to the principal of ctx, consumes it, and checks
-// req.NotificationID against the id the context holds. A context that holds none
-// (an engine-blind issuance, where the orchestrator never saw the issuer's id)
-// forwards the id of the request. It
+// req.SessionID, bound to the principal of ctx, and marks req.NotificationID
+// notified: each notification_id is single use (an issuance can end in several
+// Credential Responses, each with its own id), the other ids of the issuance
+// stay usable. It checks the id against the ones the context knows. A context
+// that knows none (an engine-blind issuance, where the orchestrator never saw
+// the issuer's ids) accepts the ids of the wallet, once each. It
 // calls sign for each DPoP proof it needs and returns nil when the issuer
 // accepted the notification. Its errors select the reason of the flow error:
 // ErrNotificationContextUnavailable, ErrNotificationBusy, an error wrapping
@@ -335,4 +339,17 @@ func requestClientAuth(ctx context.Context, fc *wmp.FlowContext, car ClientAuthR
 		return "", fmt.Errorf("%w: result carries no dpop_proof", ErrClientAuthSigning)
 	}
 	return proof, nil
+}
+
+// NotificationHTU returns the DPoP htu for a request to the notification
+// endpoint: the endpoint without its query and fragment (RFC 9449 Section 4.2),
+// which is also the only htu a wallet signs for a notification (Section 3.4.3).
+// The request itself goes to the full endpoint.
+func NotificationHTU(endpoint string) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("openid4x: notification endpoint is not an absolute URL")
+	}
+	u.RawQuery, u.Fragment, u.RawFragment, u.ForceQuery = "", "", "", false
+	return u.String(), nil
 }
