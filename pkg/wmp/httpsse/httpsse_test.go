@@ -197,7 +197,7 @@ func TestSSELastEventIDReplay(t *testing.T) {
 	ts := httptest.NewServer(handler)
 	defer ts.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	// Connect with Last-Event-ID: evt-1 to replay evt-2 and evt-3.
