@@ -171,7 +171,10 @@ func NotificationStartMiddleware(events func() []string) wmp.Middleware {
 // NotificationRequest is what a NotificationForwarder is asked to forward.
 type NotificationRequest struct {
 	// FlowID is the credential_notification flow; IssuanceFlowID the oid4vci
-	// flow whose retained context the forwarder looks up.
+	// flow whose retained context the forwarder looks up, in SessionID, the
+	// session this flow runs in (a flow_id is session-scoped, Core 6.2). A
+	// context of another session is not used (Section 3.4.2).
+	SessionID        string
 	FlowID           string
 	IssuanceFlowID   string
 	NotificationID   string
@@ -201,8 +204,11 @@ type ClientAuthSigner func(ctx context.Context, req ClientAuthRequest) (dpopProo
 // go-wallet-backend implements it with its context store and
 // sendNotification.
 //
-// ForwardNotification looks up the context for req.IssuanceFlowID, bound to the
-// principal of ctx, checks req.NotificationID against it and consumes it. It
+// ForwardNotification looks up the context for req.IssuanceFlowID in
+// req.SessionID, bound to the principal of ctx, consumes it, and checks
+// req.NotificationID against the id the context holds. A context that holds none
+// (an engine-blind issuance, where the orchestrator never saw the issuer's id)
+// forwards the id of the request. It
 // calls sign for each DPoP proof it needs and returns nil when the issuer
 // accepted the notification. Its errors select the reason of the flow error:
 // ErrNotificationContextUnavailable, ErrNotificationBusy, an error wrapping
@@ -215,7 +221,7 @@ type NotificationForwarder interface {
 // Errors a NotificationForwarder returns (match with errors.Is).
 var (
 	// ErrNotificationContextUnavailable: no usable context (absent, expired,
-	// consumed, another principal's, another replica's, or a notification_id
+	// consumed, another session's or principal's, another replica's, or a notification_id
 	// that does not match). It does not say which.
 	ErrNotificationContextUnavailable = errors.New("openid4x: notification context unavailable")
 	// ErrNotificationBusy: the orchestrator is at its forwarding limit and kept
@@ -267,7 +273,7 @@ func NotificationFlow(fwd NotificationForwarder, opts NotificationFlowOptions) w
 			return fc.Error(ctx, rpcErr.Code, rpcErr.Message, rpcErr.Data)
 		}
 		req := NotificationRequest{
-			FlowID: fc.FlowID, IssuanceFlowID: start.IssuanceFlowID, NotificationID: start.NotificationID,
+			SessionID: fc.SessionID(), FlowID: fc.FlowID, IssuanceFlowID: start.IssuanceFlowID, NotificationID: start.NotificationID,
 			Event: start.Event, EventDescription: start.EventDescription,
 		}
 		sign := func(ctx context.Context, car ClientAuthRequest) (string, error) {

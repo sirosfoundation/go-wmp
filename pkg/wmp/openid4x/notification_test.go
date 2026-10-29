@@ -276,7 +276,7 @@ func TestNotificationFlowForwardsWithClientHeldDPoP(t *testing.T) {
 	fwd.mu.Lock()
 	defer fwd.mu.Unlock()
 	if fwd.proof != "a.b.c" || len(fwd.reqs) != 1 || fwd.reqs[0].IssuanceFlowID != "flow-vci-001" || fwd.reqs[0].NotificationID != "nid-77" ||
-		fwd.reqs[0].Event != "credential_accepted" || fwd.reqs[0].FlowID != "flow-cn-001" {
+		fwd.reqs[0].Event != "credential_accepted" || fwd.reqs[0].FlowID != "flow-cn-001" || fwd.reqs[0].SessionID != "ses-1" {
 		t.Errorf("forwarder saw %+v proof %q", fwd.reqs, fwd.proof)
 	}
 }
