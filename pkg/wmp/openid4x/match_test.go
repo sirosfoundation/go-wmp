@@ -41,6 +41,7 @@ func TestValidateMatchResult(t *testing.T) {
 		"repeated id":                {`{"satisfiable":true,"satisfiable_query_ids":["pid","pid"]}`, false},
 		"ids null":                   {`{"satisfiable":true,"satisfiable_query_ids":null}`, false},
 		"ids not strings":            {`{"satisfiable":true,"satisfiable_query_ids":[1]}`, false},
+		"ids null element":           {`{"satisfiable":true,"satisfiable_query_ids":[null]}`, false},
 		"handle too short":           {`{"satisfiable":true,"selection_handle":"abc"}`, false},
 		"handle padded":              {`{"satisfiable":true,"selection_handle":"` + goodHandle + `=="}`, false},
 		"handle bad alphabet":        {`{"satisfiable":true,"selection_handle":"Zm9yLXRoZS13YWxsZXQtb25se+"}`, false},
@@ -337,5 +338,63 @@ func TestRequestMatchNeedsOID4VPCapabilityAndAQuery(t *testing.T) {
 			default:
 			}
 		})
+	}
+}
+
+func TestValidateMatchResultNullElementWithEmptyQueryID(t *testing.T) {
+	// A null element decoded to "" would match a query that has an empty id.
+	err := ValidateMatchResult(json.RawMessage(`{"satisfiable":true,"satisfiable_query_ids":[null]}`), []string{""})
+	if err == nil {
+		t.Fatal("a null element was taken for the empty id")
+	}
+}
+
+func TestValidateSignResult(t *testing.T) {
+	enc := json.RawMessage(`{"jwk":{"kty":"EC"},"alg":"ECDH-ES","enc":"A128GCM"}`)
+	jwe := "aaa.bbb.ccc.ddd.eee"
+	for name, tc := range map[string]struct {
+		p      SignSubFlowParams
+		result string
+		ok     bool
+	}{
+		"plain presentation":                 {SignSubFlowParams{Action: "sign_presentation"}, `{"vp_token":"x"}`, true},
+		"encrypted presentation":             {SignSubFlowParams{Action: "sign_presentation", ResponseEncryption: enc}, `{"response_jwe":"` + jwe + `"}`, true},
+		"encrypted answered with vp_token":   {SignSubFlowParams{Action: "sign_presentation", ResponseEncryption: enc}, `{"vp_token":"x"}`, false},
+		"encrypted answered with nothing":    {SignSubFlowParams{Action: "sign_presentation", ResponseEncryption: enc}, `{}`, false},
+		"null response_encryption":           {SignSubFlowParams{Action: "sign_presentation", ResponseEncryption: json.RawMessage(`null`)}, `{"vp_token":"x"}`, true},
+		"decrypt with count":                 {SignSubFlowParams{Action: "decrypt_credential_response"}, `{"credential_count":2}`, true},
+		"decrypt with transaction":           {SignSubFlowParams{Action: "decrypt_credential_response"}, `{"transaction_id":"t"}`, true},
+		"decrypt with credentials only":      {SignSubFlowParams{Action: "decrypt_credential_response"}, `{"credentials":[{"credential":"secret"}]}`, false},
+		"decrypt with nothing":               {SignSubFlowParams{Action: "decrypt_credential_response"}, `{}`, false},
+		"non-conforming result rule applies": {SignSubFlowParams{Action: "sign_presentation"}, `{"vp_token":"x","response_jwe":"` + jwe + `"}`, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateSignResult(tc.p, json.RawMessage(tc.result))
+			if (err == nil) != tc.ok {
+				t.Fatalf("err = %v, want ok=%v", err, tc.ok)
+			}
+			if err != nil && !errors.Is(err, ErrCompletionResult) {
+				t.Errorf("error does not wrap ErrCompletionResult: %v", err)
+			}
+		})
+	}
+}
+
+func TestRequestMatchRefusesASessionThatIsNotTheFlows(t *testing.T) {
+	w := newWalletSide()
+	o := runOrchestrator(t, w, func(ctx context.Context, fc *wmp.FlowContext) outcome {
+		// Another session that did negotiate oid4vp is no evidence for this one.
+		other := &wmp.Session{ID: "ses-other", Capabilities: wmp.Capabilities{CapabilityOID4VP: json.RawMessage(`{}`)}}
+		_, err := RequestMatch(wmp.ContextWithSession(ctx, other), fc, MatchSubFlowParams{DCQLQuery: json.RawMessage(`{"credentials":[{"id":"pid"}]}`)}, time.Second)
+		return outcome{err: err}
+	})
+	var se *wmp.SubFlowError
+	if !errors.As(o.err, &se) || se.Code != wmp.ErrCapabilityNotSupported {
+		t.Fatalf("err = %v", o.err)
+	}
+	select {
+	case p := <-w.started:
+		t.Fatalf("a match flow was sent: %+v", p)
+	default:
 	}
 }

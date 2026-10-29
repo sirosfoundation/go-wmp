@@ -67,13 +67,9 @@ func ValidateMatchResult(result json.RawMessage, queryIDs []string) error {
 			return matchErr("unknown member")
 		}
 	}
-	sat, ok := m["satisfiable"]
-	if !ok {
-		return matchErr("satisfiable is missing")
-	}
-	var satisfiable bool
-	if !isNotNull(sat) || json.Unmarshal(sat, &satisfiable) != nil {
-		return matchErr("satisfiable is not a boolean")
+	satisfiable, err := matchSatisfiable(m)
+	if err != nil {
+		return err
 	}
 	if raw, ok := m["satisfiable_query_ids"]; ok {
 		if err := checkQueryIDs(raw, queryIDs); err != nil {
@@ -86,6 +82,24 @@ func ValidateMatchResult(result json.RawMessage, queryIDs []string) error {
 			return matchErr("selection_handle is not a handle")
 		}
 	}
+	return checkMatchCode(m, satisfiable)
+}
+
+func matchSatisfiable(m map[string]json.RawMessage) (bool, error) {
+	raw, ok := m["satisfiable"]
+	if !ok {
+		return false, matchErr("satisfiable is missing")
+	}
+	var satisfiable bool
+	if !isNotNull(raw) || json.Unmarshal(raw, &satisfiable) != nil {
+		return false, matchErr("satisfiable is not a boolean")
+	}
+	return satisfiable, nil
+}
+
+// checkMatchCode applies the rule that code is present exactly when the query
+// is not satisfiable, and is one of the defined codes.
+func checkMatchCode(m map[string]json.RawMessage, satisfiable bool) error {
 	raw, hasCode := m["code"]
 	if satisfiable && hasCode {
 		return matchErr("code present although satisfiable")
@@ -93,22 +107,23 @@ func ValidateMatchResult(result json.RawMessage, queryIDs []string) error {
 	if !satisfiable && !hasCode {
 		return matchErr("code missing although not satisfiable")
 	}
-	if hasCode {
-		var c string
-		if !isNotNull(raw) || json.Unmarshal(raw, &c) != nil {
-			return matchErr("code is not a string")
-		}
-		switch c {
-		case MatchCodeNoMatch, MatchCodeInsufficient, MatchCodeError:
-		default:
-			return matchErr("code is not a defined code")
-		}
+	if !hasCode {
+		return nil
 	}
-	return nil
+	var c string
+	if !isNotNull(raw) || json.Unmarshal(raw, &c) != nil {
+		return matchErr("code is not a string")
+	}
+	switch c {
+	case MatchCodeNoMatch, MatchCodeInsufficient, MatchCodeError:
+		return nil
+	}
+	return matchErr("code is not a defined code")
 }
 
 func checkQueryIDs(raw json.RawMessage, queryIDs []string) error {
-	var ids []string
+	// Pointers: a JSON null element would otherwise decode to the empty string.
+	var ids []*string
 	if !isNotNull(raw) || json.Unmarshal(raw, &ids) != nil || ids == nil {
 		return matchErr("satisfiable_query_ids is not an array of strings")
 	}
@@ -117,7 +132,11 @@ func checkQueryIDs(raw json.RawMessage, queryIDs []string) error {
 		known[q] = true
 	}
 	seen := make(map[string]bool, len(ids))
-	for _, id := range ids {
+	for _, p := range ids {
+		if p == nil {
+			return matchErr("satisfiable_query_ids is not an array of strings")
+		}
+		id := *p
 		if !known[id] {
 			return matchErr("satisfiable_query_ids names an id that is not in the query")
 		}
@@ -166,16 +185,17 @@ func DCQLQueryIDs(dcql json.RawMessage) ([]string, error) {
 // sub-flow is a *wmp.SubFlowError whose Rejected is true, handled as a
 // rejected sign sub-flow (Section 3.2.6).
 //
-// When the session in ctx did not negotiate the oid4vp capability, or ctx has
-// no session, no match flow is sent: the error is a -31005 *wmp.SubFlowError.
+// When the session in ctx is not the flow's own session, did not negotiate the
+// oid4vp capability, or ctx has no session, no match flow is sent: the error is a -31005 *wmp.SubFlowError.
 func RequestMatch(ctx context.Context, fc *wmp.FlowContext, p MatchSubFlowParams, timeout time.Duration) (json.RawMessage, error) {
 	ids, err := DCQLQueryIDs(p.DCQLQuery)
 	if err != nil {
 		return nil, err
 	}
 	// Fail closed: with no session in ctx there is no evidence that oid4vp
-	// was negotiated (wmp.Peer fills the session from its SessionStore).
-	if sess := wmp.SessionFromContext(ctx); sess == nil || !sess.HasCapability(CapabilityOID4VP) {
+	// was negotiated (wmp.Peer fills the session from its SessionStore), and
+	// the session that has it must be the one the match is sent to.
+	if sess := wmp.SessionFromContext(ctx); sess == nil || sess.ID != fc.SessionID() || !sess.HasCapability(CapabilityOID4VP) {
 		return nil, &wmp.SubFlowError{
 			Code:    wmp.ErrCapabilityNotSupported,
 			Message: wmp.ErrorMessage(wmp.ErrCapabilityNotSupported),
@@ -198,7 +218,7 @@ func mustJSON(v any) json.RawMessage {
 }
 
 // RequestSign asks the wallet, with a nested sign flow, to sign, and returns
-// the sub-flow's result after ValidateCompletionResult. Failures are
+// the sub-flow's result after ValidateSignResult. Failures are
 // *wmp.SubFlowError with the wallet's code, message and data intact; a
 // rejection (Rejected) is -31006 with data.reason "rejected" (Section 3.2.6).
 // A result that does not conform is an error wrapping ErrCompletionResult.
@@ -207,8 +227,37 @@ func RequestSign(ctx context.Context, fc *wmp.FlowContext, p SignSubFlowParams, 
 	if err != nil {
 		return nil, err
 	}
-	if err := ValidateCompletionResult(result); err != nil {
+	if err := ValidateSignResult(p, result); err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// ValidateSignResult checks the result of a sign sub-flow started with p: the
+// rules of ValidateCompletionResult, which look only at the result, and those
+// that depend on what was asked.
+//
+//   - A decrypt_credential_response request is answered with a control result
+//     only: credential_count or transaction_id, never the credentials.
+//   - A request that carried response_encryption (direct_post.jwt) is answered
+//     with response_jwe: the vp_token stays in the wallet.
+func ValidateSignResult(p SignSubFlowParams, result json.RawMessage) error {
+	if err := ValidateCompletionResult(result); err != nil {
+		return err
+	}
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(result, &m) // an object: ValidateCompletionResult checked
+	if p.Action == "decrypt_credential_response" {
+		_, hasCount := m["credential_count"]
+		_, hasTx := m["transaction_id"]
+		if !hasCount && !hasTx {
+			return resultErr("decryption request answered without credential_count or transaction_id")
+		}
+	}
+	if len(p.ResponseEncryption) > 0 && isNotNull(p.ResponseEncryption) {
+		if _, ok := m["response_jwe"]; !ok {
+			return resultErr("encrypted presentation request answered without response_jwe")
+		}
+	}
+	return nil
 }

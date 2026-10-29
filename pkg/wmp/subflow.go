@@ -80,15 +80,51 @@ type FlowRouter interface {
 	// ClaimFlow routes wmp.flow.progress, wmp.flow.complete and
 	// wmp.flow.error of flowID to h, but only when they name sessionID in
 	// their wmp metadata (when sessionID is empty any session is accepted).
-	// It returns false, and routes nothing, when flowID is already routed
-	// to a handler or a wmp.flow.start of it is running. A claim is not ended
-	// by a completion or error, nor taken by a wmp.flow.start of the peer:
-	// only ReleaseFlow ends it.
-	ClaimFlow(flowID, sessionID string, h FlowHandler) bool
+	// It returns ok false, and routes nothing, when flowID is already routed
+	// or a wmp.flow.start of it is running. A claim is not ended by a
+	// completion or error, nor taken by a wmp.flow.start of the peer: only
+	// the returned release ends it.
+	ClaimFlow(flowID, sessionID string, h FlowHandler) (release func(), ok bool)
+}
 
-	// ReleaseFlow ends the routing of flowID, if h owns it: a claim made with
-	// ClaimFlow, or a flow h started.
-	ReleaseFlow(flowID string, h FlowHandler)
+// routeManager marks a FlowHandler that ends the route of each flow it runs
+// itself (AsyncFlowProfile, through the release function in the context of
+// StartFlow). For any other handler the Peer ends the route when the flow sends
+// its terminal notification.
+type routeManager interface{ managesFlowRoutes() }
+
+// flowRoute is what the Peer gives StartFlow, in its context, about the flow it
+// is starting: the generation of the route and the function that ends exactly
+// that route.
+type flowRoute struct {
+	gen     uint64
+	release func()
+}
+
+type (
+	flowRouteKey struct{}
+	flowGenKey   struct{}
+)
+
+func contextWithFlowRoute(ctx context.Context, r flowRoute) context.Context {
+	return context.WithValue(ctx, flowRouteKey{}, r)
+}
+
+func flowRouteFrom(ctx context.Context) (flowRoute, bool) {
+	r, ok := ctx.Value(flowRouteKey{}).(flowRoute)
+	return r, ok
+}
+
+// withFlowGen marks ctx as dispatching a message to generation gen of its flow.
+func withFlowGen(ctx context.Context, gen uint64) context.Context {
+	return context.WithValue(ctx, flowGenKey{}, gen)
+}
+
+// flowGenFrom returns the generation a message was dispatched for, 0 when
+// the context names none.
+func flowGenFrom(ctx context.Context) uint64 {
+	g, _ := ctx.Value(flowGenKey{}).(uint64)
+	return g
 }
 
 // FlowCanceller is an optional interface for a FlowHandler. The Peer calls
@@ -116,6 +152,8 @@ type subFlow struct {
 	// sent is closed when the goroutine that sends the start has finished
 	// with it: a cancel must not overtake the start it cancels.
 	sent chan struct{}
+	// release ends the claim on the sub-flow's flow_id.
+	release func()
 }
 
 type subFlowOutcome struct {
@@ -191,7 +229,7 @@ func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, para
 	if err := fc.profile.addSubFlow(router, key, sub); err != nil {
 		return nil, err
 	}
-	defer fc.profile.removeSubFlow(router, key)
+	defer fc.profile.removeSubFlow(key, sub)
 
 	sctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -217,6 +255,10 @@ func (fc *FlowContext) RequestSubFlow(ctx context.Context, flowType string, para
 	}
 	return outcome.result, nil
 }
+
+// SessionID is the session the flow's messages go out under: the session the
+// flow was started in, else the one the Peer's identity names; "" when neither.
+func (fc *FlowContext) SessionID() string { return fc.effectiveSession() }
 
 // effectiveSession is the session the flow's outgoing messages go out under:
 // the flow's own, else the one the Peer's identity names.
@@ -324,13 +366,21 @@ func (fc *FlowContext) cancelSubFlow(ctx context.Context, sub *subFlow) {
 	bg := context.WithoutCancel(ctx)
 	meta := fc.meta()
 	meta.SessionID = sub.sessionID
+	var gone <-chan struct{}
+	if lt, ok := fc.peer.(interface{ Lifetime() <-chan struct{} }); ok {
+		gone = lt.Lifetime()
+	}
 	go func() {
-		cctx, cancel := context.WithTimeout(bg, 5*time.Second)
-		defer cancel()
+		// The start may be stuck in a write for longer than any cancel
+		// timeout; the cancel's own clock starts only when it can follow it.
 		select {
 		case <-sub.sent:
-		case <-cctx.Done():
+		case <-gone:
+			return
+		case <-time.After(10 * time.Minute):
 		}
+		cctx, cancel := context.WithTimeout(bg, 5*time.Second)
+		defer cancel()
 		_ = fc.peer.Call(cctx, MethodFlowCancel, &FlowCancelParams{
 			WMP: meta, FlowID: sub.id, Reason: CancelReasonNoLongerNeeded,
 		}, nil)
@@ -375,26 +425,30 @@ func (p *AsyncFlowProfile) subFlowKey(peer PeerContext, id string) flowKey {
 // addSubFlow registers sub and has the router (the Peer the flow runs on)
 // route its messages here.
 func (p *AsyncFlowProfile) addSubFlow(router FlowRouter, key flowKey, sub *subFlow) error {
+	// Registered before the claim goes in: the first message of the sub-flow
+	// may be routed the moment the claim exists.
 	p.mu.Lock()
 	p.childSeq++
 	sub.seq = p.childSeq
 	p.children[key] = sub
 	p.mu.Unlock()
-	if !router.ClaimFlow(sub.id, sub.sessionID, p) {
+	release, ok := router.ClaimFlow(sub.id, sub.sessionID, p)
+	if !ok {
 		p.mu.Lock()
 		delete(p.children, key)
 		p.mu.Unlock()
 		return errors.New("wmp: sub-flow id is already in use")
 	}
+	sub.release = release
 	return nil
 }
 
 // removeSubFlow forgets a sub-flow and stops routing its messages.
-func (p *AsyncFlowProfile) removeSubFlow(router FlowRouter, key flowKey) {
+func (p *AsyncFlowProfile) removeSubFlow(key flowKey, sub *subFlow) {
 	p.mu.Lock()
 	delete(p.children, key)
 	p.mu.Unlock()
-	router.ReleaseFlow(key.id, p)
+	sub.release()
 }
 
 // deliverSubFlow hands an outcome to the goroutine waiting for sub-flow key
@@ -416,27 +470,29 @@ func (p *AsyncFlowProfile) deliverSubFlow(key flowKey, out subFlowOutcome) bool 
 // session resume a flow function can use it to re-issue the sub-flows whose
 // start or result the interrupted connection may have lost.
 //
-// ctx scopes the answer: only sub-flows of the peer ctx was dispatched on (as
-// in a resume hook) and, when ctx carries a session, of that session, are
-// returned, so a profile shared by several peers never shows one session's
-// sub-flows (and the verifier data in their params) to another. A flow
-// function can use FlowContext.PendingSubFlows instead.
+// ctx must name both the peer it was dispatched on (as the context of a
+// session hook or a resume hook run by the Peer does) and the session (a
+// session in the context, which the Peer sets from its SessionStore); without
+// either the result is empty, so a profile shared by several peers never shows
+// one session's sub-flows, and the verifier data in their params, to another.
+// A flow function can use FlowContext.PendingSubFlows instead.
 func (p *AsyncFlowProfile) PendingSubFlows(ctx context.Context, parentID string) []PendingSubFlow {
-	peer := p.peerFor(ctx)
-	session := ""
-	if sess := SessionFromContext(ctx); sess != nil {
-		session = sess.ID
+	peer, ok := ctx.Value(peerCtxKey{}).(PeerContext)
+	sess := SessionFromContext(ctx)
+	if !ok || sess == nil || sess.ID == "" {
+		return nil
 	}
-	return p.pendingSubFlows(peer, session, parentID)
+	return p.pendingSubFlows(peer, sess.ID, parentID)
 }
 
 // PendingSubFlows returns this flow's own sub-flows that have not completed or
 // failed, oldest first.
 func (fc *FlowContext) PendingSubFlows() []PendingSubFlow {
-	if fc.profile == nil {
+	session := fc.effectiveSession()
+	if fc.profile == nil || session == "" {
 		return nil
 	}
-	return fc.profile.pendingSubFlows(fc.peer, fc.effectiveSession(), fc.FlowID)
+	return fc.profile.pendingSubFlows(fc.peer, session, fc.FlowID)
 }
 
 func (p *AsyncFlowProfile) pendingSubFlows(peer PeerContext, session, parentID string) []PendingSubFlow {
@@ -447,7 +503,7 @@ func (p *AsyncFlowProfile) pendingSubFlows(peer PeerContext, session, parentID s
 		if sub.parentID != parentID || sub.delivered || key.peer != want {
 			continue
 		}
-		if session != "" && sub.sessionID != session {
+		if sub.sessionID != session {
 			continue
 		}
 		subs = append(subs, sub)
@@ -456,7 +512,9 @@ func (p *AsyncFlowProfile) pendingSubFlows(peer PeerContext, session, parentID s
 	sort.Slice(subs, func(i, j int) bool { return subs[i].seq < subs[j].seq })
 	out := make([]PendingSubFlow, len(subs))
 	for i, sub := range subs {
-		out[i] = PendingSubFlow{FlowID: sub.id, ParentFlowID: sub.parentID, FlowType: sub.flowType, Params: sub.params}
+		// A copy: the caller may edit it, and the sub-flow's own bytes stay
+		// what was sent.
+		out[i] = PendingSubFlow{FlowID: sub.id, ParentFlowID: sub.parentID, FlowType: sub.flowType, Params: append(json.RawMessage(nil), sub.params...)}
 	}
 	return out
 }

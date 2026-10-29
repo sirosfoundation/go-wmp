@@ -40,6 +40,10 @@ type FlowContext struct {
 	profile *AsyncFlowProfile
 	// stop cancels the context the flow function runs under (see StartFlow).
 	stop context.CancelFunc
+	// gen is the generation of the flow's route and release ends exactly that
+	// route (both from the Peer, see flowRoute); zero and a no-op outside one.
+	gen     uint64
+	release func()
 }
 
 // newFlowContext creates a FlowContext for a specific flow.
@@ -49,6 +53,7 @@ func newFlowContext(flowID, flowType string, params json.RawMessage, peer PeerCo
 
 func newSessionFlowContext(flowID, flowType string, params json.RawMessage, peer PeerContext, sessionID string) *FlowContext {
 	return &FlowContext{
+		release:   func() {},
 		FlowID:    flowID,
 		FlowType:  flowType,
 		Params:    params,
@@ -202,7 +207,11 @@ func (fc *FlowContext) deliverAction(params *FlowActionParams) {
 type AsyncFlowProfile struct {
 	name     string
 	handlers map[string]FlowFunc
-	peer     PeerContext
+
+	// peer is the peer the profile was last initialised with (guarded by
+	// peerMu, apart from mu so that code holding mu can read it).
+	peerMu sync.RWMutex
+	peer   PeerContext
 
 	mu    sync.RWMutex
 	flows map[flowKey]*FlowContext // keyed by the dispatching peer and the flow ID
@@ -212,23 +221,14 @@ type AsyncFlowProfile struct {
 	children map[flowKey]*subFlow
 	childSeq uint64
 
-	// self is the FlowHandler the peer registered for this profile when it
-	// differs from p (a type that embeds an AsyncFlowProfile): flow routes are
-	// released under that identity. Nil means p.
-	self FlowHandler
-
 	// afterStart, when set, runs at the end of StartFlow, just before it
 	// returns (a seam for tests of workers that end first).
 	afterStart func()
 }
 
-// owner is the FlowHandler flow routes are held under.
-func (p *AsyncFlowProfile) owner() FlowHandler {
-	if p.self != nil {
-		return p.self
-	}
-	return p
-}
+// managesFlowRoutes marks the profile as ending the route of each of its flows
+// itself (see routeManager).
+func (p *AsyncFlowProfile) managesFlowRoutes() {}
 
 // flowKey identifies a flow of a profile shared by several peers (an HTTP+SSE
 // server gives each session its own Peer): the same flow_id on two peers is two
@@ -252,6 +252,8 @@ func (p *AsyncFlowProfile) peerFor(ctx context.Context) PeerContext {
 	if pc, ok := ctx.Value(peerCtxKey{}).(PeerContext); ok {
 		return pc
 	}
+	p.peerMu.RLock()
+	defer p.peerMu.RUnlock()
 	return p.peer
 }
 
@@ -285,7 +287,9 @@ func (p *AsyncFlowProfile) Handle(flowType string, fn FlowFunc) {
 func (p *AsyncFlowProfile) Name() string           { return p.name }
 func (p *AsyncFlowProfile) Capabilities() []string { return nil }
 func (p *AsyncFlowProfile) Init(ctx PeerContext) error {
+	p.peerMu.Lock()
 	p.peer = ctx
+	p.peerMu.Unlock()
 	return nil
 }
 
@@ -327,11 +331,19 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	// the end of the flow trigger.
 	flowCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
 	fc.stop = stop
-	// ...but not the peer: closing the Peer, or the end of Serve, ends it.
-	unlink := func() bool { return true }
-	if lt, ok := peer.(interface{ Lifetime() context.Context }); ok {
-		// The whole flow, sub-flows included, ends with the peer.
-		unlink = context.AfterFunc(lt.Lifetime(), fc.cancel)
+	if route, ok := flowRouteFrom(ctx); ok {
+		fc.gen, fc.release = route.gen, route.release
+	}
+	// ...but not the peer: closing the Peer, or the end of Serve, ends the
+	// whole flow, sub-flows included.
+	if lt, ok := peer.(interface{ Lifetime() <-chan struct{} }); ok {
+		go func() {
+			select {
+			case <-lt.Lifetime():
+				fc.cancel()
+			case <-fc.doneCh:
+			}
+		}()
 	}
 
 	p.mu.Lock()
@@ -341,21 +353,15 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	// Run the flow handler in a goroutine.
 	go func() {
 		defer func() {
-			unlink()
 			p.mu.Lock()
-			own := p.flows[key] == fc
-			if own {
+			if p.flows[key] == fc {
 				delete(p.flows, key)
 			}
 			p.mu.Unlock()
 			fc.cancel()
-			// The flow is over: the peer stops routing to it. Only if the
-			// profile still held this very flow: one that was cancelled or
-			// completed from outside was unrouted then, and its ID may by
-			// now belong to a new flow.
-			if router, ok := peer.(FlowRouter); ok && own {
-				router.ReleaseFlow(params.FlowID, p.owner())
-			}
+			// The flow is over: its route (this instance's, not a later
+			// flow's of the same ID) ends.
+			fc.release()
 		}()
 
 		// A flow that was cancelled (by the remote peer, CancelFlow or the
@@ -376,11 +382,33 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	}, nil
 }
 
-func (p *AsyncFlowProfile) HandleAction(ctx context.Context, params *FlowActionParams) (*FlowActionResult, error) {
+// flowOf returns the flow a message dispatched with ctx is for. A message
+// dispatched for one instance of a flow_id never reaches a later instance of it.
+func (p *AsyncFlowProfile) flowOf(ctx context.Context, id string) (flowKey, *FlowContext) {
+	key := p.keyFor(ctx, id)
 	p.mu.RLock()
-	fc, ok := p.flows[p.keyFor(ctx, params.FlowID)]
+	fc := p.flows[key]
 	p.mu.RUnlock()
-	if !ok {
+	if fc != nil {
+		if gen := flowGenFrom(ctx); gen != 0 && fc.gen != gen {
+			return key, nil
+		}
+	}
+	return key, fc
+}
+
+// endFlow takes fc out of the profile's flows, if it is still the one under key.
+func (p *AsyncFlowProfile) endFlow(key flowKey, fc *FlowContext) {
+	p.mu.Lock()
+	if p.flows[key] == fc {
+		delete(p.flows, key)
+	}
+	p.mu.Unlock()
+}
+
+func (p *AsyncFlowProfile) HandleAction(ctx context.Context, params *FlowActionParams) (*FlowActionResult, error) {
+	_, fc := p.flowOf(ctx, params.FlowID)
+	if fc == nil {
 		return nil, NewRPCError(ErrFlowError, map[string]string{
 			"reason": "flow not found: " + params.FlowID,
 		})
@@ -403,14 +431,8 @@ func (p *AsyncFlowProfile) HandleComplete(ctx context.Context, params *FlowCompl
 	if p.deliverSubFlow(p.keyFor(ctx, params.FlowID), subFlowOutcome{result: params.Result}) {
 		return
 	}
-	key := p.keyFor(ctx, params.FlowID)
-	p.mu.Lock()
-	fc, ok := p.flows[key]
-	if ok {
-		delete(p.flows, key)
-	}
-	p.mu.Unlock()
-	if ok {
+	if key, fc := p.flowOf(ctx, params.FlowID); fc != nil {
+		p.endFlow(key, fc)
 		fc.cancel()
 	}
 }
@@ -420,14 +442,8 @@ func (p *AsyncFlowProfile) HandleError(ctx context.Context, params *FlowErrorPar
 	if p.deliverSubFlow(p.keyFor(ctx, params.FlowID), subFlowOutcome{err: failure}) {
 		return
 	}
-	key := p.keyFor(ctx, params.FlowID)
-	p.mu.Lock()
-	fc, ok := p.flows[key]
-	if ok {
-		delete(p.flows, key)
-	}
-	p.mu.Unlock()
-	if ok {
+	if key, fc := p.flowOf(ctx, params.FlowID); fc != nil {
+		p.endFlow(key, fc)
 		fc.cancel()
 	}
 }
@@ -435,7 +451,8 @@ func (p *AsyncFlowProfile) HandleError(ctx context.Context, params *FlowErrorPar
 // HandleCancel implements FlowCanceller: a remote wmp.flow.cancel ends the
 // flow, and with it the sub-flows it is waiting for.
 func (p *AsyncFlowProfile) HandleCancel(ctx context.Context, params *FlowCancelParams) bool {
-	return p.cancelFlowKey(p.keyFor(ctx, params.FlowID))
+	key, fc := p.flowOf(ctx, params.FlowID)
+	return p.cancelFlowContext(key, fc)
 }
 
 // ActiveFlows returns the number of currently active flows.
@@ -448,33 +465,26 @@ func (p *AsyncFlowProfile) ActiveFlows() int {
 // CancelFlow cancels the flows with the given ID, whichever peer runs them.
 func (p *AsyncFlowProfile) CancelFlow(flowID string) {
 	p.mu.RLock()
-	var keys []flowKey
-	for k := range p.flows {
+	found := map[flowKey]*FlowContext{}
+	for k, fc := range p.flows {
 		if k.id == flowID {
-			keys = append(keys, k)
+			found[k] = fc
 		}
 	}
 	p.mu.RUnlock()
-	for _, k := range keys {
-		p.cancelFlowKey(k)
+	for k, fc := range found {
+		p.cancelFlowContext(k, fc)
 	}
 }
 
-// cancelFlowKey cancels one flow, reporting whether this profile was running
-// it, and unroutes it: the flow is over, and its worker's own cleanup will
-// not (it no longer holds the flow).
-func (p *AsyncFlowProfile) cancelFlowKey(key flowKey) bool {
-	p.mu.Lock()
-	fc, ok := p.flows[key]
-	if ok {
-		delete(p.flows, key)
+// cancelFlowContext cancels one flow instance and unroutes it, reporting
+// whether there was one.
+func (p *AsyncFlowProfile) cancelFlowContext(key flowKey, fc *FlowContext) bool {
+	if fc == nil {
+		return false
 	}
-	p.mu.Unlock()
-	if ok {
-		fc.cancel()
-		if router, isRouter := fc.peer.(FlowRouter); isRouter {
-			router.ReleaseFlow(key.id, p.owner())
-		}
-	}
-	return ok
+	p.endFlow(key, fc)
+	fc.cancel()
+	fc.release()
+	return true
 }
