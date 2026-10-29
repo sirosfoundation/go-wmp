@@ -54,8 +54,9 @@ type ServerConfig struct {
 	// sessions is dropped. Default one minute; negative disables the sweeper.
 	SweepInterval time.Duration
 
-	// MaxEvents bounds the per-session event buffer by count (default 200).
-	MaxEvents int
+	// Stream tunes the event streams: heartbeat, write deadline, the event
+	// log and replay redaction.
+	Stream StreamConfig
 
 	// Logger receives sweep errors. Default slog.Default().
 	Logger *slog.Logger
@@ -101,14 +102,13 @@ func NewSecuredServerHandler(cfg ServerConfig) *ServerHandler {
 	if cfg.SweepInterval == 0 {
 		cfg.SweepInterval = defaultSweepInterval
 	}
-	if cfg.MaxEvents <= 0 {
-		cfg.MaxEvents = defaultMaxEvents
-	}
+	cfg.Stream.applyDefaults()
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	h := &ServerHandler{
 		sessions: make(map[string]*serverSession),
+		trackers: make(map[string]*flowTracker),
 		secured:  &securedState{cfg: cfg, store: cfg.Service.Store(), stop: make(chan struct{}), building: make(map[string]*build)},
 	}
 	if cfg.SweepInterval > 0 {
@@ -298,6 +298,22 @@ func (h *ServerHandler) dispatch(ctx context.Context, w http.ResponseWriter, p w
 			h.forget(id)
 		}
 	}
+	if env.Method == wmp.MethodFlowCancel && succeeded(resp) {
+		// The cancel was handled here, not sent outward: tell the tracker, in
+		// order with what the session emits, that the flow is over.
+		var p struct {
+			Params struct {
+				FlowID string `json:"flow_id"`
+			} `json:"params"`
+		}
+		if json.Unmarshal(body, &p) == nil && p.Params.FlowID != "" {
+			sess.endFlow(p.Params.FlowID)
+		}
+	}
+	if env.Method == wmp.MethodSessionResume && resumed(resp) {
+		// Re-send what the event buffer may have lost (transport 4.3.4).
+		sess.resend()
+	}
 	writeResponse(w, resp)
 }
 
@@ -409,7 +425,7 @@ type resultWMP struct {
 func (h *ServerHandler) createSession(ctx context.Context, w http.ResponseWriter, p wmp.Principal, body []byte) {
 	hctx := context.WithoutCancel(ctx)
 	handler, opts := h.secured.cfg.NewHandler(hctx, p, "")
-	tmp := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.MaxEvents)
+	tmp := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.Stream.MaxEvents, nil)
 	defer tmp.close() // a panicking handler or hook must not leave its goroutine behind
 	dctx, cancel := h.dispatchContext(ctx, tmp.done)
 	defer cancel()
@@ -485,6 +501,26 @@ func (h *ServerHandler) liveSession(ctx context.Context, p wmp.Principal, id str
 	}
 }
 
+// discard shuts an unpublished session down and waits for its broadcaster: a
+// profile's Init may already have queued notifications, and nothing may be
+// appended to the log once the build's placeholder is released.
+func discard(s *serverSession) {
+	s.close()
+	<-s.stopped
+}
+
+// tracker returns the flow tracker of session id, creating it.
+func (h *ServerHandler) tracker(id string) *flowTracker {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	tr := h.trackers[id]
+	if tr == nil {
+		tr = newFlowTracker(h.secured.cfg.Stream.MaxFlows, h.secured.cfg.Logger)
+		h.trackers[id] = tr
+	}
+	return tr
+}
+
 // finishBuild runs the factory for the session b stands for and publishes the
 // result unless the session was deleted or the handler closed meanwhile. It
 // always removes b and wakes its waiters, a panic in the factory included
@@ -502,8 +538,15 @@ func (h *ServerHandler) finishBuild(ctx context.Context, p wmp.Principal, id str
 	}()
 
 	handler, opts := h.secured.cfg.NewHandler(context.WithoutCancel(ctx), p, id)
-	built := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.MaxEvents)
-	built.owner = p.Key()
+	tr := h.tracker(id)
+	built := newServerSession(handler, h.sessionPeerOptions(opts), h.secured.cfg.Stream.MaxEvents, func(s *serverSession) {
+		s.owner = p.Key()
+		s.sid = id
+		s.log = h.secured.cfg.Stream.Log
+		s.filter = h.secured.cfg.Stream.ReplayFilter
+		s.logger = h.secured.cfg.Logger
+		s.flows = tr
+	})
 
 	// The stored session may have gone while the factory ran (closed, expired,
 	// deleted by another replica): check again before publishing.
@@ -512,11 +555,11 @@ func (h *ServerHandler) finishBuild(ctx context.Context, p wmp.Principal, id str
 	switch {
 	case h.secured.closed:
 		h.mu.Unlock()
-		built.close()
+		discard(built)
 		return nil, lookupClosing
 	case b.cancelled || !stored || !rec.OwnedBy(p.Key()):
 		h.mu.Unlock()
-		built.close()
+		discard(built)
 		return nil, wmp.ErrSessionNotFound
 	}
 	published = true
@@ -552,7 +595,7 @@ func (h *ServerHandler) getSecured(w http.ResponseWriter, r *http.Request, p wmp
 		return
 	}
 	defer sess.release()
-	h.stream(w, r, sess)
+	h.streamSecured(w, r, sess)
 }
 
 // agreedSessionID returns the one non-empty value in ids, "" when there is
@@ -589,15 +632,49 @@ func writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, data int
 	writeResponse(w, b)
 }
 
-// forget ends a session whose stored record is gone: like Drop, and a build
-// of it that is still in progress is not published.
+// resumed reports whether a JSON-RPC response is a successful resume.
+func resumed(resp []byte) bool {
+	var out struct {
+		Result struct {
+			Resumed bool `json:"resumed"`
+		} `json:"result"`
+	}
+	return json.Unmarshal(resp, &out) == nil && out.Result.Resumed
+}
+
+// succeeded reports whether a JSON-RPC response carries a result, not an error.
+func succeeded(resp []byte) bool {
+	var out struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	return len(resp) > 0 && json.Unmarshal(resp, &out) == nil && out.Error == nil
+}
+
+// forget ends a session for good: its live state, its event log and the flow
+// notifications kept for resume. Use it when the stored session is gone. A
+// build of it that is still in progress is not published.
 func (h *ServerHandler) forget(id string) {
 	h.mu.Lock()
 	if b := h.secured.building[id]; b != nil {
 		b.cancelled = true
 	}
 	h.mu.Unlock()
-	h.Drop(id)
+	h.Drop(id) // waits for the broadcaster: nothing appends after the log is dropped
+	// A retirement under way (Drop from another caller) and a build that is
+	// being discarded are waited for too: their broadcaster may still be
+	// appending.
+	for {
+		h.mu.Lock()
+		b := h.secured.building[id]
+		if b == nil {
+			delete(h.trackers, id)
+			h.mu.Unlock()
+			break
+		}
+		h.mu.Unlock()
+		<-b.done
+	}
+	h.secured.cfg.Stream.Log.Drop(id)
 }
 
 // Drop ends the in-memory state of a session: its peer is closed and its event
@@ -605,11 +682,42 @@ func (h *ServerHandler) forget(id string) {
 // be resumed. Use it when the engine closes a session itself.
 func (h *ServerHandler) Drop(sessionID string) {
 	h.mu.Lock()
-	sess := h.sessions[sessionID]
-	delete(h.sessions, sessionID)
+	sess, b := h.detachLocked(sessionID)
 	h.mu.Unlock()
-	if sess != nil {
-		sess.close()
+	h.finishRetire(sessionID, sess, b)
+}
+
+// detachLocked removes the session from the live map. While it is being shut
+// down no replacement can be built under the same ID (the placeholder makes a
+// builder wait), so the old broadcaster cannot append to the log after the new
+// session attached. h.mu must be held; the result goes to finishRetire.
+func (h *ServerHandler) detachLocked(id string) (*serverSession, *build) {
+	sess := h.sessions[id]
+	if sess == nil {
+		return nil, nil
+	}
+	delete(h.sessions, id)
+	if h.secured == nil {
+		return sess, nil
+	}
+	b := &build{done: make(chan struct{})}
+	h.secured.building[id] = b
+	return sess, b
+}
+
+// finishRetire closes a detached session, waits for its broadcaster to stop and
+// only then lets a replacement be built.
+func (h *ServerHandler) finishRetire(id string, sess *serverSession, b *build) {
+	if sess == nil {
+		return
+	}
+	sess.close()
+	<-sess.stopped
+	if b != nil {
+		h.mu.Lock()
+		delete(h.secured.building, id)
+		h.mu.Unlock()
+		close(b.done)
 	}
 }
 
@@ -622,19 +730,7 @@ func (h *ServerHandler) Close(ctx context.Context) error {
 	}
 	h.mu.Lock()
 	if !st.closed {
-		st.closed = true
-		sessions := h.sessions
-		h.sessions = make(map[string]*serverSession)
-		st.drained = make(chan struct{})
-		close(st.stop)
-		go func() {
-			for _, s := range sessions {
-				s.close()
-			}
-			st.sweepWG.Wait()
-			st.inflight.Wait()
-			close(st.drained)
-		}()
+		h.startShutdownLocked()
 	}
 	drained := st.drained
 	h.mu.Unlock()
@@ -645,6 +741,57 @@ func (h *ServerHandler) Close(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// startShutdownLocked marks the handler closed and starts the drain; h.mu must
+// be held. Barriers are put in front of the sessions it retires, like Drop's: a
+// concurrent forget waits for their broadcasters instead of dropping the log
+// and tracker under them. Sessions being retired or built by other callers are
+// waited for too.
+func (h *ServerHandler) startShutdownLocked() {
+	st := h.secured
+	st.closed = true
+	sessions := h.sessions
+	h.sessions = make(map[string]*serverSession)
+	st.drained = make(chan struct{})
+	var pending []chan struct{}
+	for _, b := range st.building {
+		pending = append(pending, b.done)
+	}
+	close(st.stop)
+	barriers := make(map[string]*build, len(sessions))
+	for id := range sessions {
+		b := &build{done: make(chan struct{})}
+		st.building[id] = b
+		barriers[id] = b
+	}
+	go func() {
+		for _, s := range sessions {
+			s.close()
+		}
+		// Their broadcasters finish appending what they accepted before the
+		// shutdown counts as done.
+		for _, s := range sessions {
+			<-s.stopped
+		}
+		h.releaseBarriers(barriers)
+		for _, done := range pending {
+			<-done
+		}
+		st.sweepWG.Wait()
+		st.inflight.Wait()
+		close(st.drained)
+	}()
+}
+
+// releaseBarriers lets forget and replacements proceed for the retired sessions.
+func (h *ServerHandler) releaseBarriers(barriers map[string]*build) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for id, b := range barriers {
+		delete(h.secured.building, id)
+		close(b.done)
 	}
 }
 
@@ -674,9 +821,10 @@ func (h *ServerHandler) Sweep(ctx context.Context) {
 	if _, err := st.cfg.Service.Sweep(ctx); err != nil {
 		st.cfg.Logger.Warn("httpsse: session sweep failed", "error", err)
 	}
+	// trackers names every session with retained state, live or idle-dropped.
 	h.mu.RLock()
-	ids := make([]string, 0, len(h.sessions))
-	for id := range h.sessions {
+	ids := make([]string, 0, len(h.trackers))
+	for id := range h.trackers {
 		ids = append(ids, id)
 	}
 	h.mu.RUnlock()
@@ -697,12 +845,13 @@ func (h *ServerHandler) Sweep(ctx context.Context) {
 		sess := h.sessions[id]
 		idle := sess != nil && sess.active.Load() == 0 &&
 			now.Sub(time.Unix(0, sess.lastActive.Load())) > st.cfg.IdleTimeout
+		var b *build
 		if idle {
-			delete(h.sessions, id)
+			sess, b = h.detachLocked(id)
 		}
 		h.mu.Unlock()
 		if idle {
-			sess.close()
+			h.finishRetire(id, sess, b)
 		}
 	}
 }

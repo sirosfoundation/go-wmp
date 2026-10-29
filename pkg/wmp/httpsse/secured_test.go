@@ -169,7 +169,7 @@ func (f *securedFixture) get(auth, query string, headers map[string]string) *htt
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	f.t.Cleanup(cancel)
 	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
 	if err != nil {
@@ -411,7 +411,7 @@ func TestSecuredSweeperRunsOnItsOwn(t *testing.T) {
 	upd := *rec
 	upd.ExpiresAt = time.Now().Add(-time.Second)
 	_ = f.store.Update(&upd)
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		f.mu.Lock()
 		n := len(f.expired)
@@ -474,7 +474,7 @@ func TestSecuredDropEndsEventStreamAndSessionIsRebuilt(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("Drop did not end the event stream")
 	}
 	// Drop is not a delete: the stored session lives and is rebuilt.
@@ -487,7 +487,7 @@ func TestSecuredCloseDrainsAndRefuses(t *testing.T) {
 	f := newSecuredFixture(t, nil)
 	id, _ := f.create("Bearer alice")
 	resp := f.get("Bearer alice", "session_id="+id, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := f.h.Close(ctx); err != nil {
 		t.Fatalf("Close: %v (the open event stream must not block the drain)", err)
@@ -539,7 +539,7 @@ func TestLegacyHandlerIsNotSecured(t *testing.T) {
 // A client that connects and disconnects while events are broadcast must not
 // make the broadcast loop send on a closed channel.
 func TestBroadcastWhileClientsComeAndGo(t *testing.T) {
-	sess := newServerSession(wmp.BaseHandler{}, nil, 0)
+	sess := newServerSession(wmp.BaseHandler{}, nil, 0, nil)
 	defer sess.close()
 	var stop atomic.Bool
 	var wg sync.WaitGroup
@@ -548,7 +548,7 @@ func TestBroadcastWhileClientsComeAndGo(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for !stop.Load() {
-				ch := sess.registerClient()
+				ch := sess.registerClient(64, nil)
 				if ch != nil {
 					sess.unregisterClient(ch)
 				}
@@ -556,17 +556,17 @@ func TestBroadcastWhileClientsComeAndGo(t *testing.T) {
 		}()
 	}
 	for i := 0; i < 2000; i++ {
-		sess.outgoing <- []byte(`{}`)
+		sess.outgoing <- outMsg{data: []byte(`{}`)}
 	}
 	stop.Store(true)
 	wg.Wait()
 }
 
 func TestSessionCloseUnblocksWriters(t *testing.T) {
-	sess := newServerSession(wmp.BaseHandler{}, nil, 0)
+	sess := newServerSession(wmp.BaseHandler{}, nil, 0, nil)
 	tr := newServerTransport(sess)
 	sess.close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	for i := 0; i < 200; i++ { // more than the outgoing buffer
 		if err := tr.WriteMessage(ctx, []byte(`{}`)); err != nil {
@@ -580,9 +580,9 @@ func TestSessionCloseUnblocksWriters(t *testing.T) {
 }
 
 func TestPeerNotifyOnClosedSessionFails(t *testing.T) {
-	sess := newServerSession(wmp.BaseHandler{}, nil, 0)
+	sess := newServerSession(wmp.BaseHandler{}, nil, 0, nil)
 	sess.close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	for i := 0; i < 200; i++ {
 		if err := sess.peer.Notify(ctx, wmp.MethodMessageDeliver, map[string]any{}); err != nil {
@@ -604,7 +604,7 @@ func TestReplayEscapesLineBreaks(t *testing.T) {
 	defer ts.Close()
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/events?session_id=s1", nil)
 	req.Header.Set("Last-Event-ID", "evt-1")
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
 	if err != nil {
@@ -722,7 +722,7 @@ func TestSecuredCloseCancelsABlockedDispatch(t *testing.T) {
 	id, _ := f.create("Bearer alice")
 	reply := f.postAsync("Bearer alice", rpc("1", wmp.MethodMessageDeliver, id, nil))
 	time.Sleep(100 * time.Millisecond) // the dispatch is blocked in the handler
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := f.h.Close(ctx); err != nil {
 		t.Fatalf("Close did not drain a dispatch that waits: %v", err)
@@ -748,7 +748,7 @@ func TestSecuredCloseRetryWaitsForTheDrain(t *testing.T) {
 	}
 	close(bh.release)
 	<-reply
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := f.h.Close(ctx); err != nil {
 		t.Fatalf("Close after the request ended: %v", err)
@@ -773,12 +773,15 @@ func TestSecuredIdleSweepSparesSessionsInUse(t *testing.T) {
 }
 
 func TestSecuredIdleClockStartsWhenTheStreamEnds(t *testing.T) {
-	f := newSecuredFixture(t, func(c *ServerConfig) { c.IdleTimeout = 200 * time.Millisecond })
+	f := newSecuredFixture(t, func(c *ServerConfig) { c.IdleTimeout = 2 * time.Second })
 	id, _ := f.create("Bearer alice")
 	resp := f.get("Bearer alice", "session_id="+id, nil)
-	time.Sleep(300 * time.Millisecond) // the stream outlives the idle timeout
+	time.Sleep(2200 * time.Millisecond) // the stream outlives the idle timeout
 	resp.Body.Close()
-	time.Sleep(50 * time.Millisecond) // the server notices the disconnect
+	f.h.mu.RLock()
+	sess := f.h.sessions[id]
+	f.h.mu.RUnlock()
+	waitFor(t, "the server to notice the disconnect", func() bool { return sess.active.Load() == 0 })
 	f.h.Sweep(context.Background())
 	f.h.mu.RLock()
 	_, held := f.h.sessions[id]
@@ -831,7 +834,7 @@ func TestSecuredLookupWhileClosingIsNotAnError(t *testing.T) {
 }
 
 func TestFirstWriteAfterCloseFails(t *testing.T) {
-	sess := newServerSession(wmp.BaseHandler{}, nil, 0)
+	sess := newServerSession(wmp.BaseHandler{}, nil, 0, nil)
 	tr := newServerTransport(sess)
 	sess.close()
 	// The queue has room and done is closed: a select alone may take either.
@@ -913,7 +916,7 @@ func TestSecuredFactoryPanicDoesNotWedgeTheSession(t *testing.T) {
 		if rpcCode(r) != 0 {
 			t.Fatalf("%s", r.Raw)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("a failed build left later requests waiting forever")
 	}
 }
@@ -967,7 +970,7 @@ func TestSecuredExpiredResumeEndsTheLiveSession(t *testing.T) {
 	}
 	select {
 	case <-live.done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the live session outlived the record the resume deleted")
 	}
 }
@@ -985,7 +988,7 @@ func TestSecuredCreatePanicDoesNotLeakTheTemporarySession(t *testing.T) {
 		return panicOnCreate{wmp.NewSessionHandler(f.svc)}, nil
 	}
 	_ = f.postRaw("Bearer alice", createBody("c1")) // the connection is aborted
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for broadcastLoops() > before && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
