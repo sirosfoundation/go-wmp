@@ -661,7 +661,10 @@ func ValidateAction(flowType, action string) error {
 	switch flowType {
 	case FlowTypeOID4VCI:
 		switch action {
-		case ActionAcceptOffer, ActionProvideTxCode, ActionAuthorize, ActionCancel:
+		case ActionAcceptOffer, ActionProvideTxCode, ActionAuthorize, ActionCancel,
+			// The engine's issuance consent action is unchanged; only the
+			// presentation one was renamed (select_credentials, Section 3.2.3.1).
+			"consent":
 			return nil
 		}
 	case FlowTypeOID4VP:
