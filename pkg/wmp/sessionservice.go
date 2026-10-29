@@ -126,6 +126,11 @@ func defaultSessionID() string {
 	return "ses-" + hex.EncodeToString(b)
 }
 
+// Store returns the SessionStore the service persists to. A transport that
+// serves sessions (httpsse.NewSecuredServerHandler) uses it to check
+// ownership and to rebuild a session it no longer holds in memory.
+func (s *SessionService) Store() SessionStore { return s.cfg.Store }
+
 func (s *SessionService) lockFor(id string) *sync.Mutex {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(id))

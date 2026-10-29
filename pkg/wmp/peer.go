@@ -3,6 +3,7 @@ package wmp
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // generateRequestID creates a cryptographically random JSON-RPC request ID.
@@ -94,6 +96,12 @@ type Peer struct {
 	versions       versionCache     // fallback per-session versions (see versionFor)
 	orchestrator   *OrchestratorMessageOptions
 
+	// lifeDone is closed when the Peer is closed or Serve returns: flows
+	// started by a profile (AsyncFlowProfile) end with it, though not with
+	// the request that started them.
+	lifeDone chan struct{}
+	lifeOnce sync.Once
+
 	mu      sync.Mutex
 	pending map[string]chan *Response // keyed by request ID
 	closed  atomic.Bool
@@ -121,10 +129,26 @@ func NewPeer(transport Transport, handler Handler, opts ...PeerOption) *Peer {
 		logger:         slog.Default(),
 		maxMessageSize: 1 << 20, // 1MB default
 	}
+	p.lifeDone = make(chan struct{})
 	for _, opt := range opts {
 		opt(p)
 	}
 	return p
+}
+
+// Lifetime returns a channel that is closed when the Peer is closed or Serve
+// returns. AsyncFlowProfile ties the flows it runs to it.
+func (p *Peer) Lifetime() <-chan struct{} { return p.lifeDone }
+
+func (p *Peer) endLife() { p.lifeOnce.Do(func() { close(p.lifeDone) }) }
+
+// defaultSessionID is the session the Peer's own identity names, which stamps
+// the messages that name none (WithSessionIdentity).
+func (p *Peer) defaultSessionID() string {
+	if p.identity == nil {
+		return ""
+	}
+	return p.identity.sessionID
 }
 
 // Use registers a profile with this Peer. Profiles are initialized immediately.
@@ -188,6 +212,10 @@ func (p *Peer) ResolveIdentifier(ctx context.Context, identifier string) (*Disco
 // Serve reads messages from the transport and dispatches them to the handler.
 // It blocks until the context is cancelled or the transport is closed.
 func (p *Peer) Serve(ctx context.Context) error {
+	defer p.endLife()
+	// A transport whose ReadMessage ignores its context (an idle WebSocket)
+	// does not return when ctx ends; the flows still must.
+	defer context.AfterFunc(ctx, p.endLife)()
 	for {
 		data, err := p.transport.ReadMessage(ctx)
 		if err != nil {
@@ -346,6 +374,9 @@ func (p *Peer) handleRequest(ctx context.Context, req *Request) {
 }
 
 func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
+	// Profiles shared by several peers learn from the context which peer a
+	// flow message arrived on.
+	ctx = contextWithPeer(ctx, p)
 	switch method {
 	case MethodSessionCreate:
 		var ps SessionCreateParams
@@ -436,37 +467,16 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		// Check if a profile handles this flow type.
-		if fh, ok := p.registry.lookupFlowHandler(ps.FlowType); ok {
-			// Core §10.3: a flow type whose capability was not negotiated
-			// is refused with -31005 before the profile sees it.
-			if err := checkFlowCapability(ctx, fh, ps.FlowType); err != nil {
-				return nil, err
-			}
-			result, err := fh.StartFlow(ctx, &ps)
-			if err == nil && result != nil {
-				p.registry.trackFlow(ps.FlowID, fh)
-			}
-			return result, err
-		}
-		result, err := p.handler.FlowStart(ctx, &ps)
-		if isMethodNotFound(err) {
-			// Nobody here implements this flow type: that is an
-			// unsupported capability (core §10.3), not an unknown method.
-			return nil, NewUnsupportedError(ps.FlowType, nil)
-		}
-		return result, err
+		return p.dispatchFlowStart(ctx, &ps)
 
 	case MethodFlowProgress:
 		var ps FlowProgressParams
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
-			fh.HandleProgress(ctx, &ps)
-			return nil, nil
-		}
-		p.handler.FlowProgress(ctx, &ps)
+		p.deliverFlow(ps.FlowID, ps.WMP.SessionID, deferProgress,
+			func(e flowEntry) { e.handler.HandleProgress(withFlowGen(ctx, e.gen), &ps) },
+			func() { p.handler.FlowProgress(ctx, &ps) })
 		return nil, nil
 
 	case MethodFlowAction:
@@ -474,22 +484,18 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
-			return fh.HandleAction(ctx, &ps)
-		}
-		return p.handler.FlowAction(ctx, &ps)
+		return p.dispatchFlowAction(ctx, &ps)
 
 	case MethodFlowComplete:
 		var ps FlowCompleteParams
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
-			fh.HandleComplete(ctx, &ps)
-			p.registry.untrackFlow(ps.FlowID)
-			return nil, nil
-		}
-		p.handler.FlowComplete(ctx, &ps)
+		p.deliverFlow(ps.FlowID, ps.WMP.SessionID, deferTerminal,
+			func(e flowEntry) {
+				p.endRoutedFlow(e, func() { e.handler.HandleComplete(withFlowGen(ctx, e.gen), &ps) })
+			},
+			func() { p.handler.FlowComplete(ctx, &ps) })
 		return nil, nil
 
 	case MethodFlowError:
@@ -497,12 +503,9 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		if fh, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
-			fh.HandleError(ctx, &ps)
-			p.registry.untrackFlow(ps.FlowID)
-			return nil, nil
-		}
-		p.handler.FlowError(ctx, &ps)
+		p.deliverFlow(ps.FlowID, ps.WMP.SessionID, deferTerminal,
+			func(e flowEntry) { p.endRoutedFlow(e, func() { e.handler.HandleError(withFlowGen(ctx, e.gen), &ps) }) },
+			func() { p.handler.FlowError(ctx, &ps) })
 		return nil, nil
 
 	case MethodFlowCancel:
@@ -510,11 +513,7 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 		if err := json.Unmarshal(params, &ps); err != nil {
 			return nil, NewRPCError(ErrInvalidParams, nil)
 		}
-		// Untrack the flow if it's managed by a profile.
-		if _, ok := p.registry.lookupFlowOwner(ps.FlowID); ok {
-			p.registry.untrackFlow(ps.FlowID)
-		}
-		return p.handler.FlowCancel(ctx, &ps)
+		return p.dispatchFlowCancel(ctx, &ps)
 
 	case MethodResolve:
 		var ps ResolveParams
@@ -559,6 +558,261 @@ func (p *Peer) dispatchMethodInternal(ctx context.Context, method string, params
 	}
 }
 
+// startIdentity identifies a wmp.flow.start by what it asks for: the flow type
+// and its params. The same start sent again has the same identity.
+func startIdentity(ps *FlowStartParams) [32]byte {
+	h := sha256.New()
+	h.Write([]byte(ps.FlowType))
+	h.Write([]byte{0})
+	h.Write(ps.Params)
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
+}
+
+// maxStartWait bounds how long an action waits for the start of its flow.
+const maxStartWait = 30 * time.Second
+
+// dispatchFlowStart routes a wmp.flow.start to the profile that owns its flow
+// type, or to the Handler.
+func (p *Peer) dispatchFlowStart(ctx context.Context, ps *FlowStartParams) (interface{}, error) {
+	// A flow_id that is routed (a claim for a sub-flow of this peer, or a flow
+	// still running) or being started is not available to the remote peer's
+	// wmp.flow.start. Reserving it here, before the handler runs, keeps a
+	// claim made meanwhile from being overwritten.
+	session := p.flowSession(ctx, ps.WMP.SessionID)
+	startID := startIdentity(ps)
+	switch p.registry.beginStart(ps.FlowID, session, startID) {
+	case startRefused:
+		return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow_id in use"})
+	case startDuplicate:
+		// The same start again (a re-issue after a resume): the flow exists,
+		// and a second worker is not launched.
+		return &FlowStartResult{
+			WMP:    Metadata{Version: p.versionFor(session), SessionID: session},
+			FlowID: ps.FlowID, FlowType: ps.FlowType,
+		}, nil
+	}
+	fh, ok := p.registry.lookupFlowHandler(ps.FlowType)
+	if !ok {
+		result, err := p.handler.FlowStart(ctx, ps)
+		if isMethodNotFound(err) {
+			// Nobody here implements this flow type: that is an
+			// unsupported capability (core §10.3), not an unknown method.
+			p.registry.discardStart(ps.FlowID)
+			return nil, NewUnsupportedError(ps.FlowType, nil)
+		}
+		p.finishStart(ps.FlowID, err == nil && result != nil)
+		return result, err
+	}
+	// Core §10.3: a flow type whose capability was not negotiated is refused
+	// with -31005 before the profile sees it.
+	if err := checkFlowCapability(ctx, fh, ps.FlowType); err != nil {
+		p.registry.discardStart(ps.FlowID)
+		return nil, err
+	}
+	// Route the flow's messages before its worker can run, under a generation
+	// of its own: a worker that finishes first releases exactly this route,
+	// and messages that arrive while StartFlow runs are held until it returns.
+	gen, replaced := p.registry.route(ps.FlowID, session, fh, startID)
+	release := func() { p.registry.release(ps.FlowID, gen) }
+	terminal := func() { p.registry.markTerminal(ps.FlowID, gen) }
+	result, err := fh.StartFlow(contextWithFlowRoute(ctx, flowRoute{gen: gen, release: release, terminal: terminal}), ps)
+	if err != nil || result == nil {
+		// The flow did not start: its route goes, and the one it was to
+		// replace (an ordinary handler's earlier flow) is routed again.
+		p.registry.abandonRoute(ps.FlowID, gen, replaced)
+		p.registry.discardStart(ps.FlowID)
+		return result, err
+	}
+	p.finishStart(ps.FlowID, true)
+	return result, nil
+}
+
+// finishStart ends the reservation of a start whose handler has returned. A
+// start that succeeded applies what was held for it, in order, before anything
+// newer is dispatched; one that failed drops it.
+func (p *Peer) finishStart(flowID string, succeeded bool) {
+	if !succeeded {
+		p.registry.discardStart(flowID)
+		return
+	}
+	for {
+		ops, done := p.registry.takeDeferred(flowID)
+		if done {
+			return
+		}
+		for _, op := range ops {
+			op()
+		}
+	}
+}
+
+// deliverFlow hands a progress, completion or error message to the route of its
+// flow: now, or after the flow's start has returned when that is still running
+// (held within the limits of deferWhileStarting). A message for a flow no
+// route exists for goes to orElse (the Handler), as does one that was held for
+// a start that published no route. A message from another session than the
+// flow's is dropped.
+func (p *Peer) deliverFlow(flowID, session string, kind deferKind, fn func(e flowEntry), orElse func()) {
+	attempt := func() {
+		e, ok := p.registry.lookupFlow(flowID)
+		if !ok {
+			orElse()
+			return
+		}
+		if e.allows(session) {
+			p.viaRoute(e, fn)
+		}
+	}
+	if startSession, starting := p.registry.startingSession(flowID); starting {
+		if startSession != "" && startSession != session {
+			return
+		}
+		if p.registry.deferWhileStarting(flowID, kind, attempt) {
+			return
+		}
+	}
+	attempt()
+}
+
+// viaRoute runs fn with e's route in use: the route is not removed under it,
+// and a route that is gone (a message for an old instance) is not used.
+func (p *Peer) viaRoute(e flowEntry, fn func(e flowEntry)) bool {
+	cur, ok := p.registry.acquire(e.flowID, e.gen)
+	if !ok {
+		return false
+	}
+	defer p.registry.done(e.flowID, e.gen)
+	fn(cur)
+	return true
+}
+
+// dispatchFlowAction routes a wmp.flow.action to its flow.
+func (p *Peer) dispatchFlowAction(ctx context.Context, ps *FlowActionParams) (interface{}, error) {
+	// An action is a request the flow must answer, and the flow does not exist
+	// until its start has returned: a worker may well ask for an action (a
+	// progress notification) before that, so the action waits for the start,
+	// from the starting session only.
+	if startSession, starting := p.registry.startingSession(ps.FlowID); starting {
+		if startSession != "" && startSession != ps.WMP.SessionID {
+			return nil, NewRPCError(ErrNotAuthorized, nil)
+		}
+		wait := time.NewTimer(maxStartWait)
+		defer wait.Stop()
+		select {
+		case <-p.registry.startDone(ps.FlowID):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-wait.C:
+			return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow is still starting"})
+		}
+	}
+	e, ok := p.registry.lookupFlow(ps.FlowID)
+	if !ok {
+		return p.handler.FlowAction(ctx, ps)
+	}
+	if !e.allows(ps.WMP.SessionID) {
+		return nil, NewRPCError(ErrNotAuthorized, nil)
+	}
+	var (
+		res  *FlowActionResult
+		rerr error
+	)
+	if !p.viaRoute(e, func(e flowEntry) { res, rerr = e.handler.HandleAction(withFlowGen(ctx, e.gen), ps) }) {
+		return p.handler.FlowAction(ctx, ps)
+	}
+	return res, rerr
+}
+
+// dispatchFlowCancel routes a wmp.flow.cancel to its flow.
+func (p *Peer) dispatchFlowCancel(ctx context.Context, ps *FlowCancelParams) (interface{}, error) {
+	e, routed := p.registry.lookupFlow(ps.FlowID)
+	startSession, starting := p.registry.startingSession(ps.FlowID)
+	switch {
+	case routed && !e.allows(ps.WMP.SessionID):
+		return nil, NewRPCError(ErrNotAuthorized, nil)
+	case !routed && starting && startSession != "" && startSession != ps.WMP.SessionID:
+		return nil, NewRPCError(ErrNotAuthorized, nil)
+	}
+	cancelled := &FlowCancelResult{
+		WMP:    Metadata{Version: p.versionFor(ps.WMP.SessionID), SessionID: ps.WMP.SessionID},
+		FlowID: ps.FlowID, Status: "cancelled",
+	}
+	if starting {
+		// The flow does not exist yet. A cancel is accepted, to be applied the
+		// moment it does, only when it can then be honoured: the route is
+		// published and its handler stops flows (FlowCanceller). Otherwise it
+		// is refused, not acknowledged and lost.
+		_, canStop := e.handler.(FlowCanceller)
+		if routed && canStop && p.registry.deferWhileStarting(ps.FlowID, deferCancel, func() { _, _ = p.applyCancel(ctx, e, ps) }) {
+			return cancelled, nil
+		}
+		if !routed || !canStop {
+			return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow is still starting"})
+		}
+	}
+	if routed {
+		stopped, err := p.applyCancel(ctx, e, ps)
+		if err != nil {
+			return nil, err
+		}
+		if stopped {
+			// The profile stopped the flow: that is the answer, whatever the
+			// Handler would say about a flow it never saw.
+			return cancelled, nil
+		}
+	}
+	return p.handler.FlowCancel(ctx, ps)
+}
+
+// applyCancel lets the handler of the authorized route e stop its flow, and
+// reports whether it did, or the error that says it cannot (the flow is already
+// terminal). Only the route's own generation is acted on: if that flow has
+// ended and the ID is reused, the cancel is not applied to the replacement. A
+// handler that manages its own routes unroutes the flow when its worker has
+// exited; for any other the route ends with the cancel.
+func (p *Peer) applyCancel(ctx context.Context, e flowEntry, ps *FlowCancelParams) (stopped bool, err error) {
+	p.viaRoute(e, func(e flowEntry) {
+		if fc, ok := e.handler.(FlowCanceller); ok {
+			stopped, err = fc.HandleCancel(withFlowGen(ctx, e.gen), ps)
+		}
+		if (stopped || !e.claimed) && !e.managed {
+			p.registry.release(ps.FlowID, e.gen)
+		}
+	})
+	return stopped, err
+}
+
+// endRoutedFlow runs the handler's terminal callback for e and then ends the
+// route of that flow instance, unless the handler manages its own routes (its
+// worker ends it) or it is a claim (its claimant ends it).
+func (p *Peer) endRoutedFlow(e flowEntry, handle func()) {
+	handle()
+	if !e.claimed && !e.managed {
+		p.registry.release(e.flowID, e.gen)
+	}
+}
+
+// flowSession is the session a flow started by this request belongs to: the
+// store-resolved one when there is one, else the one the request names, else
+// the Peer's own identity's (the session its children are sent under).
+func (p *Peer) flowSession(ctx context.Context, named string) string {
+	if sess := SessionFromContext(ctx); sess != nil {
+		return sess.ID
+	}
+	if named != "" {
+		return named
+	}
+	return p.defaultSessionID()
+}
+
+// ClaimFlow implements FlowRouter: the messages of flowID that name sessionID
+// (any session when empty) go to h until the returned release is called.
+func (p *Peer) ClaimFlow(flowID, sessionID string, h FlowHandler) (release func(), ok bool) {
+	return p.registry.claimFlow(flowID, sessionID, h)
+}
+
 // Notify sends a JSON-RPC 2.0 notification (no response expected).
 func (p *Peer) Notify(ctx context.Context, method string, params interface{}) error {
 	params, err := p.stamp(method, params)
@@ -570,8 +824,11 @@ func (p *Peer) Notify(ctx context.Context, method string, params interface{}) er
 		return err
 	}
 	err = p.sendJSON(ctx, req)
-	if err == nil && method == MethodSessionClose {
-		p.forgetVersion(stringMember(metaOf(params), "session_id"))
+	if err == nil {
+		switch method {
+		case MethodSessionClose:
+			p.forgetVersion(stringMember(metaOf(params), "session_id"))
+		}
 	}
 	return err
 }
@@ -730,6 +987,7 @@ func (p *Peer) HandleRequestSync(ctx context.Context, data []byte) ([]byte, erro
 // Close closes the peer and its underlying transport.
 func (p *Peer) Close() error {
 	if p.closed.CompareAndSwap(false, true) {
+		p.endLife()
 		return p.transport.Close()
 	}
 	return nil
