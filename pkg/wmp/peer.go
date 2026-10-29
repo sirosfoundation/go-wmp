@@ -755,40 +755,46 @@ func (p *Peer) dispatchFlowCancel(ctx context.Context, ps *FlowCancelParams) (in
 		FlowID: ps.FlowID, Status: "cancelled",
 	}
 	if starting {
-		// The flow does not exist yet. A cancel is accepted, to be applied the
-		// moment it does, only when it can then be honoured: the route is
-		// published and its handler stops flows (FlowCanceller). Otherwise it
-		// is refused, not acknowledged and lost.
-		_, canStop := e.handler.(FlowCanceller)
-		if routed && canStop && p.registry.deferWhileStarting(ps.FlowID, deferCancel, func() { _, _ = p.applyCancel(context.WithoutCancel(ctx), e, ps) }) {
+		if p.cancelWhileStarting(ctx, e, routed, ps) {
 			return cancelled, nil
 		}
-		if !routed || !canStop {
-			return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow is still starting"})
-		}
+		return nil, NewRPCError(ErrFlowError, map[string]string{"reason": "flow is still starting"})
 	}
-	if routed {
-		stopped, err := p.applyCancel(ctx, e, ps)
-		if err != nil {
-			return nil, err
-		}
-		if stopped {
-			// The profile stopped the flow: that is the answer, whatever the
-			// Handler would say about a flow it never saw.
-			return cancelled, nil
-		}
-		if e.managed || e.claimed {
-			return p.handler.FlowCancel(ctx, ps)
-		}
-		// An ordinary handler's flow that has no canceller: the Handler
-		// answers, and the route goes only if it accepted.
-		res, err := p.handler.FlowCancel(ctx, ps)
-		if err == nil {
-			p.registry.release(ps.FlowID, e.gen)
-		}
-		return res, err
+	if !routed {
+		return p.handler.FlowCancel(ctx, ps)
 	}
-	return p.handler.FlowCancel(ctx, ps)
+	stopped, err := p.applyCancel(ctx, e, ps)
+	switch {
+	case err != nil:
+		return nil, err
+	case stopped:
+		// The profile stopped the flow: that is the answer, whatever the
+		// Handler would say about a flow it never saw.
+		return cancelled, nil
+	case e.managed || e.claimed:
+		return p.handler.FlowCancel(ctx, ps)
+	}
+	// An ordinary handler's flow that has no canceller: the Handler answers,
+	// and the route goes only if it accepted.
+	res, err := p.handler.FlowCancel(ctx, ps)
+	if err == nil {
+		p.registry.release(ps.FlowID, e.gen)
+	}
+	return res, err
+}
+
+// cancelWhileStarting accepts a cancel of a flow whose start is running, to be
+// applied the moment the flow exists, but only when it can then be honoured: the
+// route is published and its handler stops flows (FlowCanceller). It reports
+// whether it accepted; otherwise the cancel is refused, not acknowledged and
+// lost.
+func (p *Peer) cancelWhileStarting(ctx context.Context, e flowEntry, routed bool, ps *FlowCancelParams) bool {
+	if _, canStop := e.handler.(FlowCanceller); !routed || !canStop {
+		return false
+	}
+	return p.registry.deferWhileStarting(ps.FlowID, deferCancel, func() {
+		_, _ = p.applyCancel(context.WithoutCancel(ctx), e, ps)
+	})
 }
 
 // applyCancel lets the handler of the authorized route e stop its flow, and

@@ -52,10 +52,14 @@ func newFlowContext(flowID, flowType string, params json.RawMessage, peer PeerCo
 	return newSessionFlowContext(flowID, flowType, params, peer, "")
 }
 
+// noop is the default release and terminal hook of a FlowContext that no Peer
+// routes (it has no route to end).
+func noop() { /* nothing to do: no route */ }
+
 func newSessionFlowContext(flowID, flowType string, params json.RawMessage, peer PeerContext, sessionID string) *FlowContext {
 	return &FlowContext{
-		release:   func() {},
-		terminal:  func() {},
+		release:   noop,
+		terminal:  noop,
 		FlowID:    flowID,
 		FlowType:  flowType,
 		Params:    params,
@@ -242,7 +246,7 @@ type AsyncFlowProfile struct {
 
 // managesFlowRoutes marks the profile as ending the route of each of its flows
 // itself (see routeManager).
-func (p *AsyncFlowProfile) managesFlowRoutes() {}
+func (p *AsyncFlowProfile) managesFlowRoutes() { /* marker method: see routeManager */ }
 
 // flowKey identifies a flow of a profile shared by several peers (an HTTP+SSE
 // server gives each session its own Peer): the same flow_id on two peers is two
