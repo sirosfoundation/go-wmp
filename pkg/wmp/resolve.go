@@ -13,10 +13,18 @@ const ResolveReasonMetadataFetchError = "metadata_fetch_error"
 
 // vctmMembers are the members of a type metadata document that a vctm
 // resolution carries (WMP Core 5.8.1), in the order they are written.
-var vctmMembers = []string{"name", "description", "display", "claims", "schema"}
+// stringMember marks the two that must be strings: a null there is treated as
+// absent, while display, claims and schema are carried verbatim, null included
+// (Core 9.5 rule 4).
+var vctmMembers = []struct {
+	name         string
+	stringMember bool
+}{
+	{"name", true}, {"description", true}, {"display", false}, {"claims", false}, {"schema", false},
+}
 
 // ErrVCTMNotObject is returned by ProjectVCTM for a document that is not a JSON
-// object, or whose vct is not a string.
+// object, or whose vct, name or description is not a string.
 var ErrVCTMNotObject = errors.New("wmp: type metadata is not a JSON object")
 
 // ProjectVCTM reduces a type metadata document to the members a vctm
@@ -46,12 +54,21 @@ func ProjectVCTM(doc []byte, uri string) (json.RawMessage, error) {
 	out.WriteString(`{"vct":`)
 	v, _ := json.Marshal(vct)
 	out.Write(v)
-	for _, name := range vctmMembers {
-		raw, ok := all[name]
-		if !ok || isJSONNull(raw) {
+	for _, m := range vctmMembers {
+		raw, ok := all[m.name]
+		if !ok {
 			continue
 		}
-		k, _ := json.Marshal(name)
+		if m.stringMember {
+			if isJSONNull(raw) {
+				continue
+			}
+			var str string
+			if json.Unmarshal(raw, &str) != nil {
+				return nil, ErrVCTMNotObject
+			}
+		}
+		k, _ := json.Marshal(m.name)
 		out.WriteByte(',')
 		out.Write(k)
 		out.WriteByte(':')

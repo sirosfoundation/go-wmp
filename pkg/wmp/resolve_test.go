@@ -51,7 +51,9 @@ func TestProjectVCTMDefaultsVCTToURI(t *testing.T) {
 }
 
 func TestProjectVCTMRefusesNonObjects(t *testing.T) {
-	for _, doc := range []string{`[]`, `"x"`, `null`, `42`, `{"vct":7}`, ``, `{`} {
+	for _, doc := range []string{`[]`, `"x"`, `null`, `42`, `{"vct":7}`, ``, `{`,
+		// name and description are strings, or the metadata would fail its own schema
+		`{"vct":"v","name":42}`, `{"vct":"v","description":{}}`, `{"vct":"v","name":["n"]}`} {
 		if _, err := ProjectVCTM([]byte(doc), "https://c.example/id"); !errors.Is(err, ErrVCTMNotObject) {
 			t.Errorf("%q: err = %v, want ErrVCTMNotObject", doc, err)
 		}
@@ -107,5 +109,17 @@ func TestMetadataFetchErrorAndParams(t *testing.T) {
 		if e := ValidateVCTMResolveParams(p); e == nil || e.Code != ErrInvalidParams {
 			t.Errorf("%+v: %v", p, e)
 		}
+	}
+}
+
+func TestProjectVCTMNullMembers(t *testing.T) {
+	got, err := ProjectVCTM([]byte(`{"vct":"v","name":null,"description":null,"display":null,"claims":null,"schema":null}`), "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// display, claims and schema are carried verbatim, null included; a null name
+	// or description is absent.
+	if string(got) != `{"vct":"v","display":null,"claims":null,"schema":null}` {
+		t.Errorf("projection = %s", got)
 	}
 }
