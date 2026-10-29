@@ -13,7 +13,7 @@ import (
 // refusal that ends the flow.
 
 // ReasonUntrustedIssuer is the data.reason of the -31006 wmp.flow.error that
-// refuses an oid4vci flow for an untrusted or unentitled issuer.
+// refuses an oid4vci flow because the trust decision refused the issuer.
 const ReasonUntrustedIssuer = "untrusted_issuer"
 
 // Finding codes defined by Section 7.8. A receiver accepts any code of the
@@ -273,21 +273,17 @@ func ParseIssuerEntitlementPayload(payload json.RawMessage) (p *IssuerEntitlemen
 }
 
 // UntrustedIssuerData is the data of the -31006 wmp.flow.error that refuses an
-// oid4vci flow for an untrusted or unentitled issuer (Section 3.1.6).
+// oid4vci flow because the trust decision refused the issuer (Section 3.1.6).
+// It carries no findings: a refusal that rests on entitlement findings is
+// -31020 (IssuerNotEntitledData).
 type UntrustedIssuerData struct {
-	Reason    string               `json:"reason"`
-	Retryable bool                 `json:"retryable"`
-	Findings  []EntitlementFinding `json:"findings,omitempty"`
+	Reason    string `json:"reason"`
+	Retryable bool   `json:"retryable"`
 }
 
-// NewUntrustedIssuerData builds the data for the refusal. findings is the
-// entitlement findings (nil for a refusal by the trust decision alone); it is
-// refused when out of bounds.
-func NewUntrustedIssuerData(findings []EntitlementFinding) (*UntrustedIssuerData, error) {
-	if err := validateFindings(findings); err != nil {
-		return nil, err
-	}
-	return &UntrustedIssuerData{Reason: ReasonUntrustedIssuer, Retryable: false, Findings: findings}, nil
+// NewUntrustedIssuerData builds the data of the -31006 untrusted_issuer refusal.
+func NewUntrustedIssuerData() *UntrustedIssuerData {
+	return &UntrustedIssuerData{Reason: ReasonUntrustedIssuer, Retryable: false}
 }
 
 // ParseUntrustedIssuerData decodes and validates the data of a flow error. ok is
@@ -305,15 +301,61 @@ func ParseUntrustedIssuerData(data json.RawMessage) (d *UntrustedIssuerData, ok 
 	if out.Retryable {
 		return nil, true, entitlementErr("an untrusted_issuer refusal is not retryable")
 	}
-	if raw, present := m["findings"]; present && isNotNull(raw) {
-		f, err := decodeFindings(raw)
-		if err != nil {
-			return nil, true, err
-		}
-		if err := validateFindings(f); err != nil {
-			return nil, true, err
-		}
-		out.Findings = f
-	}
 	return &out, true, nil
+}
+
+// IssuerNotEntitledData is the data of the -31020 (wmp.ErrIssuerNotEntitled)
+// wmp.flow.error that refuses an oid4vci flow for an issuer that is not
+// registered to issue what it offers (Section 3.1.6). Its message is
+// IssuerNotEntitledMessage. Findings is required: 1 to 64 entries.
+type IssuerNotEntitledData struct {
+	Retryable bool                 `json:"retryable"`
+	Findings  []EntitlementFinding `json:"findings"`
+}
+
+// IssuerNotEntitledMessage is the fixed message of the -31020 error.
+const IssuerNotEntitledMessage = "Issuer not entitled"
+
+// NewIssuerNotEntitledData builds the data of the -31020 refusal. It is refused
+// when findings is empty or out of bounds; use IssuerEntitlement.Bounded first
+// for findings built from issuer data.
+func NewIssuerNotEntitledData(findings []EntitlementFinding) (*IssuerNotEntitledData, error) {
+	if len(findings) == 0 {
+		return nil, entitlementErr("a not-entitled refusal needs at least one finding")
+	}
+	if err := validateFindings(findings); err != nil {
+		return nil, err
+	}
+	return &IssuerNotEntitledData{Retryable: false, Findings: findings}, nil
+}
+
+// ParseIssuerNotEntitledData decodes and validates the data of a -31020 error.
+func ParseIssuerNotEntitledData(data json.RawMessage) (*IssuerNotEntitledData, error) {
+	m, ok := members(data)
+	if !ok {
+		return nil, entitlementErr("data is not an object")
+	}
+	var out IssuerNotEntitledData
+	if !member(m, "retryable", &out.Retryable) {
+		return nil, entitlementErr("retryable is missing or not a boolean")
+	}
+	if out.Retryable {
+		return nil, entitlementErr("a not-entitled refusal is not retryable")
+	}
+	raw, present := m["findings"]
+	if !present || !isNotNull(raw) {
+		return nil, entitlementErr("findings is required")
+	}
+	f, err := decodeFindings(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(f) == 0 {
+		return nil, entitlementErr("findings is empty")
+	}
+	if err := validateFindings(f); err != nil {
+		return nil, err
+	}
+	out.Findings = f
+	return &out, nil
 }

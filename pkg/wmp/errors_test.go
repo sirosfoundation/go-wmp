@@ -27,6 +27,7 @@ func TestErrorMessage(t *testing.T) {
 		{ErrAssuranceLevelUnsupported, "Assurance level unsupported"},
 		{ErrPolicyUnsupported, "Policy unsupported"},
 		{ErrPlaintextHashMismatch, "Plaintext hash mismatch"},
+		{ErrIssuerNotEntitled, "Issuer not entitled"},
 		{ErrParseError, "Parse error"},
 		{ErrInvalidRequest, "Invalid Request"},
 		{ErrMethodNotFound, "Method not found"},

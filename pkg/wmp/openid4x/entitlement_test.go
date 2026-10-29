@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 )
 
 func okEntitlement() IssuerEntitlement {
@@ -162,38 +164,69 @@ func TestParseIssuerEntitlementPayload(t *testing.T) {
 }
 
 func TestUntrustedIssuerData(t *testing.T) {
-	d, err := NewUntrustedIssuerData([]EntitlementFinding{{Code: EntitlementNotProvider}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, _ := json.Marshal(d)
-	if string(b) != `{"reason":"untrusted_issuer","retryable":false,"findings":[{"code":"not_an_attestation_provider"}]}` {
-		t.Errorf("wire = %s", b)
-	}
-	d, _ = NewUntrustedIssuerData(nil)
-	b, _ = json.Marshal(d)
+	b, _ := json.Marshal(NewUntrustedIssuerData())
 	if string(b) != `{"reason":"untrusted_issuer","retryable":false}` {
-		t.Errorf("wire without findings = %s", b)
-	}
-	if _, err := NewUntrustedIssuerData([]EntitlementFinding{{Code: "Bad"}}); !errors.Is(err, ErrEntitlement) {
-		t.Errorf("bad code accepted: %v", err)
+		t.Errorf("wire = %s", b)
 	}
 	for _, raw := range []string{`{"reason":"busy","retryable":true}`, `{"message":"x"}`, `null`} {
 		if d, ok, err := ParseUntrustedIssuerData(json.RawMessage(raw)); d != nil || ok || err != nil {
 			t.Errorf("%s: %v %v %v", raw, d, ok, err)
 		}
 	}
-	got, ok, err := ParseUntrustedIssuerData(json.RawMessage(`{"reason":"untrusted_issuer","retryable":false,"findings":[{"code":"a"}],"x":1}`))
-	if err != nil || !ok || len(got.Findings) != 1 {
+	// Unknown members are ignored: findings belong to -31020, not to this refusal.
+	got, ok, err := ParseUntrustedIssuerData(json.RawMessage(`{"reason":"untrusted_issuer","retryable":false,"x":1}`))
+	if err != nil || !ok || got.Reason != ReasonUntrustedIssuer {
 		t.Errorf("parse = %+v %v %v", got, ok, err)
 	}
 	for _, raw := range []string{
 		`{"reason":"untrusted_issuer","retryable":true}`,
-		`{"reason":"untrusted_issuer","retryable":false,"findings":[{"code":"Bad"}]}`,
 		`{"reason":"untrusted_issuer","retryable":"no"}`,
+		`{"reason":"untrusted_issuer"}`,
 	} {
 		if _, ok, err := ParseUntrustedIssuerData(json.RawMessage(raw)); !ok || !errors.Is(err, ErrEntitlement) {
 			t.Errorf("%s: ok=%v err=%v", raw, ok, err)
+		}
+	}
+}
+
+func TestIssuerNotEntitledData(t *testing.T) {
+	if wmp.ErrIssuerNotEntitled != -31020 || wmp.ErrorMessage(wmp.ErrIssuerNotEntitled) != IssuerNotEntitledMessage {
+		t.Fatalf("code/message = %d %q", wmp.ErrIssuerNotEntitled, wmp.ErrorMessage(wmp.ErrIssuerNotEntitled))
+	}
+	d, err := NewIssuerNotEntitledData([]EntitlementFinding{{Code: EntitlementNotProvider, CredentialType: "https://c.example/id"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(d)
+	if string(b) != `{"retryable":false,"findings":[{"code":"not_an_attestation_provider","credential_type":"https://c.example/id"}]}` {
+		t.Errorf("wire = %s", b)
+	}
+	got, err := ParseIssuerNotEntitledData(b)
+	if err != nil || len(got.Findings) != 1 || got.Findings[0].Code != EntitlementNotProvider {
+		t.Errorf("round trip = %+v %v", got, err)
+	}
+	if _, err := NewIssuerNotEntitledData(nil); !errors.Is(err, ErrEntitlement) {
+		t.Errorf("no findings accepted: %v", err)
+	}
+	if _, err := NewIssuerNotEntitledData([]EntitlementFinding{{Code: "Bad"}}); !errors.Is(err, ErrEntitlement) {
+		t.Errorf("bad code accepted: %v", err)
+	}
+	many := make([]EntitlementFinding, 65)
+	for i := range many {
+		many[i] = EntitlementFinding{Code: "a"}
+	}
+	if _, err := NewIssuerNotEntitledData(many); !errors.Is(err, ErrEntitlement) {
+		t.Errorf("65 findings accepted: %v", err)
+	}
+	for _, raw := range []string{
+		`null`, `[]`, `{"retryable":false}`, `{"retryable":false,"findings":null}`, `{"retryable":false,"findings":[]}`,
+		`{"retryable":true,"findings":[{"code":"a"}]}`, `{"findings":[{"code":"a"}]}`, `{"retryable":null,"findings":[{"code":"a"}]}`,
+		`{"retryable":false,"FINDINGS":[{"code":"a"}]}`, `{"retryable":false,"findings":[{"Code":"a"}]}`,
+		`{"retryable":false,"findings":[{"code":"a","message":"free text"}]}`,
+		`{"retryable":false,"findings":[{"code":"a\n"}]}`,
+	} {
+		if _, err := ParseIssuerNotEntitledData(json.RawMessage(raw)); !errors.Is(err, ErrEntitlement) {
+			t.Errorf("%s: err=%v", raw, err)
 		}
 	}
 }
@@ -223,8 +256,6 @@ func TestEntitlementParsersMatchMemberNamesExactly(t *testing.T) {
 	}
 	for _, raw := range []string{
 		`{"reason":"untrusted_issuer","RETRYABLE":false}`,
-		`{"reason":"untrusted_issuer","retryable":false,"findings":[{"Code":"a"}]}`,
-		`{"reason":"untrusted_issuer","retryable":false,"findings":{"code":"a"}}`,
 		`{"reason":"untrusted_issuer","retryable":null}`,
 	} {
 		if _, ok, err := ParseUntrustedIssuerData(json.RawMessage(raw)); !ok || !errors.Is(err, ErrEntitlement) {
@@ -244,13 +275,13 @@ func TestEntitlementParsersRefuseAMessageMember(t *testing.T) {
 	if _, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(payload)); !ok || !errors.Is(err, ErrEntitlement) {
 		t.Errorf("payload: ok=%v err=%v", ok, err)
 	}
-	refusal := `{"reason":"untrusted_issuer","retryable":false,"findings":[` + finding + `]}`
-	if _, ok, err := ParseUntrustedIssuerData(json.RawMessage(refusal)); !ok || !errors.Is(err, ErrEntitlement) {
-		t.Errorf("refusal: ok=%v err=%v", ok, err)
+	refusal := `{"retryable":false,"findings":[` + finding + `]}`
+	if _, err := ParseIssuerNotEntitledData(json.RawMessage(refusal)); !errors.Is(err, ErrEntitlement) {
+		t.Errorf("refusal: err=%v", err)
 	}
 	// Other extension members of a finding are ignored.
 	other := `{"code":"no_access_certificate","x_other":1}`
-	if _, _, err := ParseUntrustedIssuerData(json.RawMessage(`{"reason":"untrusted_issuer","retryable":false,"findings":[` + other + `]}`)); err != nil {
+	if _, err := ParseIssuerNotEntitledData(json.RawMessage(`{"retryable":false,"findings":[` + other + `]}`)); err != nil {
 		t.Errorf("extension member refused: %v", err)
 	}
 }

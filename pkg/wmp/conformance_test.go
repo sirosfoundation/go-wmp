@@ -148,6 +148,7 @@ func knownErrors() map[int]bool {
 		wmp.ErrAssuranceLevelUnsupported:  true,
 		wmp.ErrPolicyUnsupported:          true,
 		wmp.ErrPlaintextHashMismatch:      true,
+		wmp.ErrIssuerNotEntitled:          true,
 	}
 }
 
@@ -559,20 +560,30 @@ func TestConformanceIssuerEntitlement(t *testing.T) {
 				if err := json.Unmarshal(msg.Params, &ps); err != nil {
 					t.Fatal(err)
 				}
-				d, ok, err := openid4x.ParseUntrustedIssuerData(ps.Data)
-				if err != nil || !ok || ps.Code != wmp.ErrFlowError || ps.Message != wmp.ErrorMessage(wmp.ErrFlowError) {
-					t.Fatalf("error refused: ok=%v err=%v code=%d message=%q", ok, err, ps.Code, ps.Message)
+				var got any
+				if ps.Code == wmp.ErrIssuerNotEntitled {
+					d, err := openid4x.ParseIssuerNotEntitledData(ps.Data)
+					if err != nil || ps.Message != openid4x.IssuerNotEntitledMessage {
+						t.Fatalf("-31020 refused: err=%v message=%q", err, ps.Message)
+					}
+					built, err := openid4x.NewIssuerNotEntitledData(d.Findings)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got = built
+				} else {
+					_, ok, err := openid4x.ParseUntrustedIssuerData(ps.Data)
+					if err != nil || !ok || ps.Code != wmp.ErrFlowError || ps.Message != wmp.ErrorMessage(wmp.ErrFlowError) {
+						t.Fatalf("error refused: ok=%v err=%v code=%d message=%q", ok, err, ps.Code, ps.Message)
+					}
+					got = openid4x.NewUntrustedIssuerData()
 				}
-				built, err := openid4x.NewUntrustedIssuerData(d.Findings)
-				if err != nil {
-					t.Fatal(err)
-				}
-				got, _ := json.Marshal(built)
+				gotJSON, _ := json.Marshal(got)
 				var a, b map[string]any
-				_ = json.Unmarshal(got, &a)
+				_ = json.Unmarshal(gotJSON, &a)
 				_ = json.Unmarshal(ps.Data, &b)
 				if !reflect.DeepEqual(a, b) {
-					t.Errorf("built %s, vector %s", got, ps.Data)
+					t.Errorf("built %s, vector %s", gotJSON, ps.Data)
 				}
 			}
 		})
