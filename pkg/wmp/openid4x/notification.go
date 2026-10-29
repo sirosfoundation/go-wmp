@@ -85,14 +85,14 @@ func ParseCredentialNotificationStart(params json.RawMessage, events []string) (
 	if err := json.Unmarshal(params, &m); err != nil || m == nil {
 		return nil, notificationMemberError("issuance_flow_id")
 	}
-	str := func(name string, required bool, max int) (string, bool) {
+	str := func(name string, required bool, limit int) (string, bool) {
 		raw, ok := m[name]
 		if !ok {
 			return "", !required
 		}
 		// An explicit null is not a string (Unmarshal would leave it empty).
 		var s string
-		if !isNotNull(raw) || json.Unmarshal(raw, &s) != nil || utf8.RuneCountInString(s) > max || (required && s == "") {
+		if !isNotNull(raw) || json.Unmarshal(raw, &s) != nil || utf8.RuneCountInString(s) > limit || (required && s == "") {
 			return "", false
 		}
 		return s, true
@@ -145,27 +145,36 @@ func printableASCII(s string) bool {
 func NotificationStartMiddleware(events func() []string) wmp.Middleware {
 	return func(ctx context.Context, method string, params json.RawMessage, next wmp.MiddlewareFunc) (interface{}, error) {
 		if method == wmp.MethodFlowStart {
-			var ps struct {
-				FlowType string          `json:"flow_type"`
-				Params   json.RawMessage `json:"params"`
-			}
-			if json.Unmarshal(params, &ps) == nil && ps.FlowType == FlowTypeCredentialNotification {
-				// An AsyncFlowProfile does not consult RequiredCapability, so the
-				// negotiated capability is checked here (Section 2.4).
-				if sess := wmp.SessionFromContext(ctx); sess == nil || !sess.HasCapability(CapabilityCredentialNotification) {
-					return nil, wmp.NewUnsupportedError(FlowTypeCredentialNotification, map[string]any{"capability": CapabilityCredentialNotification})
-				}
-				var offered []string
-				if events != nil {
-					offered = events()
-				}
-				if _, err := ParseCredentialNotificationStart(ps.Params, offered); err != nil {
-					return nil, err
-				}
+			if err := checkNotificationStart(ctx, params, events); err != nil {
+				return nil, err
 			}
 		}
 		return next(ctx, method, params)
 	}
+}
+
+// checkNotificationStart refuses a wmp.flow.start of a credential_notification
+// flow whose session did not negotiate the capability, or whose params are
+// invalid. It returns nil for every other start.
+func checkNotificationStart(ctx context.Context, params json.RawMessage, events func() []string) *wmp.RPCError {
+	var ps struct {
+		FlowType string          `json:"flow_type"`
+		Params   json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(params, &ps) != nil || ps.FlowType != FlowTypeCredentialNotification {
+		return nil
+	}
+	// An AsyncFlowProfile does not consult RequiredCapability, so the
+	// negotiated capability is checked here (Section 2.4).
+	if sess := wmp.SessionFromContext(ctx); sess == nil || !sess.HasCapability(CapabilityCredentialNotification) {
+		return wmp.NewUnsupportedError(FlowTypeCredentialNotification, map[string]any{"capability": CapabilityCredentialNotification})
+	}
+	var offered []string
+	if events != nil {
+		offered = events()
+	}
+	_, err := ParseCredentialNotificationStart(ps.Params, offered)
+	return err
 }
 
 // NotificationRequest is what a NotificationForwarder is asked to forward.
