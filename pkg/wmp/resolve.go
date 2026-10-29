@@ -23,9 +23,10 @@ var vctmMembers = []struct {
 	{"name", true}, {"description", true}, {"display", false}, {"claims", false}, {"schema", false},
 }
 
-// ErrVCTMNotObject is returned by ProjectVCTM for a document that is not a JSON
-// object, or whose vct, name or description is not a string.
-var ErrVCTMNotObject = errors.New("wmp: type metadata is not a JSON object")
+// ErrVCTMInvalid is returned by ProjectVCTM for a type metadata document that
+// cannot be carried: it is not a JSON object, its vct, name or description is
+// not a string, or it names no vct and the uri is empty.
+var ErrVCTMInvalid = errors.New("wmp: invalid type metadata document")
 
 // ProjectVCTM reduces a type metadata document to the members a vctm
 // resolution carries: vct (set to uri when the document has none), and name,
@@ -35,20 +36,20 @@ var ErrVCTMNotObject = errors.New("wmp: type metadata is not a JSON object")
 func ProjectVCTM(doc []byte, uri string) (json.RawMessage, error) {
 	var all map[string]json.RawMessage
 	if err := json.Unmarshal(doc, &all); err != nil || all == nil {
-		return nil, ErrVCTMNotObject
+		return nil, ErrVCTMInvalid
 	}
 	vct := uri
 	if raw, ok := all["vct"]; ok && !isJSONNull(raw) {
 		var s string
 		if err := json.Unmarshal(raw, &s); err != nil {
-			return nil, ErrVCTMNotObject
+			return nil, ErrVCTMInvalid
 		}
 		if s != "" {
 			vct = s
 		}
 	}
 	if vct == "" {
-		return nil, ErrVCTMNotObject
+		return nil, ErrVCTMInvalid
 	}
 	var out bytes.Buffer
 	out.WriteString(`{"vct":`)
@@ -65,7 +66,7 @@ func ProjectVCTM(doc []byte, uri string) (json.RawMessage, error) {
 			}
 			var str string
 			if json.Unmarshal(raw, &str) != nil {
-				return nil, ErrVCTMNotObject
+				return nil, ErrVCTMInvalid
 			}
 		}
 		k, _ := json.Marshal(m.name)

@@ -54,8 +54,8 @@ func TestProjectVCTMRefusesNonObjects(t *testing.T) {
 	for _, doc := range []string{`[]`, `"x"`, `null`, `42`, `{"vct":7}`, ``, `{`,
 		// name and description are strings, or the metadata would fail its own schema
 		`{"vct":"v","name":42}`, `{"vct":"v","description":{}}`, `{"vct":"v","name":["n"]}`} {
-		if _, err := ProjectVCTM([]byte(doc), "https://c.example/id"); !errors.Is(err, ErrVCTMNotObject) {
-			t.Errorf("%q: err = %v, want ErrVCTMNotObject", doc, err)
+		if _, err := ProjectVCTM([]byte(doc), "https://c.example/id"); !errors.Is(err, ErrVCTMInvalid) {
+			t.Errorf("%q: err = %v, want ErrVCTMInvalid", doc, err)
 		}
 	}
 	if _, err := ProjectVCTM([]byte(`{"name":"N"}`), ""); err == nil {
