@@ -78,18 +78,26 @@ func TestValidateCompletionResult(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateCompletionResult(json.RawMessage(tt.result))
-			if tt.ok && err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if !tt.ok {
-				if err == nil {
-					t.Fatal("non-conforming result accepted")
+			if tt.ok {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
 				}
-				if !errors.Is(err, ErrCompletionResult) {
-					t.Fatalf("error does not wrap ErrCompletionResult: %v", err)
-				}
+				return
 			}
+			requireCompletionRefusal(t, err)
 		})
+	}
+}
+
+// requireCompletionRefusal asserts that err refuses a non-conforming result
+// with an error wrapping ErrCompletionResult.
+func requireCompletionRefusal(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("non-conforming result accepted")
+	}
+	if !errors.Is(err, ErrCompletionResult) {
+		t.Fatalf("error does not wrap ErrCompletionResult: %v", err)
 	}
 }
 
