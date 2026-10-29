@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"time"
 	"unicode/utf8"
 
@@ -115,16 +116,14 @@ func ParseCredentialNotificationStart(params json.RawMessage, events []string) (
 	return &out, nil
 }
 
+// eventOffered reports whether event is one of the two events the profile
+// defines (Section 3.4.1) and one the orchestrator forwards (events, both when
+// empty). The schema's enum is the same set.
 func eventOffered(event string, events []string) bool {
-	if len(events) == 0 {
-		events = DefaultNotificationEvents()
+	if !slices.Contains(DefaultNotificationEvents(), event) {
+		return false
 	}
-	for _, e := range events {
-		if e == event {
-			return true
-		}
-	}
-	return false
+	return len(events) == 0 || slices.Contains(events, event)
 }
 
 func printableASCII(s string) bool {

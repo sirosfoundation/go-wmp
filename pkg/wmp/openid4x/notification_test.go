@@ -88,6 +88,7 @@ func TestParseCredentialNotificationStartRefusals(t *testing.T) {
 		{"long notification_id", func(m map[string]any) { m["notification_id"] = long(257) }, nil, "notification_id"},
 		{"no event", func(m map[string]any) { delete(m, "event") }, nil, "event"},
 		{"unoffered event", func(m map[string]any) { m["event"] = "credential_deleted" }, nil, "event"},
+		{"event the capability lists but the profile does not define", func(m map[string]any) { m["event"] = "credential_deleted" }, []string{"credential_deleted"}, "event"},
 		{"event not in the capability list", func(m map[string]any) { m["event"] = "credential_failure" }, []string{"credential_accepted"}, "event"},
 		{"long description", func(m map[string]any) { m["event_description"] = long(513) }, nil, "event_description"},
 		{"non-ascii description", func(m map[string]any) { m["event_description"] = "café" }, nil, "event_description"},
