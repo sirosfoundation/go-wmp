@@ -176,27 +176,90 @@ func NewIssuerEntitlementPayload(issuer string, e IssuerEntitlement) (*IssuerEnt
 	return &IssuerEntitlementPayload{Evaluated: true, Issuer: issuer, IssuerEntitlement: e}, nil
 }
 
+// members decodes a JSON object into its members by exact name. A struct decode
+// would also match a member whose name differs only in case ("ISSUER" for
+// "issuer"), which would let a mis-cased member stand in for a missing one.
+func members(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil || m == nil {
+		return nil, false
+	}
+	return m, true
+}
+
+// member decodes the member name of m into v. It reports false for an absent
+// member and for an explicit null.
+func member(m map[string]json.RawMessage, name string, v any) bool {
+	raw, ok := m[name]
+	return ok && isNotNull(raw) && json.Unmarshal(raw, v) == nil
+}
+
+// decodeFindings decodes a findings array by exact member names. An element
+// with no code is kept with an empty Code, which validateFindings refuses.
+func decodeFindings(raw json.RawMessage) ([]EntitlementFinding, error) {
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return nil, entitlementErr("findings is not an array")
+	}
+	out := make([]EntitlementFinding, 0, len(items))
+	for _, it := range items {
+		m, ok := members(it)
+		if !ok {
+			return nil, entitlementErr("a finding is not an object")
+		}
+		var f EntitlementFinding
+		member(m, "code", &f.Code)
+		member(m, "credential_type", &f.CredentialType)
+		out = append(out, f)
+	}
+	return out, nil
+}
+
+// decodeEntitlement decodes an issuer_entitlement object by exact member names.
+func decodeEntitlement(raw json.RawMessage) (IssuerEntitlement, error) {
+	m, ok := members(raw)
+	if !ok {
+		return IssuerEntitlement{}, entitlementErr("issuer_entitlement is not an object")
+	}
+	var e IssuerEntitlement
+	if !member(m, "allowed", &e.Allowed) || !member(m, "mode", &e.Mode) || !member(m, "evaluated", &e.Evaluated) {
+		return IssuerEntitlement{}, entitlementErr("issuer_entitlement lacks allowed, mode or evaluated")
+	}
+	if raw, ok := m["findings"]; ok && isNotNull(raw) {
+		f, err := decodeFindings(raw)
+		if err != nil {
+			return IssuerEntitlement{}, err
+		}
+		e.Findings = f
+	}
+	if raw, ok := m["entitlements"]; ok && isNotNull(raw) && json.Unmarshal(raw, &e.Entitlements) != nil {
+		return IssuerEntitlement{}, entitlementErr("entitlements is not an array of strings")
+	}
+	return e, nil
+}
+
 // ParseIssuerEntitlementPayload decodes and validates the payload of a
 // trust_evaluated progress. ok is false, with a nil error, when the payload
 // does not carry issuer_entitlement_evaluated true: it is an ordinary trust
 // payload. Members it does not know are ignored (Core Section 9.5).
 func ParseIssuerEntitlementPayload(payload json.RawMessage) (p *IssuerEntitlementPayload, ok bool, err error) {
-	var probe struct {
-		Evaluated bool `json:"issuer_entitlement_evaluated"`
-	}
-	if json.Unmarshal(payload, &probe) != nil || !probe.Evaluated {
+	m, isObject := members(payload)
+	var evaluated bool
+	if !isObject || !member(m, "issuer_entitlement_evaluated", &evaluated) || !evaluated {
 		return nil, false, nil
 	}
-	var out IssuerEntitlementPayload
-	if err := json.Unmarshal(payload, &out); err != nil {
-		return nil, true, entitlementErr("payload is not of the form of Section 7.8")
+	out := IssuerEntitlementPayload{Evaluated: true}
+	if !member(m, "issuer", &out.Issuer) || out.Issuer == "" || len(out.Issuer) > MaxIssuerLen {
+		return nil, true, entitlementErr("issuer is missing or exceeds %d", MaxIssuerLen)
 	}
-	if out.Issuer == "" || len(out.Issuer) > MaxIssuerLen {
-		return nil, true, entitlementErr("issuer is empty or exceeds %d", MaxIssuerLen)
-	}
-	if err := out.IssuerEntitlement.Validate(); err != nil {
+	ent, err := decodeEntitlement(m["issuer_entitlement"])
+	if err != nil {
 		return nil, true, err
 	}
+	if err := ent.Validate(); err != nil {
+		return nil, true, err
+	}
+	out.IssuerEntitlement = ent
 	return &out, true, nil
 }
 
@@ -221,21 +284,27 @@ func NewUntrustedIssuerData(findings []EntitlementFinding) (*UntrustedIssuerData
 // ParseUntrustedIssuerData decodes and validates the data of a flow error. ok is
 // false, with a nil error, when its reason is not untrusted_issuer.
 func ParseUntrustedIssuerData(data json.RawMessage) (d *UntrustedIssuerData, ok bool, err error) {
-	var probe struct {
-		Reason string `json:"reason"`
-	}
-	if json.Unmarshal(data, &probe) != nil || probe.Reason != ReasonUntrustedIssuer {
+	m, isObject := members(data)
+	var reason string
+	if !isObject || !member(m, "reason", &reason) || reason != ReasonUntrustedIssuer {
 		return nil, false, nil
 	}
-	var out UntrustedIssuerData
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, true, entitlementErr("data is not of the form of Section 3.1.6")
+	out := UntrustedIssuerData{Reason: reason}
+	if !member(m, "retryable", &out.Retryable) {
+		return nil, true, entitlementErr("retryable is missing or not a boolean")
 	}
 	if out.Retryable {
 		return nil, true, entitlementErr("an untrusted_issuer refusal is not retryable")
 	}
-	if err := validateFindings(out.Findings); err != nil {
-		return nil, true, err
+	if raw, present := m["findings"]; present && isNotNull(raw) {
+		f, err := decodeFindings(raw)
+		if err != nil {
+			return nil, true, err
+		}
+		if err := validateFindings(f); err != nil {
+			return nil, true, err
+		}
+		out.Findings = f
 	}
 	return &out, true, nil
 }

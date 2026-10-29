@@ -54,6 +54,7 @@ func TestIssuerEntitlementValidate(t *testing.T) {
 		"mode empty":            func(e *IssuerEntitlement) { e.Mode = "" },
 		"code empty":            func(e *IssuerEntitlement) { e.Findings[0].Code = "" },
 		"code upper case":       func(e *IssuerEntitlement) { e.Findings[0].Code = "No_Access" },
+		"code trailing newline": func(e *IssuerEntitlement) { e.Findings[0].Code = "no_access_certificate\n" },
 		"code with space":       func(e *IssuerEntitlement) { e.Findings[0].Code = "no access" },
 		"code starts with 1":    func(e *IssuerEntitlement) { e.Findings[0].Code = "1a" },
 		"code too long":         func(e *IssuerEntitlement) { e.Findings[0].Code = strings.Repeat("a", 65) },
@@ -194,5 +195,45 @@ func TestUntrustedIssuerData(t *testing.T) {
 		if _, ok, err := ParseUntrustedIssuerData(json.RawMessage(raw)); !ok || !errors.Is(err, ErrEntitlement) {
 			t.Errorf("%s: ok=%v err=%v", raw, ok, err)
 		}
+	}
+}
+
+func TestEntitlementParsersMatchMemberNamesExactly(t *testing.T) {
+	// A member whose name differs only in case is a different member: it neither
+	// satisfies a required one nor overrides it.
+	for _, raw := range []string{
+		`{"ISSUER_ENTITLEMENT_EVALUATED":true,"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true}}`,
+	} {
+		if p, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(raw)); p != nil || ok || err != nil {
+			t.Errorf("%s: %v %v %v", raw, p, ok, err)
+		}
+	}
+	for _, raw := range []string{
+		`{"issuer_entitlement_evaluated":true,"ISSUER":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true}}`,
+		`{"issuer_entitlement_evaluated":true,"issuer":"i","ISSUER_ENTITLEMENT":{"allowed":true,"mode":"warn","evaluated":true}}`,
+		`{"issuer_entitlement_evaluated":true,"issuer":"i","issuer_entitlement":{"Allowed":true,"mode":"warn","evaluated":true}}`,
+		`{"issuer_entitlement_evaluated":true,"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true,"findings":[{"CODE":"no_access_certificate"}]}}`,
+	} {
+		if _, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(raw)); !ok || !errors.Is(err, ErrEntitlement) {
+			t.Errorf("%s: ok=%v err=%v", raw, ok, err)
+		}
+	}
+	if d, ok, err := ParseUntrustedIssuerData(json.RawMessage(`{"REASON":"untrusted_issuer","retryable":false}`)); d != nil || ok || err != nil {
+		t.Errorf("mis-cased reason: %v %v %v", d, ok, err)
+	}
+	for _, raw := range []string{
+		`{"reason":"untrusted_issuer","RETRYABLE":false}`,
+		`{"reason":"untrusted_issuer","retryable":false,"findings":[{"Code":"a"}]}`,
+		`{"reason":"untrusted_issuer","retryable":false,"findings":{"code":"a"}}`,
+		`{"reason":"untrusted_issuer","retryable":null}`,
+	} {
+		if _, ok, err := ParseUntrustedIssuerData(json.RawMessage(raw)); !ok || !errors.Is(err, ErrEntitlement) {
+			t.Errorf("%s: ok=%v err=%v", raw, ok, err)
+		}
+	}
+	// An explicit null findings or entitlements is absent.
+	p, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(`{"issuer_entitlement_evaluated":true,"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true,"findings":null,"entitlements":null}}`))
+	if err != nil || !ok || p.IssuerEntitlement.Findings != nil {
+		t.Errorf("null lists: %+v %v %v", p, ok, err)
 	}
 }
