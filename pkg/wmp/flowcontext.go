@@ -329,6 +329,13 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 	if sess := SessionFromContext(ctx); sess != nil {
 		sessionID = sess.ID
 	}
+	// A start that names no session belongs to the peer's own (the session
+	// its identity names), as the Peer binds its route.
+	if sessionID == "" {
+		if d, ok := p.peerFor(ctx).(interface{ defaultSessionID() string }); ok {
+			sessionID = d.defaultSessionID()
+		}
+	}
 	// The peer the start was dispatched on, which a profile shared by several
 	// peers cannot take from its own field: the flow's messages, its sub-flow
 	// claims and its lifetime are that peer's.
@@ -490,7 +497,7 @@ func (p *AsyncFlowProfile) CancelFlow(flowID string) {
 
 // CancelSessionFlow cancels the flow flowID of the session sessionID only.
 func (p *AsyncFlowProfile) CancelSessionFlow(sessionID, flowID string) {
-	p.cancelMatching(func(fc *FlowContext) bool { return fc.FlowID == flowID && fc.sessionID == sessionID })
+	p.cancelMatching(func(fc *FlowContext) bool { return fc.FlowID == flowID && fc.effectiveSession() == sessionID })
 }
 
 func (p *AsyncFlowProfile) cancelMatching(match func(*FlowContext) bool) {
