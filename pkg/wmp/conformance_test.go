@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -147,6 +148,7 @@ func knownErrors() map[int]bool {
 		wmp.ErrAssuranceLevelUnsupported:  true,
 		wmp.ErrPolicyUnsupported:          true,
 		wmp.ErrPlaintextHashMismatch:      true,
+		wmp.ErrIssuerNotEntitled:          true,
 	}
 }
 
@@ -514,6 +516,97 @@ func TestConformanceMethodCoverage(t *testing.T) {
 		if !methods[m] {
 			t.Errorf("Vector method %q not in known method constants", m)
 		}
+	}
+}
+
+// TestConformanceIssuerEntitlement runs the issuer entitlement vectors (WMP
+// OpenID4x 3.1.6 and 7.8) of flow-lifecycle.json against the validators.
+func TestConformanceIssuerEntitlement(t *testing.T) {
+	var ran int
+	for _, v := range loadVectors(t, "flow-lifecycle.json") {
+		if !strings.HasPrefix(v.ID, "flow-vci-issuer-entitlement-") && !strings.HasPrefix(v.ID, "flow-vci-refused-") {
+			continue
+		}
+		ran++
+		t.Run(v.ID, func(t *testing.T) {
+			var msg genericRPC
+			if err := json.Unmarshal(v.Input, &msg); err != nil {
+				t.Fatal(err)
+			}
+			switch msg.Method {
+			case wmp.MethodFlowProgress:
+				checkEntitlementProgressVector(t, msg.Params)
+			case wmp.MethodFlowError:
+				checkRefusalVector(t, msg.Params)
+			}
+		})
+	}
+	if ran == 0 {
+		t.Skip("no issuer entitlement vectors in this checkout of the spec")
+	}
+}
+
+// sameJSON reports whether built, marshaled, is the same JSON value as vector.
+func sameJSON(t *testing.T, built any, vector json.RawMessage) bool {
+	t.Helper()
+	got, err := json.Marshal(built)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var a, b any
+	if json.Unmarshal(got, &a) != nil || json.Unmarshal(vector, &b) != nil {
+		t.Fatalf("not JSON: %s / %s", got, vector)
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+func checkEntitlementProgressVector(t *testing.T, params json.RawMessage) {
+	t.Helper()
+	var ps wmp.FlowProgressParams
+	if err := json.Unmarshal(params, &ps); err != nil {
+		t.Fatal(err)
+	}
+	p, ok, err := openid4x.ParseIssuerEntitlementPayload(ps.Payload)
+	if err != nil || !ok || ps.Step != openid4x.StepTrustEvaluated {
+		t.Fatalf("payload refused: ok=%v err=%v step=%s", ok, err, ps.Step)
+	}
+	// What this library sends for the same result is the vector's payload.
+	built, err := openid4x.NewIssuerEntitlementPayload(p.Issuer, p.IssuerEntitlement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameJSON(t, built, ps.Payload) {
+		t.Errorf("built payload differs from the vector %s", ps.Payload)
+	}
+}
+
+// checkRefusalVector checks the -31020 and -31006 refusals of an oid4vci flow.
+func checkRefusalVector(t *testing.T, params json.RawMessage) {
+	t.Helper()
+	var ps wmp.FlowErrorParams
+	if err := json.Unmarshal(params, &ps); err != nil {
+		t.Fatal(err)
+	}
+	if ps.Code == wmp.ErrIssuerNotEntitled {
+		d, err := openid4x.ParseIssuerNotEntitledData(ps.Data)
+		if err != nil || ps.Message != openid4x.IssuerNotEntitledMessage {
+			t.Fatalf("-31020 refused: err=%v message=%q", err, ps.Message)
+		}
+		built, err := openid4x.NewIssuerNotEntitledData(d.Findings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !sameJSON(t, built, ps.Data) {
+			t.Errorf("built data differs from the vector %s", ps.Data)
+		}
+		return
+	}
+	_, ok, err := openid4x.ParseUntrustedIssuerData(ps.Data)
+	if err != nil || !ok || ps.Code != wmp.ErrFlowError || ps.Message != wmp.ErrorMessage(wmp.ErrFlowError) {
+		t.Fatalf("error refused: ok=%v err=%v code=%d message=%q", ok, err, ps.Code, ps.Message)
+	}
+	if !sameJSON(t, openid4x.NewUntrustedIssuerData(), ps.Data) {
+		t.Errorf("built data differs from the vector %s", ps.Data)
 	}
 }
 
