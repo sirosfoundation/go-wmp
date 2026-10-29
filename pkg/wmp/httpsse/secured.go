@@ -730,47 +730,7 @@ func (h *ServerHandler) Close(ctx context.Context) error {
 	}
 	h.mu.Lock()
 	if !st.closed {
-		st.closed = true
-		sessions := h.sessions
-		h.sessions = make(map[string]*serverSession)
-		st.drained = make(chan struct{})
-		// Sessions being retired or built by other callers are waited for too.
-		var pending []chan struct{}
-		for _, b := range st.building {
-			pending = append(pending, b.done)
-		}
-		close(st.stop)
-		// Barriers for the sessions Close retires, like Drop's: a concurrent
-		// forget waits for their broadcasters instead of dropping the log and
-		// tracker under them.
-		barriers := make(map[string]*build, len(sessions))
-		for id := range sessions {
-			b := &build{done: make(chan struct{})}
-			st.building[id] = b
-			barriers[id] = b
-		}
-		go func() {
-			for _, s := range sessions {
-				s.close()
-			}
-			// Their broadcasters finish appending what they accepted before the
-			// shutdown counts as done.
-			for _, s := range sessions {
-				<-s.stopped
-			}
-			h.mu.Lock()
-			for id, b := range barriers {
-				delete(st.building, id)
-				close(b.done)
-			}
-			h.mu.Unlock()
-			for _, done := range pending {
-				<-done
-			}
-			st.sweepWG.Wait()
-			st.inflight.Wait()
-			close(st.drained)
-		}()
+		h.startShutdownLocked()
 	}
 	drained := st.drained
 	h.mu.Unlock()
@@ -781,6 +741,57 @@ func (h *ServerHandler) Close(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// startShutdownLocked marks the handler closed and starts the drain; h.mu must
+// be held. Barriers are put in front of the sessions it retires, like Drop's: a
+// concurrent forget waits for their broadcasters instead of dropping the log
+// and tracker under them. Sessions being retired or built by other callers are
+// waited for too.
+func (h *ServerHandler) startShutdownLocked() {
+	st := h.secured
+	st.closed = true
+	sessions := h.sessions
+	h.sessions = make(map[string]*serverSession)
+	st.drained = make(chan struct{})
+	var pending []chan struct{}
+	for _, b := range st.building {
+		pending = append(pending, b.done)
+	}
+	close(st.stop)
+	barriers := make(map[string]*build, len(sessions))
+	for id := range sessions {
+		b := &build{done: make(chan struct{})}
+		st.building[id] = b
+		barriers[id] = b
+	}
+	go func() {
+		for _, s := range sessions {
+			s.close()
+		}
+		// Their broadcasters finish appending what they accepted before the
+		// shutdown counts as done.
+		for _, s := range sessions {
+			<-s.stopped
+		}
+		h.releaseBarriers(barriers)
+		for _, done := range pending {
+			<-done
+		}
+		st.sweepWG.Wait()
+		st.inflight.Wait()
+		close(st.drained)
+	}()
+}
+
+// releaseBarriers lets forget and replacements proceed for the retired sessions.
+func (h *ServerHandler) releaseBarriers(barriers map[string]*build) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for id, b := range barriers {
+		delete(h.secured.building, id)
+		close(b.done)
 	}
 }
 
