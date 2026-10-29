@@ -94,7 +94,9 @@ type StreamConfig struct {
 	MaxFlows int
 	// ClientBuffer is how many events may queue for one attached stream
 	// before it counts as too slow and is closed (the client reconnects with
-	// its cursor). Default 256.
+	// its cursor). A resume re-sends up to MaxFlows notifications in a burst, so
+	// the default is 256 + MaxFlows; a smaller explicit value can overflow a
+	// client that is reading continuously.
 	ClientBuffer int
 	// Log is the event log. Default: NewMemoryEventLog(MaxEvents, MaxEventBytes).
 	Log EventLog
@@ -122,7 +124,7 @@ func (c *StreamConfig) applyDefaults() {
 		c.MaxFlows = defaultMaxFlows
 	}
 	if c.ClientBuffer <= 0 {
-		c.ClientBuffer = defaultClientBuffer
+		c.ClientBuffer = defaultClientBuffer + c.MaxFlows
 	}
 	if c.Log == nil {
 		c.Log = NewMemoryEventLog(c.MaxEvents, c.MaxEventBytes)

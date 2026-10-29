@@ -1349,3 +1349,67 @@ func TestServerCloseWaitsForARetirementUnderWay(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Close puts a barrier in front of the sessions it retires: a forget that runs
+// meanwhile waits for their broadcasters.
+func TestForgetDuringCloseWaitsForTheBroadcaster(t *testing.T) {
+	var spy *hookLog
+	f := newSecuredFixture(t, func(c *ServerConfig) {
+		spy = &hookLog{EventLog: NewMemoryEventLog(10, 0), appended: make(chan struct{}, 1), release: make(chan struct{})}
+		c.Stream.Log = spy
+	})
+	sid, _ := f.create("Bearer alice")
+	spy.arm()
+	f.emit(sid, progress(sid, "f", "s1"))
+	<-spy.appended
+	closed := make(chan error, 1)
+	go func() { closed <- f.h.Close(context.Background()) }()
+	waitFor(t, "Close to take the session out", func() bool {
+		f.h.mu.RLock()
+		defer f.h.mu.RUnlock()
+		return f.h.secured.closed && len(f.h.sessions) == 0
+	})
+	forgotten := make(chan struct{})
+	go func() { f.h.forget(sid); close(forgotten) }()
+	select {
+	case <-forgotten:
+		t.Fatal("forget returned while the session's broadcaster was still appending")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(spy.release)
+	<-forgotten
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := spy.After(sid, ""); found {
+		t.Fatal("the log kept events of a forgotten session")
+	}
+}
+
+func TestDefaultClientBufferHoldsAResumeBurst(t *testing.T) {
+	c := StreamConfig{MaxFlows: 700}
+	c.applyDefaults()
+	if c.ClientBuffer < c.MaxFlows+defaultClientBuffer {
+		t.Fatalf("default ClientBuffer %d cannot hold a resume burst of %d plus live events", c.ClientBuffer, c.MaxFlows)
+	}
+	explicit := StreamConfig{MaxFlows: 700, ClientBuffer: 3}
+	explicit.applyDefaults()
+	if explicit.ClientBuffer != 3 {
+		t.Fatalf("an explicit ClientBuffer was changed to %d", explicit.ClientBuffer)
+	}
+}
+
+func TestResumeBurstReachesAContinuouslyReadingClient(t *testing.T) {
+	f := newSecuredFixture(t, func(c *ServerConfig) { c.Stream.MaxEvents = 5000 })
+	sid, token := f.create("Bearer alice")
+	const flows = 900
+	for i := 0; i < flows; i++ {
+		f.emit(sid, progress(sid, fmt.Sprintf("f%d", i), "s"))
+	}
+	f.waitLogged(sid, flows)
+	c, _ := f.open(sid, nil, "")
+	if r := f.post("Bearer alice", nil, rpc("r1", wmp.MethodSessionResume, sid, map[string]any{"session_id": sid, "resumption_token": token})); rpcCode(r) != 0 {
+		t.Fatalf("resume: %s", r.Raw)
+	}
+	c.waitEvents(t, flows)
+}

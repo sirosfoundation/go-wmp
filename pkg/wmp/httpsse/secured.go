@@ -740,6 +740,15 @@ func (h *ServerHandler) Close(ctx context.Context) error {
 			pending = append(pending, b.done)
 		}
 		close(st.stop)
+		// Barriers for the sessions Close retires, like Drop's: a concurrent
+		// forget waits for their broadcasters instead of dropping the log and
+		// tracker under them.
+		barriers := make(map[string]*build, len(sessions))
+		for id := range sessions {
+			b := &build{done: make(chan struct{})}
+			st.building[id] = b
+			barriers[id] = b
+		}
 		go func() {
 			for _, s := range sessions {
 				s.close()
@@ -749,6 +758,12 @@ func (h *ServerHandler) Close(ctx context.Context) error {
 			for _, s := range sessions {
 				<-s.stopped
 			}
+			h.mu.Lock()
+			for id, b := range barriers {
+				delete(st.building, id)
+				close(b.done)
+			}
+			h.mu.Unlock()
 			for _, done := range pending {
 				<-done
 			}
