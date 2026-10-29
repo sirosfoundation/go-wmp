@@ -43,6 +43,9 @@ const (
 	NotificationReasonBusy               = "busy"
 	NotificationReasonSigningFailed      = "signing_failed"
 	NotificationReasonForwardFailed      = "forward_failed"
+	// NotificationReasonTimeout is the reason Core 6.2 requires when the flow's
+	// own timeout expired (during signing or forwarding).
+	NotificationReasonTimeout = "timeout"
 )
 
 // NotificationStatusForwarded is the status of a successful result.
@@ -291,25 +294,41 @@ func NotificationFlow(fwd NotificationForwarder, opts NotificationFlowOptions) w
 		sign := func(ctx context.Context, car ClientAuthRequest) (string, error) {
 			return requestClientAuth(ctx, fc, car, timeout)
 		}
-		err := fwd.ForwardNotification(ctx, req, sign)
-		// A flow that was cancelled (by the wallet or the end of the peer) is
-		// over: it sends no terminal message, whatever the forwarder returned.
-		if ctx.Err() != nil || errors.Is(err, wmp.ErrSubFlowCancelled) {
-			return context.Cause(ctx)
-		}
-		if err != nil {
-			reason, retryable := NotificationFailure(err)
-			return fc.Error(ctx, wmp.ErrFlowError, wmp.ErrorMessage(wmp.ErrFlowError),
-				NotificationErrorData{Reason: reason, Retryable: retryable})
-		}
-		return fc.Complete(ctx, NotificationFlowResult{Status: NotificationStatusForwarded, NotificationID: start.NotificationID})
+		return finishNotification(ctx, fc, start.NotificationID, fwd.ForwardNotification(ctx, req, sign))
 	}
+}
+
+// finishNotification ends the flow after the forwarder returned err.
+//
+// A flow that was cancelled (by the wallet or the end of the peer) is over: it
+// sends no terminal message, whatever the forwarder returned. A flow whose own
+// deadline expired is not cancelled: Core 6.2 requires its terminal error with
+// reason timeout, sent without the expired context.
+func finishNotification(ctx context.Context, fc *wmp.FlowContext, notificationID string, err error) error {
+	expired := errors.Is(context.Cause(ctx), context.DeadlineExceeded)
+	if (ctx.Err() != nil && !expired) || errors.Is(err, wmp.ErrSubFlowCancelled) {
+		return context.Cause(ctx)
+	}
+	if expired {
+		return fc.Error(context.WithoutCancel(ctx), wmp.ErrFlowError, wmp.ErrorMessage(wmp.ErrFlowError),
+			NotificationErrorData{Reason: NotificationReasonTimeout})
+	}
+	if err != nil {
+		reason, retryable := NotificationFailure(err)
+		return fc.Error(ctx, wmp.ErrFlowError, wmp.ErrorMessage(wmp.ErrFlowError),
+			NotificationErrorData{Reason: reason, Retryable: retryable})
+	}
+	return fc.Complete(ctx, NotificationFlowResult{Status: NotificationStatusForwarded, NotificationID: notificationID})
 }
 
 // NotificationFailure maps an error of a NotificationForwarder to the reason
 // and retryable flag of the flow error.
 func NotificationFailure(err error) (reason string, retryable bool) {
 	switch {
+	// The flow's own deadline, not the orchestrator's sign timeout (which is
+	// ErrSubFlowTimeout and a signing failure).
+	case errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, wmp.ErrSubFlowTimeout):
+		return NotificationReasonTimeout, false
 	case errors.Is(err, ErrNotificationContextUnavailable):
 		return NotificationReasonContextUnavailable, false
 	case errors.Is(err, ErrNotificationBusy):

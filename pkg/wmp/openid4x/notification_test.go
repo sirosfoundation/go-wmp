@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -172,7 +173,7 @@ func newNotifyRigCaps(t *testing.T, fwd NotificationForwarder, caps wmp.Capabili
 	return newNotifyRigWith(t, fwd, NotificationFlowOptions{}, caps)
 }
 
-func newNotifyRigWith(t *testing.T, fwd NotificationForwarder, opts NotificationFlowOptions, caps wmp.Capabilities) *notifyRig {
+func newNotifyRigWith(t *testing.T, fwd NotificationForwarder, opts NotificationFlowOptions, caps wmp.Capabilities, wraps ...func(wmp.FlowFunc) wmp.FlowFunc) *notifyRig {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -195,7 +196,11 @@ func newNotifyRigWith(t *testing.T, fwd NotificationForwarder, opts Notification
 	r := &notifyRig{ctx: ctx, signs: make(chan *wmp.FlowStartParams, 8),
 		complete: make(chan *wmp.FlowCompleteParams, 8), failed: make(chan *wmp.FlowErrorParams, 8)}
 	profile := wmp.NewAsyncFlowProfile("orch")
-	profile.Handle(FlowTypeCredentialNotification, NotificationFlow(fwd, opts))
+	flow := NotificationFlow(fwd, opts)
+	for _, w := range wraps {
+		flow = w(flow)
+	}
+	profile.Handle(FlowTypeCredentialNotification, flow)
 	store := wmp.NewMemorySessionStore()
 	if err := store.Create(&wmp.Session{ID: "ses-1", Capabilities: caps}); err != nil {
 		t.Fatal(err)
@@ -313,6 +318,9 @@ func TestNotificationFlowErrorReasons(t *testing.T) {
 		{"busy", ErrNotificationBusy, "busy", true},
 		{"signing", ErrClientAuthSigning, "signing_failed", false},
 		{"forward", errors.New("issuer said 500 and some secret text"), "forward_failed", false},
+		{"deadline", fmt.Errorf("forwarding: %w", context.DeadlineExceeded), "timeout", false},
+		{"flow deadline while signing", fmt.Errorf("%w: %w", ErrClientAuthSigning, context.DeadlineExceeded), "timeout", false},
+		{"sign timeout is a signing failure", fmt.Errorf("%w: %w", ErrClientAuthSigning, wmp.ErrSubFlowTimeout), "signing_failed", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newNotifyRig(t, &fakeForwarder{err: tc.err}, NotificationFlowOptions{})
@@ -513,5 +521,38 @@ func (f *cancellingForwarder) ForwardNotification(ctx context.Context, _ Notific
 	case <-ctx.Done():
 	case <-time.After(2 * time.Second):
 	}
+	return nil
+}
+
+// A flow whose own deadline expired ends with reason timeout (Core 6.2), unlike a
+// cancelled one, which sends nothing.
+func TestNotificationFlowDeadlineSendsTimeout(t *testing.T) {
+	fwd := &deadlineForwarder{}
+	// What an embedding does to apply the flow's own timeout (Core 6.2).
+	withDeadline := func(inner wmp.FlowFunc) wmp.FlowFunc {
+		return func(ctx context.Context, fc *wmp.FlowContext) error {
+			ctx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+			defer cancel()
+			return inner(ctx, fc)
+		}
+	}
+	r := newNotifyRigWith(t, fwd, NotificationFlowOptions{}, wmp.Capabilities{CapabilityCredentialNotification: json.RawMessage(`{}`)}, withDeadline)
+	if err := r.start(startParams(t, nil)); err != nil {
+		t.Fatal(err)
+	}
+	c, e := r.terminal(t)
+	if c != nil {
+		t.Fatalf("completed: %s", c.Result)
+	}
+	if d := errorData(t, e); d.Reason != "timeout" || d.Retryable {
+		t.Errorf("data = %+v", d)
+	}
+}
+
+// deadlineForwarder blocks until its context ends, then reports success.
+type deadlineForwarder struct{}
+
+func (deadlineForwarder) ForwardNotification(ctx context.Context, _ NotificationRequest, _ ClientAuthSigner) error {
+	<-ctx.Done()
 	return nil
 }

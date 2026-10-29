@@ -689,6 +689,7 @@ func checkNotificationErrorVector(t *testing.T, params json.RawMessage) {
 	want := map[string]bool{
 		openid4x.NotificationReasonContextUnavailable: false, openid4x.NotificationReasonBusy: true,
 		openid4x.NotificationReasonSigningFailed: false, openid4x.NotificationReasonForwardFailed: false,
+		openid4x.NotificationReasonTimeout: false,
 	}
 	if r, ok := want[d.Reason]; !ok || r != d.Retryable || ps.Code != wmp.ErrFlowError || ps.Message != wmp.ErrorMessage(wmp.ErrFlowError) {
 		t.Errorf("error = %d %q %+v", ps.Code, ps.Message, d)
