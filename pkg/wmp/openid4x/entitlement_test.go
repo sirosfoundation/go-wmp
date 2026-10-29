@@ -309,3 +309,28 @@ func TestEntitlementBoundsCountCodePoints(t *testing.T) {
 		t.Error("2049 issuer characters accepted")
 	}
 }
+
+func TestEntitlementParsersRefuseMalformedKnownMembers(t *testing.T) {
+	wrap := func(findings, entitlements string) string {
+		return `{"issuer_entitlement_evaluated":true,"issuer":"i","issuer_entitlement":{"allowed":true,"mode":"warn","evaluated":true,` +
+			`"findings":` + findings + `,"entitlements":` + entitlements + `}}`
+	}
+	for name, raw := range map[string]string{
+		"code not a string":            wrap(`[{"code":7}]`, `[]`),
+		"credential_type not a string": wrap(`[{"code":"a","credential_type":{}}]`, `[]`),
+		"null element in entitlements": wrap(`[]`, `["x",null]`),
+		"number in entitlements":       wrap(`[]`, `["x",3]`),
+		"entitlements not an array":    wrap(`[]`, `"x"`),
+	} {
+		if _, ok, err := ParseIssuerEntitlementPayload(json.RawMessage(raw)); !ok || !errors.Is(err, ErrEntitlement) {
+			t.Errorf("%s: ok=%v err=%v", name, ok, err)
+		}
+	}
+	if _, err := ParseIssuerNotEntitledData(json.RawMessage(`{"retryable":false,"findings":[{"code":"a","credential_type":5}]}`)); !errors.Is(err, ErrEntitlement) {
+		t.Errorf("not-entitled with a mistyped credential_type: %v", err)
+	}
+	// An absent or null credential_type is simply absent.
+	if _, err := ParseIssuerNotEntitledData(json.RawMessage(`{"retryable":false,"findings":[{"code":"a","credential_type":null}]}`)); err != nil {
+		t.Errorf("null credential_type refused: %v", err)
+	}
+}

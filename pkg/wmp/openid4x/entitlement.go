@@ -199,6 +199,37 @@ func member(m map[string]json.RawMessage, name string, v any) bool {
 	return ok && isNotNull(raw) && json.Unmarshal(raw, v) == nil
 }
 
+// optional decodes the member name of m into v. An absent member and an
+// explicit null are absent; a present member of the wrong type is an error.
+func optional(m map[string]json.RawMessage, name string, v any) error {
+	raw, ok := m[name]
+	if !ok || !isNotNull(raw) {
+		return nil
+	}
+	if json.Unmarshal(raw, v) != nil {
+		return entitlementErr("%s has the wrong type", name)
+	}
+	return nil
+}
+
+// decodeStrings decodes an array of strings; a null element is refused (a
+// plain []string decode would turn it into an empty string).
+func decodeStrings(raw json.RawMessage) ([]string, error) {
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return nil, entitlementErr("entitlements is not an array")
+	}
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		var str string
+		if !isNotNull(it) || json.Unmarshal(it, &str) != nil {
+			return nil, entitlementErr("entitlements has an element that is not a string")
+		}
+		out = append(out, str)
+	}
+	return out, nil
+}
+
 // decodeFindings decodes a findings array by exact member names. An element
 // with no code is kept with an empty Code, which validateFindings refuses.
 func decodeFindings(raw json.RawMessage) ([]EntitlementFinding, error) {
@@ -217,8 +248,12 @@ func decodeFindings(raw json.RawMessage) ([]EntitlementFinding, error) {
 			return nil, entitlementErr("a finding carries a message member")
 		}
 		var f EntitlementFinding
-		member(m, "code", &f.Code)
-		member(m, "credential_type", &f.CredentialType)
+		if err := optional(m, "code", &f.Code); err != nil {
+			return nil, err
+		}
+		if err := optional(m, "credential_type", &f.CredentialType); err != nil {
+			return nil, err
+		}
 		out = append(out, f)
 	}
 	return out, nil
@@ -241,8 +276,12 @@ func decodeEntitlement(raw json.RawMessage) (IssuerEntitlement, error) {
 		}
 		e.Findings = f
 	}
-	if raw, ok := m["entitlements"]; ok && isNotNull(raw) && json.Unmarshal(raw, &e.Entitlements) != nil {
-		return IssuerEntitlement{}, entitlementErr("entitlements is not an array of strings")
+	if raw, ok := m["entitlements"]; ok && isNotNull(raw) {
+		ents, err := decodeStrings(raw)
+		if err != nil {
+			return IssuerEntitlement{}, err
+		}
+		e.Entitlements = ents
 	}
 	return e, nil
 }
