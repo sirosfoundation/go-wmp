@@ -378,3 +378,47 @@ func TestEntitlementParsersRefuseMalformedKnownMembers(t *testing.T) {
 		t.Errorf("null credential_type refused: %v", err)
 	}
 }
+
+func TestEntitlementFindingTextExcludesControlCharacters(t *testing.T) {
+	for _, bad := range []string{"urn:x\n", "urn:\x1bx", "urn:\x7fx", "a\u0085b", "zero\u200bwidth", "bom\ufeff", "rlo\u202e", "sep\u2028", "word\u2060joiner"} {
+		for _, f := range []EntitlementFinding{{Code: "a", CredentialType: bad}, {Code: "a", Message: bad}} {
+			e := okEntitlement()
+			e.Findings = []EntitlementFinding{f}
+			if err := e.Validate(); !errors.Is(err, ErrEntitlement) {
+				t.Errorf("%q accepted: %v", bad, err)
+			}
+			if b := e.Bounded(); b.Validate() != nil || b.Findings[0].CredentialType != "" || b.Findings[0].Message != "" {
+				t.Errorf("Bounded kept %q: %+v", bad, b.Findings)
+			}
+		}
+	}
+	// Printable text, including a no-break space and non-Latin letters, is fine.
+	e := okEntitlement()
+	e.Findings = []EntitlementFinding{{Code: "a", CredentialType: "urn:x\u00a0\u00e9\u4e2d", Message: "A fixed text."}}
+	if err := e.Validate(); err != nil {
+		t.Errorf("printable text refused: %v", err)
+	}
+}
+
+func TestIssuerEntitlementBoundedTruncationFlag(t *testing.T) {
+	valid := func(n int) []EntitlementFinding {
+		f := make([]EntitlementFinding, n)
+		for i := range f {
+			f[i] = EntitlementFinding{Code: "ok"}
+		}
+		return f
+	}
+	// An invalid finding after 16 valid ones is dropped, not "more findings than listed".
+	e := IssuerEntitlement{Mode: EntitlementModeWarn, Findings: append(valid(16), EntitlementFinding{Code: "Bad Code"})}
+	if b := e.Bounded(); b.FindingsTruncated || len(b.Findings) != 16 {
+		t.Errorf("invalid trailing finding: truncated %v, %d findings", b.FindingsTruncated, len(b.Findings))
+	}
+	// An invalid finding before them does not count against the cap.
+	e = IssuerEntitlement{Mode: EntitlementModeWarn, Findings: append([]EntitlementFinding{{Code: "Bad Code"}}, valid(16)...)}
+	if b := e.Bounded(); b.FindingsTruncated || len(b.Findings) != 16 {
+		t.Errorf("invalid leading finding: truncated %v, %d findings", b.FindingsTruncated, len(b.Findings))
+	}
+	if b := (IssuerEntitlement{Mode: EntitlementModeWarn, Findings: valid(17)}).Bounded(); !b.FindingsTruncated || len(b.Findings) != 16 {
+		t.Errorf("a 17th valid finding: truncated %v, %d findings", b.FindingsTruncated, len(b.Findings))
+	}
+}

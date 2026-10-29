@@ -94,6 +94,22 @@ type IssuerEntitlementPayload struct {
 	IssuerEntitlement IssuerEntitlement `json:"issuer_entitlement"`
 }
 
+// plainText reports whether s has none of the characters Section 7.8 excludes
+// from credential_type and message: controls (including DEL and the C1 range),
+// zero-width and bidi formatting characters, line and paragraph separators and
+// the byte order mark. It is the character class of the schema's pattern.
+func plainText(s string) bool {
+	for _, r := range s {
+		switch {
+		case r <= 0x1f, r >= 0x7f && r <= 0x9f,
+			r >= 0x200b && r <= 0x200f, r >= 0x2028 && r <= 0x202e,
+			r >= 0x2060 && r <= 0x2064, r == 0xfeff:
+			return false
+		}
+	}
+	return true
+}
+
 // chars counts Unicode code points, as the schema's maxLength does.
 func chars(s string) int { return utf8.RuneCountInString(s) }
 
@@ -125,6 +141,9 @@ func validateFindings(findings []EntitlementFinding) error {
 		if chars(f.Message) > MaxFindingMessageLen {
 			return entitlementErr("finding %d message exceeds %d", i, MaxFindingMessageLen)
 		}
+		if !plainText(f.CredentialType) || !plainText(f.Message) {
+			return entitlementErr("finding %d has control or non-printable characters", i)
+		}
 	}
 	return nil
 }
@@ -150,24 +169,25 @@ func (e IssuerEntitlement) Validate() error {
 }
 
 // Bounded returns a copy of e that satisfies the bounds: findings and
-// entitlements beyond the limits are dropped, as are a credential_type or an
-// entitlement that is too long (an identifier cut short names something else),
+// entitlements beyond the limits are dropped (the flag FindingsTruncated is set
+// only when a valid finding was cut), as are a credential_type, message or an
+// entitlement that is too long or has control characters (an identifier cut short names something else),
 // and a finding whose code is not of the defined form. Allowed, Mode and
 // Evaluated are kept.
 func (e IssuerEntitlement) Bounded() IssuerEntitlement {
 	out := IssuerEntitlement{Allowed: e.Allowed, Mode: e.Mode, Evaluated: e.Evaluated, FindingsTruncated: e.FindingsTruncated}
 	for _, f := range e.Findings {
+		if !validCode(f.Code) {
+			continue
+		}
 		if len(out.Findings) == MaxEntitlementFindings {
 			out.FindingsTruncated = true
 			break
 		}
-		if !validCode(f.Code) {
-			continue
-		}
-		if chars(f.CredentialType) > MaxCredentialTypeLen {
+		if chars(f.CredentialType) > MaxCredentialTypeLen || !plainText(f.CredentialType) {
 			f.CredentialType = ""
 		}
-		if chars(f.Message) > MaxFindingMessageLen {
+		if chars(f.Message) > MaxFindingMessageLen || !plainText(f.Message) {
 			f.Message = ""
 		}
 		out.Findings = append(out.Findings, f)
