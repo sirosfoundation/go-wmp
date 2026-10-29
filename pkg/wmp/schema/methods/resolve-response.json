@@ -10,13 +10,13 @@
     "id": { "type": ["string", "integer"] },
     "result": {
       "type": "object",
-      "required": ["wmp", "type", "uri"],
+      "required": ["wmp", "type", "uri", "metadata"],
       "properties": {
         "wmp": { "$ref": "../wmp-metadata.json" },
         "type": { "type": "string" },
         "uri": { "type": "string" },
         "metadata": {
-          "description": "Resolved metadata (null if not found)."
+          "description": "Resolved metadata; null if the resolver determined that the identifier is unknown. For type vctm: an object with vct and, optionally, name, description, display, claims and schema (WMP Core 5.8.1)."
         },
         "trust_info": {
           "type": "object",
@@ -25,7 +25,33 @@
             "source": { "type": "string" }
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "vctm" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "metadata": {
+                "oneOf": [
+                  { "type": "null" },
+                  {
+                    "type": "object",
+                    "required": ["vct"],
+                    "properties": {
+                      "vct": { "type": "string", "minLength": 1 },
+                      "name": { "type": "string" },
+                      "description": { "type": "string" },
+                      "display": {},
+                      "claims": {},
+                      "schema": {}
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }
