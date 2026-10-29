@@ -381,7 +381,7 @@ func (p *AsyncFlowProfile) StartFlow(ctx context.Context, params *FlowStartParam
 		// A flow that was cancelled (by the remote peer, CancelFlow or the
 		// peer's end) is already over: its function returning an error
 		// because of that is not a failure to report.
-		if err := fn(flowCtx, fc); err != nil && flowCtx.Err() == nil {
+		if err := fn(flowCtx, fc); err != nil && flowCtx.Err() == nil && !fc.isTerminal() {
 			fc.Error(flowCtx, ErrFlowError, err.Error(), nil)
 		}
 	}()
@@ -409,15 +409,6 @@ func (p *AsyncFlowProfile) flowOf(ctx context.Context, id string) (flowKey, *Flo
 		}
 	}
 	return key, fc
-}
-
-// endFlow takes fc out of the profile's flows, if it is still the one under key.
-func (p *AsyncFlowProfile) endFlow(key flowKey, fc *FlowContext) {
-	p.mu.Lock()
-	if p.flows[key] == fc {
-		delete(p.flows, key)
-	}
-	p.mu.Unlock()
 }
 
 func (p *AsyncFlowProfile) HandleAction(ctx context.Context, params *FlowActionParams) (*FlowActionResult, error) {
@@ -450,8 +441,7 @@ func (p *AsyncFlowProfile) HandleComplete(ctx context.Context, params *FlowCompl
 	if p.deliverSubFlow(p.keyFor(ctx, params.FlowID), subFlowOutcome{result: params.Result}) {
 		return
 	}
-	if key, fc := p.flowOf(ctx, params.FlowID); fc != nil {
-		p.endFlow(key, fc)
+	if _, fc := p.flowOf(ctx, params.FlowID); fc != nil {
 		fc.cancel()
 	}
 }
@@ -461,8 +451,7 @@ func (p *AsyncFlowProfile) HandleError(ctx context.Context, params *FlowErrorPar
 	if p.deliverSubFlow(p.keyFor(ctx, params.FlowID), subFlowOutcome{err: failure}) {
 		return
 	}
-	if key, fc := p.flowOf(ctx, params.FlowID); fc != nil {
-		p.endFlow(key, fc)
+	if _, fc := p.flowOf(ctx, params.FlowID); fc != nil {
 		fc.cancel()
 	}
 }
@@ -470,43 +459,61 @@ func (p *AsyncFlowProfile) HandleError(ctx context.Context, params *FlowErrorPar
 // HandleCancel implements FlowCanceller: a remote wmp.flow.cancel ends the
 // flow, and with it the sub-flows it is waiting for.
 func (p *AsyncFlowProfile) HandleCancel(ctx context.Context, params *FlowCancelParams) (bool, error) {
-	key, fc := p.flowOf(ctx, params.FlowID)
+	_, fc := p.flowOf(ctx, params.FlowID)
 	if fc != nil && fc.isTerminal() {
 		return false, NewRPCError(ErrFlowError, map[string]string{"reason": "already_terminal"})
 	}
-	return p.cancelFlowContext(key, fc), nil
+	return p.cancelFlowContext(fc), nil
 }
 
-// ActiveFlows returns the number of currently active flows.
+// ActiveFlows returns the number of flows that have not ended. A flow that
+// completed, failed or was cancelled stays known (and answers -31006
+// already_terminal) until its worker has exited.
 func (p *AsyncFlowProfile) ActiveFlows() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return len(p.flows)
+	n := 0
+	for _, fc := range p.flows {
+		if !fc.isTerminal() {
+			n++
+		}
+	}
+	return n
 }
 
-// CancelFlow cancels the flows with the given ID, whichever peer runs them.
+// CancelFlow cancels the flows with the given ID on every peer that runs one.
+// With a profile shared by several sessions that is rarely what is wanted:
+// CancelSessionFlow names the session.
 func (p *AsyncFlowProfile) CancelFlow(flowID string) {
+	p.cancelMatching(func(fc *FlowContext) bool { return fc.FlowID == flowID })
+}
+
+// CancelSessionFlow cancels the flow flowID of the session sessionID only.
+func (p *AsyncFlowProfile) CancelSessionFlow(sessionID, flowID string) {
+	p.cancelMatching(func(fc *FlowContext) bool { return fc.FlowID == flowID && fc.sessionID == sessionID })
+}
+
+func (p *AsyncFlowProfile) cancelMatching(match func(*FlowContext) bool) {
 	p.mu.RLock()
-	found := map[flowKey]*FlowContext{}
-	for k, fc := range p.flows {
-		if k.id == flowID {
-			found[k] = fc
+	var found []*FlowContext
+	for _, fc := range p.flows {
+		if match(fc) {
+			found = append(found, fc)
 		}
 	}
 	p.mu.RUnlock()
-	for k, fc := range found {
-		p.cancelFlowContext(k, fc)
+	for _, fc := range found {
+		p.cancelFlowContext(fc)
 	}
 }
 
 // cancelFlowContext cancels one flow instance, reporting whether there was one.
 // Its flow_id stays reserved until the worker has exited: a flow of the same ID
 // cannot start, and the old worker cannot send under it, before that.
-func (p *AsyncFlowProfile) cancelFlowContext(key flowKey, fc *FlowContext) bool {
+func (p *AsyncFlowProfile) cancelFlowContext(fc *FlowContext) bool {
 	if fc == nil {
 		return false
 	}
-	p.endFlow(key, fc)
 	fc.cancel()
 	return true
 }

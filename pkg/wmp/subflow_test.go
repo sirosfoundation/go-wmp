@@ -1735,7 +1735,9 @@ func TestCancelKeepsTheFlowIDReservedWhileItIsStopped(t *testing.T) {
 	if err := <-cancelDone; err != nil {
 		t.Fatal(err)
 	}
-	// Now the ID is free and a new flow is not touched by the finished cancel.
+	// Now the ID is free (once the cancelled worker has exited) and a new flow
+	// is not touched by the finished cancel.
+	waitFor(t, func() bool { _, owned := r.orch.registry.lookupFlowOwner("flow-p"); return !owned })
 	r.startParent(t, "flow-p")
 	time.Sleep(100 * time.Millisecond)
 	if r.profile.ActiveFlows() != 1 {
@@ -2286,7 +2288,7 @@ func TestTerminalFlowTakesNoActionsAndNoCancel(t *testing.T) {
 	}
 }
 
-func TestFallbackActionDuringStartIsAuthorizedAndWaits(t *testing.T) {
+func TestFallbackActionDuringStartIsAuthorizedAndRefused(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	h := &fallbackActionHandler{fallbackHandler: fallbackHandler{in: make(chan struct{}), release: make(chan struct{}), completes: make(chan string, 4), cancels: make(chan string, 4)}, actions: make(chan string, 4)}
@@ -2306,27 +2308,31 @@ func TestFallbackActionDuringStartIsAuthorizedAndWaits(t *testing.T) {
 	if err := remote.Call(ctx, MethodFlowAction, &FlowActionParams{WMP: Metadata{SessionID: "ses-evil"}, FlowID: "fa", Action: "go"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrNotAuthorized {
 		t.Fatalf("action from another session during a start: err = %v, want -31002", err)
 	}
-	// The starting session's action waits for the start and is then handled.
-	actionDone := make(chan error, 1)
-	go func() {
-		actionDone <- remote.Call(ctx, MethodFlowAction, &FlowActionParams{FlowID: "fa", Action: "go"}, nil)
-	}()
+	// The starting session's action cannot be taken yet: refused at once (no
+	// wait that a start waiting for its own action would deadlock on).
+	began := time.Now()
+	if err := remote.Call(ctx, MethodFlowAction, &FlowActionParams{FlowID: "fa", Action: "go"}, nil); !errors.As(err, &rpcErr) || rpcErr.Code != ErrFlowError {
+		t.Fatalf("action during a fallback start: err = %v, want -31006", err)
+	}
+	if time.Since(began) > time.Second {
+		t.Error("the action waited for the start")
+	}
 	select {
 	case a := <-h.actions:
 		t.Fatalf("action %s reached the handler before the start returned", a)
-	case <-time.After(150 * time.Millisecond):
+	default:
 	}
 	close(h.release)
 	if err := <-started; err != nil {
 		t.Fatal(err)
 	}
-	if err := <-actionDone; err != nil {
+	if err := remote.Call(ctx, MethodFlowAction, &FlowActionParams{FlowID: "fa", Action: "go"}, nil); err != nil {
 		t.Fatalf("action after the start: %v", err)
 	}
 	select {
 	case <-h.actions:
 	case <-time.After(2 * time.Second):
-		t.Fatal("the waiting action was lost")
+		t.Fatal("the action was lost")
 	}
 }
 
@@ -2444,4 +2450,169 @@ func TestRepeatedStartIsRecognisedOnlyForALiveManagedFlow(t *testing.T) {
 	if got := r.beginStart("m1", "ses-1", id); got != startRefused {
 		t.Fatalf("terminal flow: %v, want startRefused", got)
 	}
+}
+
+// --- sixth review round ---
+
+func TestCancelledFlowStaysAddressableAsTerminalUntilItsWorkerExits(t *testing.T) {
+	r := newSubFlowRig(t)
+	release := make(chan struct{})
+	r.setParent(func(ctx context.Context, fc *FlowContext) error {
+		<-ctx.Done()
+		<-release // winding down
+		return nil
+	})
+	r.startParent(t, "flow-p")
+	if err := r.wallet.Call(r.ctx, MethodFlowCancel, &FlowCancelParams{FlowID: "flow-p"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var rpcErr *RPCError
+	// A second cancel and an action are answered from the flow's terminal
+	// state, not by the unrelated base handler or "not found".
+	if err := r.wallet.Call(r.ctx, MethodFlowCancel, &FlowCancelParams{FlowID: "flow-p"}, nil); !errors.As(err, &rpcErr) || !strings.Contains(string(rpcErr.Data), "already_terminal") {
+		t.Fatalf("second cancel: err = %v, want already_terminal", err)
+	}
+	if err := r.wallet.Call(r.ctx, MethodFlowAction, &FlowActionParams{FlowID: "flow-p", Action: "x"}, nil); !errors.As(err, &rpcErr) || !strings.Contains(string(rpcErr.Data), "already_terminal") {
+		t.Fatalf("action: err = %v, want already_terminal", err)
+	}
+	if r.profile.ActiveFlows() != 0 {
+		t.Errorf("a cancelled flow is counted as active")
+	}
+	close(release)
+}
+
+func TestCancelSessionFlowIsScopedToTheSession(t *testing.T) {
+	shared := NewAsyncFlowProfile("shared")
+	shared.Handle("parent", func(ctx context.Context, fc *FlowContext) error { <-ctx.Done(); return nil })
+	a := newSubFlowRigProfile(t, shared)
+	b := newSubFlowRigProfile(t, shared)
+	a.startParent(t, "flow-1")
+	b.startParent(t, "flow-1")
+	// Both rigs are session ses-1; start one in another session instead.
+	if err := b.wallet.Call(b.ctx, MethodFlowStart, &FlowStartParams{WMP: Metadata{SessionID: "ses-2"}, FlowType: "parent", FlowID: "flow-2"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	shared.CancelSessionFlow("ses-2", "flow-1") // no such flow in ses-2
+	if shared.ActiveFlows() != 3 {
+		t.Fatalf("active = %d, want 3: a flow of another session was cancelled", shared.ActiveFlows())
+	}
+	shared.CancelSessionFlow("ses-2", "flow-2")
+	waitFor(t, func() bool { return shared.ActiveFlows() == 2 })
+	shared.CancelFlow("flow-1") // across all peers, by choice
+	waitFor(t, func() bool { return shared.ActiveFlows() == 0 })
+}
+
+func TestCancelledFlowReportsNoErrorEvenIfItsFunctionFailsFirst(t *testing.T) {
+	profile := NewAsyncFlowProfile("p")
+	mock := &syncPeerContext{}
+	_ = profile.Init(mock)
+	started := make(chan struct{})
+	profile.Handle("f", func(ctx context.Context, fc *FlowContext) error {
+		close(started)
+		// The flow ends (done channel closed) while its context is still live,
+		// which is the order fc.cancel() goes through, and the function fails.
+		fc.terminate()
+		return errors.New("failed because it was cancelled")
+	})
+	if _, err := profile.StartFlow(context.Background(), &FlowStartParams{FlowType: "f", FlowID: "f1"}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	waitFor(t, func() bool { return profile.ActiveFlows() == 0 })
+	time.Sleep(100 * time.Millisecond)
+	if got := mock.methods(); len(got) != 0 {
+		t.Errorf("notifications after the flow ended: %v", got)
+	}
+}
+
+func TestDuplicateStartIdentityIgnoresEncodingButNotContent(t *testing.T) {
+	id := func(timeout int, params string) [32]byte {
+		return startIdentity(&FlowStartParams{FlowType: "t", Timeout: timeout, Params: json.RawMessage(params)})
+	}
+	base := id(0, `{"a":1,"b":{"c":[1,2],"d":"x"},"n":12345678901234567890}`)
+	if id(0, ` { "n" : 12345678901234567890, "b":{"d":"x","c":[1,2]}, "a":1 } `) != base {
+		t.Error("member order or whitespace changed the identity")
+	}
+	for name, other := range map[string][32]byte{
+		"timeout":     id(30, `{"a":1,"b":{"c":[1,2],"d":"x"},"n":12345678901234567890}`),
+		"value":       id(0, `{"a":2,"b":{"c":[1,2],"d":"x"},"n":12345678901234567890}`),
+		"array order": id(0, `{"a":1,"b":{"c":[2,1],"d":"x"},"n":12345678901234567890}`),
+		"big number":  id(0, `{"a":1,"b":{"c":[1,2],"d":"x"},"n":12345678901234567891}`),
+	} {
+		if other == base {
+			t.Errorf("%s did not change the identity", name)
+		}
+	}
+}
+
+// refusingCanceller is an ordinary handler (not route-managing) whose
+// canceller refuses.
+type refusingCanceller struct{ terminalProfile }
+
+func (*refusingCanceller) FlowTypes() []string { return []string{"refuse"} }
+func (*refusingCanceller) HandleCancel(context.Context, *FlowCancelParams) (bool, error) {
+	return false, NewRPCError(ErrFlowError, map[string]string{"reason": "cannot stop"})
+}
+
+func TestRefusedCancelKeepsTheRoute(t *testing.T) {
+	r := newSubFlowRig(t)
+	if err := r.orch.Use(&refusingCanceller{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.wallet.Call(r.ctx, MethodFlowStart, &FlowStartParams{FlowType: "refuse", FlowID: "rf"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var rpcErr *RPCError
+	if err := r.wallet.Call(r.ctx, MethodFlowCancel, &FlowCancelParams{FlowID: "rf"}, nil); !errors.As(err, &rpcErr) {
+		t.Fatalf("cancel: err = %v, want the handler's refusal", err)
+	}
+	if _, owned := r.orch.registry.lookupFlowOwner("rf"); !owned {
+		t.Fatal("a refused cancel unrouted the flow that keeps running")
+	}
+}
+
+func TestSubFlowCancelIsRepeatedWhileTheReceiverIsStillStarting(t *testing.T) {
+	peer := &stillStartingPeer{refusals: 2}
+	profile := NewAsyncFlowProfile("p")
+	done := make(chan error, 1)
+	profile.Handle("parent", func(ctx context.Context, fc *FlowContext) error {
+		_, err := fc.RequestSubFlow(ctx, "sign", map[string]any{}, 80*time.Millisecond)
+		done <- err
+		return nil
+	})
+	_ = profile.Init(peer)
+	if _, err := profile.StartFlow(context.Background(), &FlowStartParams{FlowType: "parent", FlowID: "flow-p", WMP: Metadata{SessionID: "ses-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, ErrSubFlowTimeout) {
+		t.Fatalf("err = %v", err)
+	}
+	waitFor(t, func() bool { return peer.cancelCalls() == 3 }) // two refusals, then accepted
+}
+
+// stillStartingPeer answers the first cancels with the "still starting"
+// refusal.
+type stillStartingPeer struct {
+	orderPeer
+	refusals int
+	n        int
+}
+
+func (p *stillStartingPeer) Call(_ context.Context, method string, _ interface{}, _ interface{}) error {
+	if method != MethodFlowCancel {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.n++
+	if p.n <= p.refusals {
+		return NewRPCError(ErrFlowError, map[string]string{"reason": "flow is still starting"})
+	}
+	return nil
+}
+
+func (p *stillStartingPeer) cancelCalls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.n
 }
