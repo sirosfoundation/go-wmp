@@ -256,7 +256,7 @@ func errorData(t *testing.T, e *wmp.FlowErrorParams) NotificationErrorData {
 func TestNotificationFlowForwardsWithClientHeldDPoP(t *testing.T) {
 	fwd := &fakeForwarder{signs: &ClientAuthRequest{
 		HTM: "POST", HTU: "https://issuer.example.com/notification", ATH: "ath-1", DPoPNonce: "n-1",
-		KeyID: "instance-key-1", Audience: "https://issuer.example.com"}}
+		Audience: "https://issuer.example.com"}}
 	r := newNotifyRig(t, fwd, NotificationFlowOptions{})
 	r.answerSign(`{"dpop_proof":"a.b.c","dpop_key_id":"instance-key-1"}`)
 	if err := r.start(startParams(t, nil)); err != nil {
@@ -276,7 +276,7 @@ func TestNotificationFlowForwardsWithClientHeldDPoP(t *testing.T) {
 	_ = json.Unmarshal(sign.Params, &sent)
 	if sign.FlowType != wmp.FlowTypeSign || sent.Action != "sign_client_auth" || sent.ParentFlowID != "flow-cn-001" ||
 		sent.HTM != "POST" || sent.HTU != "https://issuer.example.com/notification" || sent.ATH != "ath-1" ||
-		sent.DPoPNonce != "n-1" || sent.KeyID != "instance-key-1" || sent.Audience != "https://issuer.example.com" {
+		sent.DPoPNonce != "n-1" || sent.KeyID != "" || sent.Audience != "https://issuer.example.com" {
 		t.Errorf("sign start = %s %s", sign.FlowType, sign.Params)
 	}
 	fwd.mu.Lock()
@@ -318,9 +318,10 @@ func TestNotificationFlowErrorReasons(t *testing.T) {
 		{"busy", ErrNotificationBusy, "busy", true},
 		{"signing", ErrClientAuthSigning, "signing_failed", false},
 		{"forward", errors.New("issuer said 500 and some secret text"), "forward_failed", false},
-		{"deadline", fmt.Errorf("forwarding: %w", context.DeadlineExceeded), "timeout", false},
-		{"flow deadline while signing", fmt.Errorf("%w: %w", ErrClientAuthSigning, context.DeadlineExceeded), "timeout", false},
-		{"sign timeout is a signing failure", fmt.Errorf("%w: %w", ErrClientAuthSigning, wmp.ErrSubFlowTimeout), "signing_failed", false},
+		// An operation timeout keeps its reason: only the flow's own deadline is "timeout".
+		{"issuer request timeout", fmt.Errorf("forwarding: %w", context.DeadlineExceeded), "forward_failed", false},
+		{"signing context deadline", fmt.Errorf("%w: %w", ErrClientAuthSigning, context.DeadlineExceeded), "signing_failed", false},
+		{"sign timeout", fmt.Errorf("%w: %w", ErrClientAuthSigning, wmp.ErrSubFlowTimeout), "signing_failed", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newNotifyRig(t, &fakeForwarder{err: tc.err}, NotificationFlowOptions{})
@@ -531,7 +532,8 @@ func TestNotificationFlowDeadlineSendsTimeout(t *testing.T) {
 	// What an embedding does to apply the flow's own timeout (Core 6.2).
 	withDeadline := func(inner wmp.FlowFunc) wmp.FlowFunc {
 		return func(ctx context.Context, fc *wmp.FlowContext) error {
-			ctx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+			// WithTimeoutCause: ctx.Err() is DeadlineExceeded, the cause is custom.
+			ctx, cancel := context.WithTimeoutCause(ctx, 150*time.Millisecond, errors.New("flow timeout"))
 			defer cancel()
 			return inner(ctx, fc)
 		}

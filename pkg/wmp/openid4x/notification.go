@@ -201,9 +201,11 @@ type ClientAuthRequest struct {
 	// the notification endpoint without query and fragment (NotificationHTU).
 	HTM, HTU string
 	// ATH is base64url(SHA-256(access_token)), DPoPNonce the issuer's DPoP nonce
-	// when there is one, KeyID the dpop_key_id the wallet reported at issuance,
-	// Audience the issuer identifier.
-	ATH, DPoPNonce, KeyID, Audience string
+	// when there is one, Audience the issuer identifier. There is no key id: the
+	// dpop_key_id is a secret of the issuance that a replayed sub-flow start
+	// must not carry (Section 3.4.3); the wallet knows the key from the parent's
+	// issuance_flow_id.
+	ATH, DPoPNonce, Audience string
 }
 
 // ClientAuthSigner asks the wallet for a DPoP proof with a sign_client_auth
@@ -305,7 +307,7 @@ func NotificationFlow(fwd NotificationForwarder, opts NotificationFlowOptions) w
 // deadline expired is not cancelled: Core 6.2 requires its terminal error with
 // reason timeout, sent without the expired context.
 func finishNotification(ctx context.Context, fc *wmp.FlowContext, notificationID string, err error) error {
-	expired := errors.Is(context.Cause(ctx), context.DeadlineExceeded)
+	expired := errors.Is(ctx.Err(), context.DeadlineExceeded) // not the cause: a WithTimeoutCause flow has a custom one
 	if (ctx.Err() != nil && !expired) || errors.Is(err, wmp.ErrSubFlowCancelled) {
 		return context.Cause(ctx)
 	}
@@ -325,10 +327,6 @@ func finishNotification(ctx context.Context, fc *wmp.FlowContext, notificationID
 // and retryable flag of the flow error.
 func NotificationFailure(err error) (reason string, retryable bool) {
 	switch {
-	// The flow's own deadline, not the orchestrator's sign timeout (which is
-	// ErrSubFlowTimeout and a signing failure).
-	case errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, wmp.ErrSubFlowTimeout):
-		return NotificationReasonTimeout, false
 	case errors.Is(err, ErrNotificationContextUnavailable):
 		return NotificationReasonContextUnavailable, false
 	case errors.Is(err, ErrNotificationBusy):
@@ -349,7 +347,6 @@ func requestClientAuth(ctx context.Context, fc *wmp.FlowContext, car ClientAuthR
 		HTU:       car.HTU,
 		ATH:       car.ATH,
 		DPoPNonce: car.DPoPNonce,
-		KeyID:     car.KeyID,
 	}, timeout)
 	if err != nil {
 		// The wallet's text and data stay out of the error (SubFlowError.Error
