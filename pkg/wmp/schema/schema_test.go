@@ -327,3 +327,31 @@ func TestValidateFlowCompleteEngineBlind(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateResolveResponseVCTM(t *testing.T) {
+	v, err := NewValidator()
+	if err != nil {
+		t.Fatalf("NewValidator() error: %v", err)
+	}
+	resp := func(result string) []byte {
+		return []byte(`{"jsonrpc":"2.0","id":1,"result":{"wmp":{"version":"0.1"},"type":"vctm","uri":"https://c.example/id",` + result + `}}`)
+	}
+	for _, ok := range []string{
+		`"metadata":{"vct":"https://c.example/id","name":"N","display":[],"claims":[],"schema":{}}`,
+		`"metadata":null`,
+	} {
+		if err := v.ValidateResponse("wmp.resolve", resp(ok)); err != nil {
+			t.Errorf("%s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		`"metadata":{"name":"N"}`,
+		`"metadata":{"vct":"v","extends":"x"}`,
+		`"metadata":[]`,
+		`"content_type":"application/vctm+json","body":{"vct":"v"}`,
+	} {
+		if err := v.ValidateResponse("wmp.resolve", resp(bad)); err == nil {
+			t.Errorf("%s must be refused", bad)
+		}
+	}
+}
