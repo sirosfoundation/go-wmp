@@ -1816,27 +1816,32 @@ func TestPendingSubFlowsAreScopedToThePeer(t *testing.T) {
 	}
 	// The profile-level lookup is scoped by the dispatching peer in ctx.
 	for _, rig := range []*subFlowRig{a, b} {
-		ctx := contextWithPeer(context.Background(), rig.orch)
-		if got := shared.PendingSubFlows(ctx, "ses-1", "flow-1"); len(got) != 1 {
-			t.Fatalf("peer-scoped pending = %d, want 1", len(got))
-		}
-		// Without the peer, or without the session id, nothing is shown.
-		if got := shared.PendingSubFlows(contextWithPeer(context.Background(), rig.orch), "", "flow-1"); len(got) != 0 {
-			t.Fatalf("pending without a session = %d, want 0", len(got))
-		}
-		if got := shared.PendingSubFlows(context.Background(), "ses-1", "flow-1"); len(got) != 0 {
-			t.Fatalf("pending without a peer = %d, want 0", len(got))
-		}
-		// The returned params are a copy.
-		got := shared.PendingSubFlows(ctx, "ses-1", "flow-1")
-		for i := range got[0].Params {
-			got[0].Params[i] = 'x'
-		}
-		if again := shared.PendingSubFlows(ctx, "ses-1", "flow-1"); !json.Valid(again[0].Params) {
-			t.Fatal("editing the returned params changed the sub-flow's own")
-		}
+		checkPendingScopedTo(t, shared, rig)
 	}
 	shared.CancelFlow("flow-1")
+}
+
+func checkPendingScopedTo(t *testing.T, shared *AsyncFlowProfile, rig *subFlowRig) {
+	t.Helper()
+	ctx := contextWithPeer(context.Background(), rig.orch)
+	if got := shared.PendingSubFlows(ctx, "ses-1", "flow-1"); len(got) != 1 {
+		t.Fatalf("peer-scoped pending = %d, want 1", len(got))
+	}
+	// Without the peer, or without the session id, nothing is shown.
+	if got := shared.PendingSubFlows(ctx, "", "flow-1"); len(got) != 0 {
+		t.Fatalf("pending without a session = %d, want 0", len(got))
+	}
+	if got := shared.PendingSubFlows(context.Background(), "ses-1", "flow-1"); len(got) != 0 {
+		t.Fatalf("pending without a peer = %d, want 0", len(got))
+	}
+	// The returned params are a copy.
+	got := shared.PendingSubFlows(ctx, "ses-1", "flow-1")
+	for i := range got[0].Params {
+		got[0].Params[i] = 'x'
+	}
+	if again := shared.PendingSubFlows(ctx, "ses-1", "flow-1"); !json.Valid(again[0].Params) {
+		t.Fatal("editing the returned params changed the sub-flow's own")
+	}
 }
 
 func TestRejectedReadsTheExactReasonMember(t *testing.T) {
