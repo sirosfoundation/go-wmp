@@ -592,7 +592,7 @@ func checkRefusalVector(t *testing.T, params json.RawMessage) {
 		if err != nil || ps.Message != openid4x.IssuerNotEntitledMessage {
 			t.Fatalf("-31020 refused: err=%v message=%q", err, ps.Message)
 		}
-		built, err := openid4x.NewIssuerNotEntitledData(d.Findings)
+		built, err := openid4x.NewIssuerNotEntitledData(d.Issuer, d.IssuerEntitlement)
 		if err != nil {
 			t.Fatal(err)
 		}
