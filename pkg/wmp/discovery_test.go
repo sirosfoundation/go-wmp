@@ -3,6 +3,7 @@ package wmp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -163,27 +164,183 @@ func TestDiscoverConfigForDID(t *testing.T) {
 	}
 }
 
-func TestBuildWellKnownURL(t *testing.T) {
+func TestDiscoverConfig_InvalidDomain(t *testing.T) {
+	for _, domain := range []string{"", "example.com/path", "example.com?query", "user@example.com"} {
+		if _, err := DiscoverConfig(context.Background(), domain); !errors.Is(err, ErrNoDiscoveryBase) {
+			t.Errorf("DiscoverConfig(%q) err=%v, want ErrNoDiscoveryBase", domain, err)
+		}
+	}
+}
+
+// The rows of the well-known URL table of WMP Core 7.5.1.
+func TestDiscoveryBaseFor(t *testing.T) {
 	tests := []struct {
-		domain string
-		want   string
-		err    bool
+		identifier string
+		wellKnown  string
+		base       string
 	}{
-		{"example.com", "https://example.com/.well-known/wmp-configuration", false},
-		{"", "", true},
-		{"example.com/path", "", true},
-		{"example.com?query", "", true},
-		{"user@example.com", "", true},
+		{"x509:san:dns:example.com", "https://example.com/.well-known/wmp-configuration", "https://example.com"},
+		{"https://example.com", "https://example.com/.well-known/wmp-configuration", "https://example.com"},
+		{"https://example.com/", "https://example.com/.well-known/wmp-configuration", "https://example.com"},
+		{"https://example.com/tenant1", "https://example.com/.well-known/wmp-configuration/tenant1", "https://example.com/tenant1"},
+		{"https://example.com:8443/tenants/acme/", "https://example.com:8443/.well-known/wmp-configuration/tenants/acme", "https://example.com:8443/tenants/acme"},
+		{"x509:san:uri:https://example.com/tenant1", "https://example.com/.well-known/wmp-configuration/tenant1", "https://example.com/tenant1"},
+		{"did:web:example.com", "https://example.com/.well-known/wmp-configuration", "https://example.com"},
+		{"did:web:example.com%3A8443", "https://example.com:8443/.well-known/wmp-configuration", "https://example.com:8443"},
 	}
 	for _, tt := range tests {
-		got, err := buildWellKnownURL(tt.domain)
-		if (err != nil) != tt.err {
-			t.Errorf("buildWellKnownURL(%q) err=%v, wantErr=%v", tt.domain, err, tt.err)
+		base, err := DiscoveryBaseFor(tt.identifier)
+		if err != nil {
+			t.Errorf("DiscoveryBaseFor(%q): %v", tt.identifier, err)
 			continue
 		}
-		if got != tt.want {
-			t.Errorf("buildWellKnownURL(%q) = %q, want %q", tt.domain, got, tt.want)
+		if got := base.WellKnownURL(); got != tt.wellKnown {
+			t.Errorf("DiscoveryBaseFor(%q).WellKnownURL() = %q, want %q", tt.identifier, got, tt.wellKnown)
 		}
+		if got := base.String(); got != tt.base {
+			t.Errorf("DiscoveryBaseFor(%q).String() = %q, want %q", tt.identifier, got, tt.base)
+		}
+	}
+}
+
+func TestDiscoveryBaseFor_None(t *testing.T) {
+	cases := []string{
+		"did:web:example.com:tenant1", // the did:web method resolves its DID Document
+		"did:key:z6Mkf5rGMoatrSj1f3JWKc",
+		"https://example.com/tenant1?x=1",
+		"https://example.com/tenant1#frag",
+		"https://user@example.com/tenant1",
+		"https://example.com/a/../b",
+		"https://example.com/a/./b",
+		"https://example.com/a/%2e%2e/b",
+		"https://example.com\\@evil.example/",
+		"x509:san:uri:https://example.com/t?x=1",
+		"x509:san:dns:example.com/path",
+		"http://example.com/tenant1",
+		"opaque",
+	}
+	for _, c := range cases {
+		if base, err := DiscoveryBaseFor(c); !errors.Is(err, ErrNoDiscoveryBase) {
+			t.Errorf("DiscoveryBaseFor(%q) = %+v, %v; want ErrNoDiscoveryBase", c, base, err)
+		}
+	}
+}
+
+// tenantServer serves one configuration per well-known URL path.
+func tenantServer(t *testing.T, docs func(srvURL string) map[string]WellKnownConfig) *httptest.Server {
+	t.Helper()
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		doc, ok := docs(srv.URL)[r.URL.Path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(doc)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestDiscoverConfigForIdentifier_Tenant(t *testing.T) {
+	srv := tenantServer(t, func(u string) map[string]WellKnownConfig {
+		return map[string]WellKnownConfig{
+			"/.well-known/wmp-configuration": {
+				SupportedVersions: []string{"0.1"},
+				Endpoints:         map[string]string{"websocket": "wss://root/wmp"},
+			},
+			"/.well-known/wmp-configuration/tenants/acme": {
+				DiscoveryBase:     strings.ToUpper(u[:len("https")]) + u[len("https"):] + "/tenants/acme",
+				SupportedVersions: []string{"0.1"},
+				Endpoints:         map[string]string{"websocket": "wss://acme/wmp"},
+			},
+		}
+	})
+	ctx := context.Background()
+
+	for _, id := range []string{srv.URL + "/tenants/acme", srv.URL + "/tenants/acme/", "x509:san:uri:" + srv.URL + "/tenants/acme"} {
+		got, err := DiscoverConfigForIdentifier(ctx, id, srv.Client())
+		if err != nil {
+			t.Fatalf("%s: %v", id, err)
+		}
+		if got.Endpoints["websocket"] != "wss://acme/wmp" {
+			t.Fatalf("%s: got the configuration of %v", id, got.Endpoints)
+		}
+	}
+
+	got, err := DiscoverConfigForIdentifier(ctx, srv.URL, srv.Client())
+	if err != nil || got.Endpoints["websocket"] != "wss://root/wmp" {
+		t.Fatalf("host root: %v, %v", got, err)
+	}
+
+	// A tenant without a configuration of its own does not get the host's.
+	if _, err := DiscoverConfigForIdentifier(ctx, srv.URL+"/tenants/other", srv.Client()); err == nil {
+		t.Fatal("a tenant without a configuration resolved")
+	}
+}
+
+func TestDiscoverConfigForIdentifier_DiscoveryBaseCheck(t *testing.T) {
+	// A catch-all server: every well-known path answers the same document.
+	serve := func(base func(srvURL string) string) *httptest.Server {
+		var srv *httptest.Server
+		srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(WellKnownConfig{
+				DiscoveryBase:     base(srv.URL),
+				SupportedVersions: []string{"0.1"},
+				Endpoints:         map[string]string{"websocket": "wss://x/wmp"},
+			})
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+	ctx := context.Background()
+
+	absent := serve(func(string) string { return "" })
+	if _, err := DiscoverConfigForIdentifier(ctx, absent.URL+"/tenant1", absent.Client()); !errors.Is(err, ErrDiscoveryBaseMismatch) {
+		t.Fatalf("tenant, discovery_base absent: err=%v", err)
+	}
+	if _, err := DiscoverConfigForIdentifier(ctx, absent.URL, absent.Client()); err != nil {
+		t.Fatalf("host root, discovery_base absent: %v", err)
+	}
+
+	other := serve(func(u string) string { return u + "/tenant2" })
+	if _, err := DiscoverConfigForIdentifier(ctx, other.URL+"/tenant1", other.Client()); !errors.Is(err, ErrDiscoveryBaseMismatch) {
+		t.Fatalf("tenant, another tenant's document: err=%v", err)
+	}
+	if _, err := DiscoverConfigForIdentifier(ctx, other.URL, other.Client()); !errors.Is(err, ErrDiscoveryBaseMismatch) {
+		t.Fatalf("host root, a tenant's document: err=%v", err)
+	}
+
+	root := serve(func(u string) string { return u })
+	if _, err := DiscoverConfigForIdentifier(ctx, root.URL+"/tenant1", root.Client()); !errors.Is(err, ErrDiscoveryBaseMismatch) {
+		t.Fatalf("tenant, the host's document: err=%v", err)
+	}
+	if _, err := DiscoverConfigForIdentifier(ctx, root.URL, root.Client()); err != nil {
+		t.Fatalf("host root, own document: %v", err)
+	}
+
+	for _, suffix := range []string{"/", "//"} {
+		slash := serve(func(u string) string { return u + "/tenant1" + suffix })
+		if _, err := DiscoverConfigForIdentifier(ctx, slash.URL+"/tenant1", slash.Client()); !errors.Is(err, ErrDiscoveryBaseMismatch) {
+			t.Fatalf("tenant, discovery_base with trailing %q: err=%v", suffix, err)
+		}
+		rootSlash := serve(func(u string) string { return u + suffix })
+		if _, err := DiscoverConfigForIdentifier(ctx, rootSlash.URL, rootSlash.Client()); !errors.Is(err, ErrDiscoveryBaseMismatch) {
+			t.Fatalf("host root, discovery_base with trailing %q: err=%v", suffix, err)
+		}
+	}
+
+	otherHost := serve(func(string) string { return "https://evil.example/tenant1" })
+	if _, err := DiscoverConfigForIdentifier(ctx, otherHost.URL+"/tenant1", otherHost.Client()); !errors.Is(err, ErrDiscoveryBaseMismatch) {
+		t.Fatalf("tenant, another host's document: err=%v", err)
+	}
+}
+
+func TestDiscoverConfigForDID_Path(t *testing.T) {
+	_, err := DiscoverConfigForDID(context.Background(), "did:web:example.com:tenant1", nil)
+	if !errors.Is(err, ErrNoDiscoveryBase) {
+		t.Fatalf("err=%v, want ErrNoDiscoveryBase", err)
 	}
 }
 
