@@ -159,8 +159,10 @@ func (b DiscoveryBase) Check(config *WellKnownConfig) error {
 		}
 		return nil
 	}
+	// The declared base is compared as written: a trailing "/" is not the
+	// base, only an identifier's path is trimmed.
 	got, err := urlBase(config.DiscoveryBase)
-	if err != nil || !strings.EqualFold(got.Host, b.Host) || got.TenantPath != b.TenantPath {
+	if err != nil || strings.HasSuffix(config.DiscoveryBase, "/") || !strings.EqualFold(got.Host, b.Host) || got.TenantPath != b.TenantPath {
 		return fmt.Errorf("%w: discovery_base is %q, want %q", ErrDiscoveryBaseMismatch, config.DiscoveryBase, b.String())
 	}
 	return nil

@@ -320,6 +320,17 @@ func TestDiscoverConfigForIdentifier_DiscoveryBaseCheck(t *testing.T) {
 		t.Fatalf("host root, own document: %v", err)
 	}
 
+	for _, suffix := range []string{"/", "//"} {
+		slash := serve(func(u string) string { return u + "/tenant1" + suffix })
+		if _, err := DiscoverConfigForIdentifier(ctx, slash.URL+"/tenant1", slash.Client()); !errors.Is(err, ErrDiscoveryBaseMismatch) {
+			t.Fatalf("tenant, discovery_base with trailing %q: err=%v", suffix, err)
+		}
+		rootSlash := serve(func(u string) string { return u + suffix })
+		if _, err := DiscoverConfigForIdentifier(ctx, rootSlash.URL, rootSlash.Client()); !errors.Is(err, ErrDiscoveryBaseMismatch) {
+			t.Fatalf("host root, discovery_base with trailing %q: err=%v", suffix, err)
+		}
+	}
+
 	otherHost := serve(func(string) string { return "https://evil.example/tenant1" })
 	if _, err := DiscoverConfigForIdentifier(ctx, otherHost.URL+"/tenant1", otherHost.Client()); !errors.Is(err, ErrDiscoveryBaseMismatch) {
 		t.Fatalf("tenant, another host's document: err=%v", err)
