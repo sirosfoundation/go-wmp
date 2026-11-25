@@ -282,12 +282,8 @@ func (t *Transport) WriteMessage(ctx context.Context, data []byte) error {
 		}
 	}
 
-	if t.proofs != nil {
-		if sid := t.requestSession(req, data); sid != "" {
-			if err := t.proofs.Authorize(req, sid); err != nil {
-				return fmt.Errorf("http request: %w", err)
-			}
-		}
+	if err := t.prove(req, data); err != nil {
+		return fmt.Errorf("http request: %w", err)
 	}
 
 	resp, err := t.httpClient.Do(req)
@@ -314,6 +310,19 @@ func (t *Transport) WriteMessage(ctx context.Context, data []byte) error {
 	}
 
 	return nil
+}
+
+// prove adds a per-request proof to a POST that names a session, when
+// proofs are configured.
+func (t *Transport) prove(req *http.Request, data []byte) error {
+	if t.proofs == nil {
+		return nil
+	}
+	sid := t.requestSession(req, data)
+	if sid == "" {
+		return nil
+	}
+	return t.proofs.Authorize(req, sid)
 }
 
 // requestSession returns the session a POST names: the Wmp-Session-Id header,
