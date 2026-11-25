@@ -680,30 +680,45 @@ func (c *client) readEvidence(ctx context.Context, repository, messageID string)
 		if status < 200 || status > 299 {
 			return nil, fmt.Errorf("HTTP %d", status)
 		}
-		var doc struct {
-			Records []json.RawMessage `json:"evidence_records"`
-			Token   *string           `json:"continuation_token"`
+		found, next, err := parseEvidencePage(data, messageID)
+		if err != nil {
+			return nil, err
 		}
-		if err := json.Unmarshal(data, &doc); err != nil || doc.Records == nil {
-			return nil, errors.New("no evidence_records")
-		}
-		for _, raw := range doc.Records {
-			var r EvidenceRecord
-			if isNull(raw) || json.Unmarshal(raw, &r) != nil || r.EvidenceID == "" || r.EventType == "" {
-				return nil, errors.New("a malformed record")
-			}
-			// The session's records of other messages are not this message's evidence.
-			if r.OriginalMessageID == messageID {
-				r.Raw = raw
-				records = append(records, r)
-			}
-		}
-		if doc.Token == nil || *doc.Token == "" {
+		records = append(records, found...)
+		if next == "" {
 			return records, nil
 		}
-		token = *doc.Token
+		token = next
 	}
 	return nil, fmt.Errorf("more than %d pages", maxEvidencePages)
+}
+
+// parseEvidencePage returns the records of one page that belong to the
+// message, and the token of the next page.
+func parseEvidencePage(data []byte, messageID string) ([]EvidenceRecord, string, error) {
+	var doc struct {
+		Records []json.RawMessage `json:"evidence_records"`
+		Token   *string           `json:"continuation_token"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil || doc.Records == nil {
+		return nil, "", errors.New("no evidence_records")
+	}
+	var records []EvidenceRecord
+	for _, raw := range doc.Records {
+		var r EvidenceRecord
+		if isNull(raw) || json.Unmarshal(raw, &r) != nil || r.EvidenceID == "" || r.EventType == "" {
+			return nil, "", errors.New("a malformed record")
+		}
+		// The session's records of other messages are not this message's evidence.
+		if r.OriginalMessageID == messageID {
+			r.Raw = raw
+			records = append(records, r)
+		}
+	}
+	if doc.Token == nil {
+		return records, "", nil
+	}
+	return records, *doc.Token, nil
 }
 
 func reached(records []EvidenceRecord, until []string) bool {
