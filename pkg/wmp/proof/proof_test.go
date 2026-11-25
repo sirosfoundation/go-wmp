@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -413,5 +414,36 @@ func TestNewSignerRefusesUnsupportedKeys(t *testing.T) {
 	k, _ := ecdsa.GenerateKey(elliptic.P224(), rand.Reader)
 	if _, err := NewSigner(k); err == nil {
 		t.Error("P-224")
+	}
+}
+
+// A proof made by wmp-js (createRequestProof with a WebCrypto P-256 key) for
+// POST https://relay.example.com/wmp on ses-a1b2c3d4 at the test epoch.
+const (
+	jsProof    = "eyJhbGciOiJFUzI1NiIsInR5cCI6IndtcC1wcm9vZitqd3QiLCJraWQiOiJkaWQ6d2ViOndhbGxldC5leGFtcGxlLmNvbSNrZXktMSJ9.eyJodG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9yZWxheS5leGFtcGxlLmNvbS93bXAiLCJpYXQiOjE3OTU1MjY0MDAsImp0aSI6IkcwOUlwMGpoRTc3Q0tnejN2RGtyLWciLCJzaWQiOiJzZXMtYTFiMmMzZDQifQ.VWR_E32_FK7VPT-o-uLYfyZS2bw4Eg9fAoZIw7YXlcwd4nx9dLbNawGQ4tniySSHkCdwmV-DrYupVwzYhv7G6Q"
+	jsProofKey = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEG1sdU+APiZLqRXX/OamSDjZ/xGGmFYhYktUimRPLgQSoVde4sbb5E3CLKn8jOGflikb4ecjile7K345nAo31sA==" // base64 SubjectPublicKeyInfo
+)
+
+func TestVerifiesAProofMadeByWmpJS(t *testing.T) {
+	der, err := base64.StdEncoding.DecodeString(jsProofKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := x509.ParsePKIXPublicKey(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := &Verifier{Now: fixedNow, ResolveKey: func(string) (crypto.PublicKey, error) { return pub, nil }}
+	want := Expect{Method: "POST", URL: "https://relay.example.com/wmp", SessionID: "ses-a1b2c3d4"}
+	p, err := v.Verify(jsProof, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.KeyID != "did:web:wallet.example.com#key-1" || p.IssuedAt != epoch.Unix() {
+		t.Fatalf("proof %+v", p)
+	}
+	want.SessionID = "ses-other"
+	if _, err := v.Verify(jsProof, want); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("another session: %v", err)
 	}
 }
