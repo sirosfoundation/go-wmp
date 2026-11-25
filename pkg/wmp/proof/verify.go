@@ -496,3 +496,10 @@ func (m *memoryReplay) Seen(key string, expires time.Time) bool {
 	m.seen[key] = expires
 	return false
 }
+
+// VerifySignature checks a JWS signature over input: alg must be the
+// algorithm of key, and an ECDSA signature the fixed-width R||S form of
+// RFC 7518 section 3.4. A signature that does not verify is an ErrInvalid.
+func VerifySignature(alg string, key crypto.PublicKey, input, sig []byte) error {
+	return verifySignature(alg, key, input, sig)
+}
