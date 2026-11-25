@@ -17,8 +17,11 @@ type ProofConfig struct {
 	// Principal maps a verified proof to the Principal it authenticates,
 	// from the leaf certificate's SAN or the key id. The session lookup
 	// then admits the request only on a session that Principal created,
-	// which is the identity match of the verification's last step. An
-	// error, or a Principal with no Subject, is answered with 401. Required.
+	// which is the identity match of the verification's last step: a proof
+	// of another identity is answered as an unknown session (-31000, or 404
+	// on the event stream), as the transport requires for a session the
+	// caller does not own. An error, or a Principal with no Subject, is
+	// answered with 401. Required.
 	Principal func(p *proof.Proof) (wmp.Principal, error)
 
 	// URL returns the URL the client sent r to. Set it behind a proxy that
@@ -62,13 +65,18 @@ func (c *ProofConfig) authenticate(r *http.Request) (wmp.Principal, proofState, 
 
 // proofBinds reports whether the request may act on session id: a handler
 // that requires proofs admits a request naming a session only with a
-// verified proof whose "sid" is that session. A request that did not come
-// through ServeHTTP (ServeAuthenticated, WithPrincipal) was authenticated by
-// the embedder and is not checked here.
+// verified proof whose "sid" is that session. A request that names none
+// (wmp.session.create) is admitted only as authenticated by Authenticate: a
+// proof is bound to an existing session and never creates one. A request
+// that did not come through ServeHTTP (ServeAuthenticated, WithPrincipal)
+// was authenticated by the embedder and is not checked here.
 func proofBinds(r *http.Request, id string) bool {
 	state, required := r.Context().Value(proofKey{}).(proofState)
-	if !required || id == "" {
+	if !required {
 		return true
+	}
+	if id == "" {
+		return !state.presented
 	}
 	return state.presented && subtle.ConstantTimeCompare([]byte(state.sessionID), []byte(id)) == 1
 }

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -357,7 +358,8 @@ func object(raw []byte) (map[string]json.RawMessage, error) {
 	if _, err := dec.Token(); err != nil {
 		return nil, err
 	}
-	if dec.More() {
+	// Nothing but white space may follow the object.
+	if _, err := dec.Token(); err != io.EOF {
 		return nil, errors.New("trailing data")
 	}
 	return out, nil
@@ -438,10 +440,15 @@ func normalizeURL(raw string, strip bool) (string, error) {
 }
 
 type memoryReplay struct {
-	mu   sync.Mutex
-	seen map[string]time.Time
-	now  func() time.Time
+	mu    sync.Mutex
+	seen  map[string]time.Time
+	now   func() time.Time
+	sweep time.Time // when expired entries are next removed
 }
+
+// replaySweepInterval bounds how often the cache is scanned for expired
+// entries, so that a lookup does not pay for the whole cache.
+const replaySweepInterval = time.Second
 
 // NewMemoryReplayCache returns an in-process ReplayCache. A deployment with
 // several instances needs a shared one.
@@ -453,12 +460,15 @@ func (m *memoryReplay) Seen(key string, expires time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := m.now()
-	for k, exp := range m.seen {
-		if !exp.After(now) {
-			delete(m.seen, k)
+	if !now.Before(m.sweep) {
+		for k, exp := range m.seen {
+			if !exp.After(now) {
+				delete(m.seen, k)
+			}
 		}
+		m.sweep = now.Add(replaySweepInterval)
 	}
-	if _, ok := m.seen[key]; ok {
+	if exp, ok := m.seen[key]; ok && exp.After(now) {
 		return true
 	}
 	m.seen[key] = expires

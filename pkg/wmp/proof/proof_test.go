@@ -266,8 +266,14 @@ func TestReplayCacheForgetsExpiredEntries(t *testing.T) {
 	if m.Seen("a", epoch.Add(time.Minute)) || !m.Seen("a", epoch.Add(time.Minute)) {
 		t.Fatal("first use must pass and second must not")
 	}
+	// Between sweeps an expired entry is still not a replay.
+	m.seen["c"] = epoch.Add(500 * time.Millisecond)
+	now = epoch.Add(500 * time.Millisecond)
+	if m.Seen("c", now.Add(time.Minute)) {
+		t.Fatal("an expired entry was reported as seen")
+	}
 	now = epoch.Add(time.Minute)
-	if m.Seen("b", now.Add(time.Minute)); len(m.seen) != 1 {
+	if m.Seen("b", now.Add(time.Minute)); len(m.seen) != 2 {
 		t.Fatalf("expired entry kept: %v", m.seen)
 	}
 }
@@ -344,6 +350,13 @@ func TestVerifyRefusesTamperingAndGarbage(t *testing.T) {
 		parts[0] + "." + parts[1] + "." + swapped[2], // another key's signature
 		parts[0] + "=." + parts[1] + "." + parts[2],
 		b64.EncodeToString([]byte(`{"alg":"ES256","alg":"none","typ":"wmp-proof+jwt"}`)) + "." + parts[1] + "." + parts[2],
+	}
+	// Correctly signed, but the payload is not one JSON object.
+	for _, tail := range []string{"]", "}", "{}", " x"} {
+		payload, _ := b64.DecodeString(parts[1])
+		input := parts[0] + "." + b64.EncodeToString(append(payload, tail...))
+		sig, _ := f.creator.Signer.Sign([]byte(input))
+		bad = append(bad, input+"."+b64.EncodeToString(sig))
 	}
 	for _, compact := range bad {
 		if _, err := f.verifier.Verify(compact, f.want); !errors.Is(err, ErrInvalid) {

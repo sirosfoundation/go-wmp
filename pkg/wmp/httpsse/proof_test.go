@@ -142,6 +142,21 @@ func TestProofMustNameTheSessionMethodAndURL(t *testing.T) {
 	}
 }
 
+// A proof is bound to an existing session: it does not create one, whatever
+// session it names.
+func TestProofDoesNotCreateASession(t *testing.T) {
+	f, pki := newProofFixture(t)
+	wallet := pki.wallet(t, "https://alice.example.com")
+	count := func() int { l, _ := f.store.List(); return len(l) }
+	before := count()
+	if r := f.post(f.proofFor(wallet, "POST", "", "ses-made-up"), nil, createBody("c1")); r.Status != http.StatusUnauthorized {
+		t.Fatalf("%d %s", r.Status, r.Raw)
+	}
+	if got := count(); got != before {
+		t.Fatalf("sessions: %d, want %d", got, before)
+	}
+}
+
 func TestProofIsSingleUse(t *testing.T) {
 	f, pki := newProofFixture(t)
 	const alice = "https://alice.example.com"
