@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
+	"github.com/sirosfoundation/go-wmp/pkg/wmp/proof"
 )
 
 // Transport implements wmp.Transport over HTTPS POST (client→server)
@@ -29,6 +30,7 @@ type Transport struct {
 	httpClient *http.Client
 	headers    http.Header
 	insecure   bool
+	proofs     *proof.Creator
 
 	// SSE reader
 	sseReader *bufio.Reader
@@ -59,6 +61,14 @@ func WithHTTPClient(c *http.Client) ClientOption {
 // WithHeaders sets custom HTTP headers (e.g., Authorization).
 func WithHeaders(h http.Header) ClientOption {
 	return func(t *Transport) { t.headers = h }
+}
+
+// WithProof sends a per-request proof (WMP Core section 4.4.8) as the
+// Authorization header of every request that names a session: each POST
+// after the session create and each event stream. It replaces an
+// Authorization header set with WithHeaders on those requests.
+func WithProof(c *proof.Creator) ClientOption {
+	return func(t *Transport) { t.proofs = c }
 }
 
 // WithInsecure allows plain http:// endpoints and disables TLS certificate
@@ -128,6 +138,11 @@ func (t *Transport) ConnectSSE(ctx context.Context, sessionID string) error {
 	for k, vs := range t.headers {
 		for _, v := range vs {
 			req.Header.Add(k, v)
+		}
+	}
+	if t.proofs != nil {
+		if err := t.proofs.Authorize(req, sessionID); err != nil {
+			return fmt.Errorf("sse request: %w", err)
 		}
 	}
 	// Send Last-Event-ID for replay on reconnection.
@@ -267,6 +282,14 @@ func (t *Transport) WriteMessage(ctx context.Context, data []byte) error {
 		}
 	}
 
+	if t.proofs != nil {
+		if sid := t.requestSession(req, data); sid != "" {
+			if err := t.proofs.Authorize(req, sid); err != nil {
+				return fmt.Errorf("http request: %w", err)
+			}
+		}
+	}
+
 	resp, err := t.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("http post: %w", err)
@@ -291,6 +314,28 @@ func (t *Transport) WriteMessage(ctx context.Context, data []byte) error {
 	}
 
 	return nil
+}
+
+// requestSession returns the session a POST names: the Wmp-Session-Id header,
+// the wmp metadata or, for a resume, the params. It is empty for a session
+// create, which names none.
+func (t *Transport) requestSession(req *http.Request, data []byte) string {
+	if sid := req.Header.Get(headerSessionID); sid != "" {
+		return sid
+	}
+	var m struct {
+		Params struct {
+			SessionID string `json:"session_id"`
+			WMP       struct {
+				SessionID string `json:"session_id"`
+			} `json:"wmp"`
+		} `json:"params"`
+	}
+	_ = json.Unmarshal(data, &m)
+	if m.Params.WMP.SessionID != "" {
+		return m.Params.WMP.SessionID
+	}
+	return m.Params.SessionID
 }
 
 // isResponse reports whether data is a JSON-RPC message without a method: a

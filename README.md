@@ -26,6 +26,7 @@ go get github.com/sirosfoundation/go-wmp
 | `wmp` | `github.com/sirosfoundation/go-wmp/pkg/wmp` | Core types, JSON-RPC codec, handler interface, peer, session management |
 | `ws` | `github.com/sirosfoundation/go-wmp/pkg/wmp/ws` | WebSocket transport (`wmp.v1` subprotocol) |
 | `httpsse` | `github.com/sirosfoundation/go-wmp/pkg/wmp/httpsse` | HTTPS POST + Server-Sent Events transport |
+| `proof` | `github.com/sirosfoundation/go-wmp/pkg/wmp/proof` | Per-request proof for HTTPS sessions (WMP Core §4.4.8) |
 
 ## Usage
 
