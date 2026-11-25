@@ -37,6 +37,11 @@ var b64 = base64.RawURLEncoding.Strict()
 // {"ciphertext": ...}, plus "plaintext_hash" when the sender commits to the
 // plaintext.
 func ContentObject(params []byte) ([]byte, error) {
+	// Decoding member names is lossy for text that has no canonical form
+	// (invalid UTF-8, a lone surrogate): refuse that text as it arrived.
+	if _, err := jcs.Canonicalize(params); err != nil {
+		return nil, fmt.Errorf("signature: params: %w", err)
+	}
 	members, err := object(params)
 	if err != nil {
 		return nil, fmt.Errorf("signature: params: %w", err)
@@ -204,8 +209,8 @@ func checkUnencodedPayload(header map[string]json.RawMessage) error {
 	if string(bytes.TrimSpace(header["b64"])) != "false" {
 		return invalid("b64 is not false")
 	}
-	var crit []json.RawMessage
-	if isNull(header["crit"]) || json.Unmarshal(header["crit"], &crit) != nil || len(crit) != 1 || string(bytes.TrimSpace(crit[0])) != `"b64"` {
+	var crit []string
+	if isNull(header["crit"]) || json.Unmarshal(header["crit"], &crit) != nil || len(crit) != 1 || crit[0] != "b64" {
 		return invalid(`crit is not ["b64"]`)
 	}
 	return nil

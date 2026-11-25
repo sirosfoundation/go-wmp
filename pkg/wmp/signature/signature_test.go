@@ -236,6 +236,7 @@ func TestVerifyRefusesHeaders(t *testing.T) {
 		"b64 null":                      func(h map[string]any) { h["b64"] = nil },
 		"crit absent":                   func(h map[string]any) { delete(h, "crit") },
 		"crit null":                     func(h map[string]any) { h["crit"] = nil },
+		"crit with a null entry":        func(h map[string]any) { h["crit"] = []any{nil} },
 		"an unknown critical parameter": func(h map[string]any) { h["crit"] = []string{"b64", "exp"} },
 		"alg none":                      func(h map[string]any) { h["alg"] = "none" },
 		"alg null":                      func(h map[string]any) { h["alg"] = nil },
@@ -291,7 +292,7 @@ func TestContentObject(t *testing.T) {
 	if want := `{"ciphertext":"abc","plaintext_hash":{"algorithm":"sha-256","value":"v"}}`; string(got) != want {
 		t.Fatalf("got %s, want %s", got, want)
 	}
-	for _, bad := range []string{`[]`, `{"a":1,"a":2}`, `{"a":1}x`, `null`} {
+	for _, bad := range []string{`[]`, `{"a":1,"a":2}`, `{"a":1}x`, `null`, "{\"a\xff\":1}", `{"\ud800":1}`, `{"a":"\ud800"}`} {
 		if _, err := ContentObject([]byte(bad)); err == nil {
 			t.Errorf("%s: accepted", bad)
 		}
@@ -320,5 +321,21 @@ func TestVerifiesASignatureMadeByWmpJS(t *testing.T) {
 	}
 	if _, err := v.Verify(sig, []byte(strings.Replace(vector, "AAECAwQ", "AAECAwU", 1))); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("changed content: %v", err)
+	}
+}
+
+// The critical parameter is compared by its name, whatever its JSON spelling.
+func TestVerifyAcceptsAnEscapedCriticalName(t *testing.T) {
+	f := newFixture(t, elliptic.P256())
+	header := `{"alg":"ES256","b64":false,"crit":["\u006264"],"kid":"k"}`
+	protected := base64.RawURLEncoding.EncodeToString([]byte(header))
+	canonical := `{"body":{"n":1},"content_type":"application/json","to":["x509:san:dns:bob.example.com"]}`
+	sig, err := f.signer.Sign([]byte(protected + "." + canonical))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := &Verifier{ResolveKey: func(string) (crypto.PublicKey, error) { return &f.key.PublicKey, nil }}
+	if _, err := v.Verify(protected+".."+base64.RawURLEncoding.EncodeToString(sig), []byte(content)); err != nil {
+		t.Fatal(err)
 	}
 }

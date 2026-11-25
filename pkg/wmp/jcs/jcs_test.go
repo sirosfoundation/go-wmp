@@ -99,6 +99,11 @@ func TestCanonicalizeRefuses(t *testing.T) {
 		"a number beyond a double":  `1e400`,
 		"invalid UTF-8":             "\"\xff\"",
 		"an empty text":             ``,
+		"a lone high surrogate":     `"\ud800"`,
+		"a lone low surrogate":      `"\udc00"`,
+		"a reversed pair":           `"\udc00\ud800"`,
+		"a high surrogate and text": `"\ud800x"`,
+		"a lone surrogate name":     `{"\ud83d":1}`,
 	}
 	for name, text := range cases {
 		if _, err := Canonicalize([]byte(text)); !errors.Is(err, ErrInvalid) {
@@ -114,5 +119,20 @@ func TestMarshalDoesNotEscapeHTML(t *testing.T) {
 	}
 	if want := `{"a":[2,1],"b":"<&>"}`; string(got) != want {
 		t.Fatalf("got %s, want %s", got, want)
+	}
+}
+
+func TestCanonicalizeAcceptsPairsAndTheReplacementCharacter(t *testing.T) {
+	cases := map[string]string{
+		`"\ud83d\ude00"`:      "\"\U0001F600\"",
+		`"\ufffd"`:            "\"\ufffd\"",
+		`"\\ud800"`:           `"\\ud800"`, // an escaped backslash, then text
+		`"a\\\\\ud83d\ude00"`: `"a\\\\` + "\U0001F600\"",
+	}
+	for text, want := range cases {
+		got, err := Canonicalize([]byte(text))
+		if err != nil || string(got) != want {
+			t.Errorf("%s: got %q, %v; want %q", text, got, err, want)
+		}
 	}
 }

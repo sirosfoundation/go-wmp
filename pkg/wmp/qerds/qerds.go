@@ -436,6 +436,10 @@ func (c *client) createSession(ctx context.Context, res *Result) error {
 	if result.WMP.SessionID == "" {
 		return errors.New("the response names no session")
 	}
+	// The group and the encrypted deliver need a session that negotiated MLS.
+	if !strings.HasPrefix(result.Security.Mode, "mls") {
+		return fmt.Errorf("the session's security mode is %q, not mls", result.Security.Mode)
+	}
 	c.sessionID = result.WMP.SessionID
 	res.SessionID, res.Security, res.Capabilities = result.WMP.SessionID, result.Security, result.Capabilities
 	return nil
@@ -500,11 +504,12 @@ func (c *client) resolveRecipient(ctx context.Context, recipient string) ([]mls.
 
 // acceptedSuites are the cipher suites the session negotiated, when it names any.
 func acceptedSuites(s wmp.SecurityMode) []int {
-	if len(s.CipherSuites) > 0 {
-		return s.CipherSuites
-	}
+	// The suite the responder selected binds; the list is what it would accept.
 	if s.CipherSuite != nil {
 		return []int{*s.CipherSuite}
+	}
+	if len(s.CipherSuites) > 0 {
+		return s.CipherSuites
 	}
 	return nil
 }
@@ -637,12 +642,12 @@ func (c *client) deliver(ctx context.Context, group Group, res *Result) error {
 	if id == "" {
 		id = uniqueID("msg")
 	}
-	if _, err := c.call(ctx, wmp.MethodMessageDeliver, id, params); err != nil {
-		return err
-	}
+	// Recorded before the request: when its answer is lost the ERDS may still
+	// have accepted the message, and the caller needs the id to find out.
 	res.Epoch = epoch
 	res.Message = Sent{ID: id, Content: contentJSON, Signature: sig, Plaintext: plaintext}
-	return nil
+	_, err = c.call(ctx, wmp.MethodMessageDeliver, id, params)
+	return err
 }
 
 func (c *client) repository(res *Result) string {
@@ -726,9 +731,17 @@ func (c *client) pollEvidence(ctx context.Context, res *Result) error {
 	}
 	deadline := time.Now().Add(timeout)
 	repository := c.repository(res)
+	// The timeout bounds the reads too: a repository that stalls ends the
+	// poll unconfirmed, as an elapsed timeout does.
+	caller := ctx
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	for {
 		records, err := c.readEvidence(ctx, repository, res.Message.ID)
 		if err != nil {
+			if caller.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+				return nil
+			}
 			return err
 		}
 		res.Evidence = records
@@ -740,8 +753,8 @@ func (c *client) pollEvidence(ctx context.Context, res *Result) error {
 			return nil
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-caller.Done():
+			return caller.Err()
 		case <-time.After(interval):
 		}
 	}
@@ -756,33 +769,33 @@ func Send(ctx context.Context, cfg Config) (*Result, error) {
 	if err := cfg.check(); err != nil {
 		return nil, err
 	}
-	c := newClient(&cfg)
 	res := &Result{}
-	var (
-		published map[string][]mls.KeyPackage
-		group     Group
-	)
-	steps := []struct {
-		step Step
-		run  func() error
-	}{
-		{StepSession, func() error { return c.createSession(ctx, res) }},
-		{StepResolve, func() (err error) { published, err = c.resolveRecipients(ctx); return }},
-		{StepGroup, func() (err error) { group, err = c.createGroup(ctx, published, res); return }},
-		{StepDeliver, func() error { return c.deliver(ctx, group, res) }},
-		{StepEvidence, func() error {
-			if cfg.Evidence.Skip {
-				return nil
-			}
-			return c.pollEvidence(ctx, res)
-		}},
-	}
-	for _, s := range steps {
-		if err := s.run(); err != nil {
-			return res, &Error{Step: s.step, Err: err}
-		}
+	if step, err := newClient(&cfg).run(ctx, res); err != nil {
+		return res, &Error{Step: step, Err: err}
 	}
 	return res, nil
+}
+
+// run performs the steps in order and names the one that failed.
+func (c *client) run(ctx context.Context, res *Result) (Step, error) {
+	if err := c.createSession(ctx, res); err != nil {
+		return StepSession, err
+	}
+	published, err := c.resolveRecipients(ctx)
+	if err != nil {
+		return StepResolve, err
+	}
+	group, err := c.createGroup(ctx, published, res)
+	if err != nil {
+		return StepGroup, err
+	}
+	if err := c.deliver(ctx, group, res); err != nil {
+		return StepDeliver, err
+	}
+	if c.cfg.Evidence.Skip {
+		return "", nil
+	}
+	return StepEvidence, c.pollEvidence(ctx, res)
 }
 
 func (c *client) resolveRecipients(ctx context.Context) (map[string][]mls.KeyPackage, error) {

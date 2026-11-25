@@ -448,7 +448,7 @@ func TestUniqueIDsAndAFreshKeyPackagePerSend(t *testing.T) {
 func TestDPoPProvesEveryRequest(t *testing.T) {
 	e := setup(t)
 	e.cfg.Auth = wmp.AuthTypeDPoP
-	e.cfg.Evidence = Evidence{Timeout: time.Nanosecond}
+	e.cfg.Evidence = Evidence{Timeout: 5 * time.Second, Interval: time.Minute}
 	if _, err := Send(context.Background(), e.cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +552,8 @@ func TestSuiteComesFromTheKeyPackageWithinTheSession(t *testing.T) {
 	if err != nil || res.CipherSuite != 1 {
 		t.Fatalf("got %+v, %v", res, err)
 	}
-	e.erds.security = `{"mode":"mls","cipher_suite":2}`
+	// The selected suite binds even when the list is wider.
+	e.erds.security = `{"mode":"mls","cipher_suites":[1,2],"cipher_suite":2}`
 	if _, err := Send(context.Background(), e.cfg); stepOf(err) != StepGroup {
 		t.Fatalf("a suite the session does not accept: %v", err)
 	}
@@ -678,7 +679,7 @@ func TestEvidencePollEndsUnconfirmed(t *testing.T) {
 
 func TestEvidenceRepositoryFromTheSession(t *testing.T) {
 	e := setup(t)
-	e.cfg.Evidence = Evidence{Timeout: time.Nanosecond}
+	e.cfg.Evidence = Evidence{Timeout: 5 * time.Second, Interval: time.Minute}
 	e.erds.capabilities = `{"evidence":{"repository":"` + e.erds.srv.URL + `/api/"}}`
 	if _, err := Send(context.Background(), e.cfg); err != nil {
 		t.Fatal(err)
@@ -697,7 +698,7 @@ func TestEvidenceRefusesMalformedAnswers(t *testing.T) {
 		"not JSON":              `nope`,
 	} {
 		e := setup(t)
-		e.cfg.Evidence = Evidence{Timeout: time.Nanosecond}
+		e.cfg.Evidence = Evidence{Timeout: 5 * time.Second, Interval: time.Minute}
 		e.erds.evidencePages = []string{page}
 		res, err := Send(context.Background(), e.cfg)
 		if stepOf(err) != StepEvidence {
@@ -733,5 +734,76 @@ func TestConfigIsCheckedBeforeAnyRequest(t *testing.T) {
 		if len(e.erds.calls) != 0 {
 			t.Errorf("%s: a request was made", name)
 		}
+	}
+}
+
+func TestSessionWithoutMLSIsRefused(t *testing.T) {
+	for _, mode := range []string{"tls", "none", ""} {
+		e := setup(t)
+		e.erds.security = `{"mode":"` + mode + `"}`
+		if _, err := Send(context.Background(), e.cfg); stepOf(err) != StepSession {
+			t.Errorf("mode %q: got %v", mode, err)
+		}
+		if len(e.erds.calls) != 1 || len(e.mls.requests) != 0 {
+			t.Errorf("mode %q: the flow went on", mode)
+		}
+	}
+	e := setup(t)
+	e.erds.security = `{"mode":"mls-optional","cipher_suites":[2]}`
+	if _, err := Send(context.Background(), e.cfg); err != nil {
+		t.Fatalf("mls-optional: %v", err)
+	}
+}
+
+// A deliver whose answer is lost may have been accepted: the result carries
+// what was sent, so the caller can look for its evidence.
+func TestFailedDeliverKeepsWhatWasSent(t *testing.T) {
+	e := setup(t)
+	e.erds.refuse[wmp.MethodMessageDeliver] = &wmp.RPCError{Code: -32603, Message: "Internal error"}
+	res, err := Send(context.Background(), e.cfg)
+	if stepOf(err) != StepDeliver {
+		t.Fatalf("got %v", err)
+	}
+	sent := e.erds.of(wmp.MethodMessageDeliver)[0]
+	if res.Message.ID == "" || res.Message.ID != sent.id || res.Message.Signature == "" || len(res.Message.Content) == 0 || len(res.Message.Plaintext) == 0 {
+		t.Fatalf("result message %+v", res.Message)
+	}
+}
+
+// The evidence timeout bounds a repository that does not answer.
+func TestEvidenceTimeoutBoundsAStalledRepository(t *testing.T) {
+	e := setup(t)
+	release := make(chan struct{})
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer stalled.Close()
+	defer close(release)
+	e.cfg.Evidence = Evidence{Timeout: 100 * time.Millisecond, Repository: stalled.URL}
+	done := make(chan struct{})
+	var res *Result
+	var err error
+	go func() {
+		res, err = Send(context.Background(), e.cfg)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Send did not return")
+	}
+	if err != nil || res.Confirmed || res.Message.ID == "" {
+		t.Fatalf("got %+v, %v", res, err)
+	}
+
+	// The caller's own cancellation is an error.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	e.cfg.Evidence.Timeout = time.Minute
+	if _, err := Send(ctx, e.cfg); stepOf(err) != StepEvidence {
+		t.Fatalf("cancelled: %v", err)
 	}
 }

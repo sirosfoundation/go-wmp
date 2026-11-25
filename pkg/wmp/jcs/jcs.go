@@ -33,6 +33,9 @@ func Canonicalize(text []byte) ([]byte, error) {
 	if !utf8.Valid(text) {
 		return nil, invalid("not UTF-8")
 	}
+	if err := checkSurrogates(text); err != nil {
+		return nil, err
+	}
 	dec := json.NewDecoder(bytes.NewReader(text))
 	dec.UseNumber()
 	out, err := appendValue(nil, dec, 0)
@@ -52,6 +55,42 @@ func Marshal(v any) ([]byte, error) {
 		return nil, err
 	}
 	return Canonicalize(text)
+}
+
+// checkSurrogates refuses a \u escape of a surrogate that is not half of a
+// pair. encoding/json would decode it to U+FFFD, which RFC 8785 does not
+// allow: a lone surrogate has no canonical form. A backslash occurs only
+// inside a JSON string, so the whole text can be scanned for escapes.
+func checkSurrogates(text []byte) error {
+	for i := 0; i < len(text); i++ {
+		if text[i] != '\\' {
+			continue
+		}
+		unit, ok := escapedUnit(text, i)
+		if !ok {
+			i++ // a two-character escape, or malformed JSON the decoder refuses
+			continue
+		}
+		i += 5
+		if !utf16.IsSurrogate(rune(unit)) {
+			continue
+		}
+		low, ok := escapedUnit(text, i+1)
+		if unit >= 0xdc00 || !ok || low < 0xdc00 || low > 0xdfff {
+			return invalid("a lone surrogate")
+		}
+		i += 6
+	}
+	return nil
+}
+
+// escapedUnit returns the code unit of a \uXXXX escape that starts at text[i].
+func escapedUnit(text []byte, i int) (uint16, bool) {
+	if i+6 > len(text) || text[i] != '\\' || text[i+1] != 'u' {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(string(text[i+2:i+6]), 16, 16)
+	return uint16(v), err == nil
 }
 
 func appendValue(b []byte, dec *json.Decoder, depth int) ([]byte, error) {
@@ -164,9 +203,6 @@ func lessUTF16(a, b []uint16) bool {
 // and the C0 controls are escaped.
 func appendString(b []byte, s string) ([]byte, error) {
 	const hexDigits = "0123456789abcdef"
-	// encoding/json decodes a lone surrogate escape to U+FFFD; a literal
-	// U+FFFD is indistinguishable from it, and neither is refused by RFC 8785
-	// once decoded, so only invalid UTF-8 remains to refuse here.
 	if !utf8.ValidString(s) {
 		return nil, invalid("a string is not UTF-8")
 	}
