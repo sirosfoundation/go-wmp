@@ -27,6 +27,11 @@ go get github.com/sirosfoundation/go-wmp
 | `ws` | `github.com/sirosfoundation/go-wmp/pkg/wmp/ws` | WebSocket transport (`wmp.v1` subprotocol) |
 | `httpsse` | `github.com/sirosfoundation/go-wmp/pkg/wmp/httpsse` | HTTPS POST + Server-Sent Events transport |
 | `proof` | `github.com/sirosfoundation/go-wmp/pkg/wmp/proof` | Per-request proof for HTTPS sessions (WMP Core §4.4.8) |
+| `mls` | `github.com/sirosfoundation/go-wmp/pkg/wmp/mls` | MLS group lifecycle methods and the provider interface (bring your own MLS engine) |
+| `openid4x` | `github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x` | OpenID4VCI / OpenID4VP flow profile |
+| `relay` | `github.com/sirosfoundation/go-wmp/pkg/wmp/relay` | Store-and-forward relay |
+| `schema` | `github.com/sirosfoundation/go-wmp/pkg/wmp/schema` | JSON Schema validation of WMP messages |
+| `stdio` | `github.com/sirosfoundation/go-wmp/pkg/wmp/stdio` | Newline-delimited JSON transport over stdio |
 
 ## Usage
 
@@ -79,14 +84,16 @@ func handleWMP(w http.ResponseWriter, r *http.Request) {
 
 ### Client Side (connecting to a WMP endpoint)
 
+Over WebSocket:
+
 ```go
 import (
     "github.com/sirosfoundation/go-wmp/pkg/wmp"
     "github.com/sirosfoundation/go-wmp/pkg/wmp/ws"
 )
 
-// Connect:
-transport, _, err := ws.Dial(ctx, "wss://example.com/wmp", nil)
+// Connect (the last argument allows ws:// for local development):
+transport, _, err := ws.Dial(ctx, "wss://example.com/wmp", nil, false)
 if err != nil { log.Fatal(err) }
 
 peer := wmp.NewPeer(transport, &myClientHandler{})
@@ -108,21 +115,51 @@ peer.Notify(ctx, wmp.MethodMessageDeliver, wmp.MessageDeliverParams{
 })
 ```
 
-## Phase 1 Scope
+Over HTTPS POST + Server-Sent Events:
 
-This initial release covers:
+```go
+import (
+    "github.com/sirosfoundation/go-wmp/pkg/wmp"
+    "github.com/sirosfoundation/go-wmp/pkg/wmp/httpsse"
+)
 
-- **Core types** — All WMP message types, metadata, capabilities, security modes
-- **JSON-RPC 2.0 codec** — Request/response/notification/batch encoding
-- **Handler interface** — With `BaseHandler` for embedding
-- **Peer** — Bidirectional JSON-RPC over any transport (Call, Notify, Serve)
-- **Session management** — Session type + in-memory store
-- **WebSocket transport** — gorilla/websocket with `wmp.v1` subprotocol
-- **HTTPS+SSE transport** — Client and server-side HTTP transport
+transport, err := httpsse.NewClientTransport("https://example.com/wmp")
+if err != nil { log.Fatal(err) }
 
-Not yet implemented: MLS encryption, eDelivery profile, evidence profile.
+peer := wmp.NewPeer(transport, &myClientHandler{})
+go peer.Serve(ctx)
+
+var result wmp.SessionCreateResult
+err = peer.Call(ctx, wmp.MethodSessionCreate, wmp.SessionCreateParams{
+    WMP:      wmp.Metadata{Version: wmp.Version, Sender: "did:web:me.example.com"},
+    Security: wmp.SecurityMode{Mode: "tls"},
+    TTL:      3600,
+}, &result)
+
+// Open the event stream of the session: server-initiated messages arrive on it.
+err = transport.ConnectSSE(ctx, result.WMP.SessionID)
+```
+
+The order matters: the session create first, `ConnectSSE` after it. A session whose stream was never opened sends but receives no events.
+
+Options: `httpsse.WithHTTPClient` (for example a client with a TLS client certificate), `httpsse.WithHeaders` (for example an `Authorization` header) and `httpsse.WithProof` (the per-request proof of WMP Core §4.4.8 on every request).
+
+The snippets above are compiled as the package examples in `pkg/wmp/ws` and `pkg/wmp/httpsse`.
+
+## Scope
+
+- **Core types** — WMP message types, metadata, capabilities, security modes
+- **JSON-RPC 2.0 codec** — request/response/notification/batch encoding
+- **Handler interface** — with `BaseHandler` for embedding
+- **Peer** — bidirectional JSON-RPC over any transport (Call, Notify, Serve)
+- **Session management** — session service, session type and in-memory store
+- **Transports** — WebSocket (`wmp.v1` subprotocol), HTTPS+SSE (client and server), stdio
+- **Profiles** — OpenID4VCI / OpenID4VP flows, MLS group methods, relay
+- **Per-request proof** — creation and verification
+
+The MLS package defines the methods and a provider interface; the MLS cryptography itself comes from an engine the application supplies.
 
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sirosfoundation/go-wmp/badge)](https://scorecard.dev/viewer/?uri=github.com/sirosfoundation/go-wmp)
 ## License
 
-Apache 2.0
+[BSD-2-Clause](LICENSE) — Copyright (c) 2026, SIROS Foundation
