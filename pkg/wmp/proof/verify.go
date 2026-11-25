@@ -80,10 +80,13 @@ type Expect struct {
 	Method string
 	// URL is the URL the request was sent to, as the client saw it.
 	URL string
-	// SessionID is the session the request names. When it is empty the
-	// "sid" claim is not compared and the caller MUST compare the returned
-	// Proof.SessionID itself.
+	// SessionID is the session the request names. When it is empty and
+	// NoSession is false the "sid" claim is not compared and the caller
+	// MUST compare the returned Proof.SessionID itself.
 	SessionID string
+	// NoSession says the request names no session (wmp.session.create):
+	// the proof must then carry no "sid".
+	NoSession bool
 	// AccessToken is the bearer token the request also carries. When set,
 	// the proof must carry its hash in "ath"; when empty, a proof with an
 	// "ath" is refused.
@@ -123,22 +126,8 @@ func (v *Verifier) Verify(compact string, want Expect) (*Proof, error) {
 		return nil, err
 	}
 
-	if want.SessionID != "" && subtle.ConstantTimeCompare([]byte(p.SessionID), []byte(want.SessionID)) != 1 {
-		return nil, invalid("sid does not name this session")
-	}
-	if p.Method != want.Method {
-		return nil, invalid("htm does not match the request")
-	}
-	wantURL, err := normalizeURL(want.URL, true)
-	if err != nil {
-		return nil, invalid("request URL: %v", err)
-	}
-	gotURL, err := normalizeURL(p.URL, false)
-	if err != nil || gotURL != wantURL {
-		return nil, invalid("htu does not match the request")
-	}
-	if p.TokenHash != tokenHash(want.AccessToken) {
-		return nil, invalid("ath does not match the access token")
+	if err := p.checkBinding(want); err != nil {
+		return nil, err
 	}
 
 	now := time.Now()
@@ -165,9 +154,38 @@ func (v *Verifier) Verify(compact string, want Expect) (*Proof, error) {
 	return p, nil
 }
 
+// checkBinding checks that the claims name the session, the request and the
+// access token of want.
+func (p *Proof) checkBinding(want Expect) error {
+	if want.NoSession && (want.SessionID != "" || p.SessionID != "") {
+		return invalid("sid on a request that names no session")
+	}
+	if want.SessionID != "" && subtle.ConstantTimeCompare([]byte(p.SessionID), []byte(want.SessionID)) != 1 {
+		return invalid("sid does not name this session")
+	}
+	if p.Method != want.Method {
+		return invalid("htm does not match the request")
+	}
+	wantURL, err := normalizeURL(want.URL, true)
+	if err != nil {
+		return invalid("request URL: %v", err)
+	}
+	gotURL, err := normalizeURL(p.URL, false)
+	if err != nil || gotURL != wantURL {
+		return invalid("htu does not match the request")
+	}
+	if p.TokenHash != tokenHash(want.AccessToken) {
+		return invalid("ath does not match the access token")
+	}
+	return nil
+}
+
 // VerifyRequest checks the proof in the Authorization header of r. url is
 // the URL the client sent the request to; when it is empty it is taken from
 // r (see RequestURL), which is only right when no proxy rewrites the request.
+// When sessionID is empty the "sid" claim is not compared: the caller MUST
+// compare the returned Proof.SessionID with the session the request names
+// (none for a wmp.session.create).
 func (v *Verifier) VerifyRequest(r *http.Request, url, sessionID string) (*Proof, error) {
 	compact, ok := FromHeader(r.Header.Get("Authorization"))
 	if !ok {
@@ -308,8 +326,12 @@ func parseClaims(raw []byte) (Claims, error) {
 	if c.ID, err = stringMember(members, "jti"); err != nil {
 		return c, err
 	}
-	if c.SessionID, err = stringMember(members, "sid"); err != nil {
-		return c, err
+	// "sid" is omitted on a wmp.session.create; when present it is a
+	// non-empty string.
+	if _, ok := members["sid"]; ok {
+		if c.SessionID, err = stringMember(members, "sid"); err != nil {
+			return c, err
+		}
 	}
 	if _, ok := members["ath"]; ok {
 		if c.TokenHash, err = stringMember(members, "ath"); err != nil {

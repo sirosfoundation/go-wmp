@@ -59,7 +59,8 @@ type Claims struct {
 	IssuedAt int64
 	// ID is "jti": the unique identifier of this proof.
 	ID string
-	// SessionID is "sid": the WMP session the proof is bound to.
+	// SessionID is "sid": the WMP session the proof is bound to. Empty for
+	// the proof of a wmp.session.create, which carries no "sid".
 	SessionID string
 	// TokenHash is "ath": the base64url SHA-256 of the access token the
 	// request also carries (RFC 9449 section 4.2). Empty when there is none.
@@ -81,8 +82,10 @@ func (c Claims) canonical() ([]byte, error) {
 	b = strconv.AppendInt(b, c.IssuedAt, 10)
 	b = append(b, ',')
 	b = appendMember(b, "jti", c.ID)
-	b = append(b, ',')
-	b = appendMember(b, "sid", c.SessionID)
+	if c.SessionID != "" {
+		b = append(b, ',')
+		b = appendMember(b, "sid", c.SessionID)
+	}
 	b = append(b, '}')
 	for _, s := range []string{c.TokenHash, c.Method, c.URL, c.ID, c.SessionID} {
 		if !utf8.ValidString(s) {
@@ -230,7 +233,8 @@ type Request struct {
 	Method string
 	// URL is the request URL. Its query and fragment are left out of "htu".
 	URL string
-	// SessionID is the WMP session of the request. Required.
+	// SessionID is the WMP session of the request. It is empty only for a
+	// wmp.session.create, whose proof carries no "sid".
 	SessionID string
 	// AccessToken is the bearer token the request also carries (the dpop
 	// auth type); its hash becomes "ath". Empty when there is none.
@@ -245,8 +249,8 @@ func (c *Creator) Proof(req Request) (string, error) {
 	if (len(c.Chain) == 0) == (c.KeyID == "") {
 		return "", errors.New("proof: exactly one of Chain and KeyID is required")
 	}
-	if req.Method == "" || req.SessionID == "" {
-		return "", errors.New("proof: method and session id are required")
+	if req.Method == "" {
+		return "", errors.New("proof: method is required")
 	}
 	htu, err := normalizeURL(req.URL, true)
 	if err != nil {
@@ -296,7 +300,7 @@ func (c *Creator) Proof(req Request) (string, error) {
 }
 
 // Authorize sets the Authorization header of r to a proof for it on the
-// session sessionID.
+// session sessionID. sessionID is empty only for a wmp.session.create.
 func (c *Creator) Authorize(r *http.Request, sessionID string) error {
 	p, err := c.Proof(Request{Method: r.Method, URL: r.URL.String(), SessionID: sessionID})
 	if err != nil {

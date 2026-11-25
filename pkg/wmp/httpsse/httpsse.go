@@ -64,8 +64,8 @@ func WithHeaders(h http.Header) ClientOption {
 }
 
 // WithProof sends a per-request proof (WMP Core section 4.4.8) as the
-// Authorization header of every request that names a session: each POST
-// after the session create and each event stream. It replaces an
+// Authorization header of the session create (a proof without "sid"), of
+// every POST that names a session and of each event stream. It replaces an
 // Authorization header set with WithHeaders on those requests.
 func WithProof(c *proof.Creator) ClientOption {
 	return func(t *Transport) { t.proofs = c }
@@ -312,17 +312,24 @@ func (t *Transport) WriteMessage(ctx context.Context, data []byte) error {
 	return nil
 }
 
-// prove adds a per-request proof to a POST that names a session, when
-// proofs are configured.
+// prove adds a per-request proof to a POST that names a session and to a
+// session create (whose proof names none), when proofs are configured.
 func (t *Transport) prove(req *http.Request, data []byte) error {
 	if t.proofs == nil {
 		return nil
 	}
 	sid := t.requestSession(req, data)
-	if sid == "" {
+	if sid == "" && !isSessionCreate(data) {
 		return nil
 	}
 	return t.proofs.Authorize(req, sid)
+}
+
+func isSessionCreate(data []byte) bool {
+	var m struct {
+		Method string `json:"method"`
+	}
+	return json.Unmarshal(data, &m) == nil && m.Method == wmp.MethodSessionCreate
 }
 
 // requestSession returns the session a POST names: the Wmp-Session-Id header,

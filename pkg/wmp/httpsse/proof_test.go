@@ -142,9 +142,28 @@ func TestProofMustNameTheSessionMethodAndURL(t *testing.T) {
 	}
 }
 
-// A proof is bound to an existing session: it does not create one, whatever
-// session it names.
-func TestProofDoesNotCreateASession(t *testing.T) {
+// A wmp.session.create is authenticated by a proof without a sid: the
+// session belongs to the proof's identity and its later proofs act on it.
+func TestProofWithoutSidCreatesASession(t *testing.T) {
+	f, pki := newProofFixture(t)
+	wallet := pki.wallet(t, "https://alice.example.com")
+	r := f.post(f.proofFor(wallet, "POST", "", ""), nil, createBody("c1"))
+	res, _ := r.Body["result"].(map[string]any)
+	if res == nil {
+		t.Fatalf("create: %d %s", r.Status, r.Raw)
+	}
+	id, _ := res["wmp"].(map[string]any)["session_id"].(string)
+	if r := f.post(f.proofFor(wallet, "POST", "", id), nil, pingBody(id)); r.Status != http.StatusOK || rpcCode(r) != wmp.ErrMethodNotFound {
+		t.Fatalf("own session: %d %s", r.Status, r.Raw)
+	}
+	// The proof without a sid does not act on the session.
+	if r := f.post(f.proofFor(wallet, "POST", "", ""), nil, pingBody(id)); r.Status != http.StatusUnauthorized {
+		t.Fatalf("sid-less proof on a session: %d %s", r.Status, r.Raw)
+	}
+}
+
+// A proof that names a session does not create one.
+func TestProofWithSidDoesNotCreateASession(t *testing.T) {
 	f, pki := newProofFixture(t)
 	wallet := pki.wallet(t, "https://alice.example.com")
 	count := func() int { l, _ := f.store.List(); return len(l) }
@@ -154,6 +173,21 @@ func TestProofDoesNotCreateASession(t *testing.T) {
 	}
 	if got := count(); got != before {
 		t.Fatalf("sessions: %d, want %d", got, before)
+	}
+}
+
+// The Principal callback decides who may create a session with a proof.
+func TestProofCreateIsRefusedByThePrincipalCallback(t *testing.T) {
+	pki := newProofPKI(t)
+	f := newSecuredFixture(t, func(cfg *ServerConfig) {
+		cfg.Proof = &ProofConfig{
+			Verifier:  &proof.Verifier{Roots: pki.roots},
+			Principal: func(*proof.Proof) (wmp.Principal, error) { return wmp.Principal{}, errors.New("not welcome") },
+		}
+	})
+	wallet := pki.wallet(t, "https://alice.example.com")
+	if r := f.post(f.proofFor(wallet, "POST", "", ""), nil, createBody("c1")); r.Status != http.StatusUnauthorized {
+		t.Fatalf("%d %s", r.Status, r.Raw)
 	}
 }
 
@@ -228,14 +262,13 @@ func TestProofConfigWithoutVerifierFailsClosed(t *testing.T) {
 	}
 }
 
-// The client transport proves each request that names a session and leaves
-// the create, which names none, to the configured headers.
+// The client transport proves the create (without a sid), each request that
+// names a session and the event stream. No other credential is configured.
 func TestClientTransportSendsProofs(t *testing.T) {
 	f, pki := newProofFixture(t)
 	const alice = "https://alice.example.com"
 	tr, err := NewClientTransport(f.ts.URL,
 		WithInsecure(true),
-		WithHeaders(http.Header{"Authorization": {"Bearer " + alice}}),
 		WithProof(pki.wallet(t, alice)))
 	if err != nil {
 		t.Fatal(err)
