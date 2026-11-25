@@ -222,6 +222,7 @@ var (
 )
 
 const (
+	jsonType         = "application/json"
 	maxResponse      = 4 << 20
 	maxEvidencePages = 100
 )
@@ -243,6 +244,23 @@ func isNull(raw json.RawMessage) bool {
 	return s == "" || s == "null"
 }
 
+func checkRecipients(recipients []string) error {
+	if len(recipients) == 0 {
+		return fail(StepConfig, "at least one recipient is required")
+	}
+	seen := map[string]bool{}
+	for _, r := range recipients {
+		if r == "" {
+			return fail(StepConfig, "a recipient is empty")
+		}
+		if seen[r] {
+			return fail(StepConfig, "recipient %s is named twice", r)
+		}
+		seen[r] = true
+	}
+	return nil
+}
+
 func (c *Config) check() error {
 	u, err := url.Parse(c.Endpoint)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
@@ -251,18 +269,8 @@ func (c *Config) check() error {
 	if c.Sender == "" {
 		return fail(StepConfig, "Sender is required")
 	}
-	if len(c.Recipients) == 0 {
-		return fail(StepConfig, "at least one recipient is required")
-	}
-	seen := map[string]bool{}
-	for _, r := range c.Recipients {
-		if r == "" {
-			return fail(StepConfig, "a recipient is empty")
-		}
-		if seen[r] {
-			return fail(StepConfig, "recipient %s is named twice", r)
-		}
-		seen[r] = true
+	if err := checkRecipients(c.Recipients); err != nil {
+		return err
 	}
 	if len(c.Credential.Chain) == 0 {
 		return fail(StepConfig, "Credential.Chain is empty")
@@ -316,9 +324,9 @@ func (c *client) do(ctx context.Context, method, target string, body []byte) ([]
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", jsonType)
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", jsonType)
 	}
 	if c.sessionID != "" {
 		req.Header.Set("Wmp-Session-Id", c.sessionID)
@@ -578,7 +586,7 @@ func (c *client) deliver(ctx context.Context, group Group, res *Result) error {
 	cfg := c.cfg
 	contentType := cfg.Message.ContentType
 	if contentType == "" {
-		contentType = "application/json"
+		contentType = jsonType
 	}
 	// The recipients, content type and body travel inside the ciphertext
 	// only: a "to" next to "ciphertext" would be read as a plaintext message.
@@ -750,30 +758,41 @@ func Send(ctx context.Context, cfg Config) (*Result, error) {
 	}
 	c := newClient(&cfg)
 	res := &Result{}
-
-	if err := c.createSession(ctx, res); err != nil {
-		return res, &Error{Step: StepSession, Err: err}
+	var (
+		published map[string][]mls.KeyPackage
+		group     Group
+	)
+	steps := []struct {
+		step Step
+		run  func() error
+	}{
+		{StepSession, func() error { return c.createSession(ctx, res) }},
+		{StepResolve, func() (err error) { published, err = c.resolveRecipients(ctx); return }},
+		{StepGroup, func() (err error) { group, err = c.createGroup(ctx, published, res); return }},
+		{StepDeliver, func() error { return c.deliver(ctx, group, res) }},
+		{StepEvidence, func() error {
+			if cfg.Evidence.Skip {
+				return nil
+			}
+			return c.pollEvidence(ctx, res)
+		}},
 	}
-	published := make(map[string][]mls.KeyPackage, len(cfg.Recipients))
-	for _, r := range cfg.Recipients {
+	for _, s := range steps {
+		if err := s.run(); err != nil {
+			return res, &Error{Step: s.step, Err: err}
+		}
+	}
+	return res, nil
+}
+
+func (c *client) resolveRecipients(ctx context.Context) (map[string][]mls.KeyPackage, error) {
+	published := make(map[string][]mls.KeyPackage, len(c.cfg.Recipients))
+	for _, r := range c.cfg.Recipients {
 		kps, err := c.resolveRecipient(ctx, r)
 		if err != nil {
-			return res, &Error{Step: StepResolve, Err: fmt.Errorf("%s: %w", r, err)}
+			return nil, fmt.Errorf("%s: %w", r, err)
 		}
 		published[r] = kps
 	}
-	group, err := c.createGroup(ctx, published, res)
-	if err != nil {
-		return res, &Error{Step: StepGroup, Err: err}
-	}
-	if err := c.deliver(ctx, group, res); err != nil {
-		return res, &Error{Step: StepDeliver, Err: err}
-	}
-	if cfg.Evidence.Skip {
-		return res, nil
-	}
-	if err := c.pollEvidence(ctx, res); err != nil {
-		return res, &Error{Step: StepEvidence, Err: err}
-	}
-	return res, nil
+	return published, nil
 }

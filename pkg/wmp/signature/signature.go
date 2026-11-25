@@ -93,10 +93,11 @@ func Sign(content []byte, signer proof.Signer, opts Options) (string, error) {
 
 // signingInput is ASCII(header) || "." || M, the payload M unencoded.
 func signingInput(protected string, canonical []byte) []byte {
-	input := make([]byte, 0, len(protected)+1+len(canonical))
-	input = append(input, protected...)
-	input = append(input, '.')
-	return append(input, canonical...)
+	var input bytes.Buffer
+	input.WriteString(protected)
+	input.WriteByte('.')
+	input.Write(canonical)
+	return input.Bytes()
 }
 
 // Signature is a verified content signature.
@@ -186,19 +187,34 @@ func (v *Verifier) parseHeader(raw []byte) (*Signature, error) {
 	if json.Unmarshal(header["alg"], &s.Algorithm) != nil || isNull(header["alg"]) || !v.allows(s.Algorithm) {
 		return nil, invalid("algorithm is not accepted")
 	}
-	if string(bytes.TrimSpace(header["b64"])) != "false" {
-		return nil, invalid("b64 is not false")
-	}
-	// "b64" must be critical and is the only critical parameter understood here.
-	var crit []json.RawMessage
-	if isNull(header["crit"]) || json.Unmarshal(header["crit"], &crit) != nil || len(crit) != 1 || string(bytes.TrimSpace(crit[0])) != `"b64"` {
-		return nil, invalid(`crit is not ["b64"]`)
+	if err := checkUnencodedPayload(header); err != nil {
+		return nil, err
 	}
 	if raw, ok := header["kid"]; ok {
 		if isNull(raw) || json.Unmarshal(raw, &s.KeyID) != nil || s.KeyID == "" {
 			return nil, invalid("kid is not a non-empty string")
 		}
 	}
+	return v.resolveKey(s, header)
+}
+
+// checkUnencodedPayload requires the RFC 7797 header parameters: "b64" false
+// and critical, as the only critical parameter (none other is understood).
+func checkUnencodedPayload(header map[string]json.RawMessage) error {
+	if string(bytes.TrimSpace(header["b64"])) != "false" {
+		return invalid("b64 is not false")
+	}
+	var crit []json.RawMessage
+	if isNull(header["crit"]) || json.Unmarshal(header["crit"], &crit) != nil || len(crit) != 1 || string(bytes.TrimSpace(crit[0])) != `"b64"` {
+		return invalid(`crit is not ["b64"]`)
+	}
+	return nil
+}
+
+// resolveKey sets the key the header names: the leaf of its "x5c" chain when
+// there is one, otherwise the key of its "kid".
+func (v *Verifier) resolveKey(s *Signature, header map[string]json.RawMessage) (*Signature, error) {
+	var err error
 	if raw, ok := header["x5c"]; ok {
 		if s.Chain, err = parseChain(raw); err != nil {
 			return nil, err

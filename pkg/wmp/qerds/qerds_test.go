@@ -280,17 +280,9 @@ func stepOf(err error) Step {
 	return ""
 }
 
-func TestSendRunsTheConsignment(t *testing.T) {
-	e := setup(t)
-	res, err := Send(context.Background(), e.cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{wmp.MethodSessionCreate, wmp.MethodResolve, wmp.MethodResolve, mls.MethodGroupCreate, wmp.MethodMessageDeliver}
-	if got := e.erds.methods(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("methods %v", got)
-	}
-
+// assertCreate checks the session create: no session, no proof, the defaults.
+func assertCreate(t *testing.T, e *env) {
+	t.Helper()
 	create := e.erds.calls[0]
 	if create.header.Get("Wmp-Session-Id") != "" || create.header.Get("Authorization") != "" {
 		t.Fatalf("create headers %v", create.header)
@@ -315,7 +307,12 @@ func TestSendRunsTheConsignment(t *testing.T) {
 	if !strings.Contains(string(cp.Caps["evidence"]), "delivery_confirmed") {
 		t.Fatalf("capabilities %s", create.params)
 	}
+}
 
+// assertRequestsInSession checks that every later request names the session
+// and that the recipient is resolved as a participant, then for a KeyPackage.
+func assertRequestsInSession(t *testing.T, e *env) {
+	t.Helper()
 	for _, c := range e.erds.calls[1:] {
 		var p struct {
 			WMP wmp.Metadata `json:"wmp"`
@@ -334,6 +331,21 @@ func TestSendRunsTheConsignment(t *testing.T) {
 	if !reflect.DeepEqual(types, []string{"participant " + bob, "mls_key_packages " + bob}) {
 		t.Fatalf("resolves %v", types)
 	}
+}
+
+func TestSendRunsTheConsignment(t *testing.T) {
+	e := setup(t)
+	res, err := Send(context.Background(), e.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{wmp.MethodSessionCreate, wmp.MethodResolve, wmp.MethodResolve, mls.MethodGroupCreate, wmp.MethodMessageDeliver}
+	if got := e.erds.methods(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("methods %v", got)
+	}
+
+	assertCreate(t, e)
+	assertRequestsInSession(t, e)
 
 	var gp mls.GroupCreateParams
 	_ = json.Unmarshal(e.erds.of(mls.MethodGroupCreate)[0].params, &gp)
