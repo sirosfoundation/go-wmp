@@ -135,9 +135,10 @@ err = peer.Call(ctx, wmp.MethodSessionCreate, wmp.SessionCreateParams{
     Security: wmp.SecurityMode{Mode: "tls"},
     TTL:      3600,
 }, &result)
+if err != nil { log.Fatal(err) }
 
 // Open the event stream of the session: server-initiated messages arrive on it.
-err = transport.ConnectSSE(ctx, result.WMP.SessionID)
+if err := transport.ConnectSSE(ctx, result.WMP.SessionID); err != nil { log.Fatal(err) }
 ```
 
 The order matters: the session create first, `ConnectSSE` after it. A session whose stream was never opened sends but receives no events.
