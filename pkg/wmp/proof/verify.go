@@ -126,25 +126,8 @@ func (v *Verifier) Verify(compact string, want Expect) (*Proof, error) {
 		return nil, err
 	}
 
-	if want.NoSession && (want.SessionID != "" || p.SessionID != "") {
-		return nil, invalid("sid on a request that names no session")
-	}
-	if want.SessionID != "" && subtle.ConstantTimeCompare([]byte(p.SessionID), []byte(want.SessionID)) != 1 {
-		return nil, invalid("sid does not name this session")
-	}
-	if p.Method != want.Method {
-		return nil, invalid("htm does not match the request")
-	}
-	wantURL, err := normalizeURL(want.URL, true)
-	if err != nil {
-		return nil, invalid("request URL: %v", err)
-	}
-	gotURL, err := normalizeURL(p.URL, false)
-	if err != nil || gotURL != wantURL {
-		return nil, invalid("htu does not match the request")
-	}
-	if p.TokenHash != tokenHash(want.AccessToken) {
-		return nil, invalid("ath does not match the access token")
+	if err := p.checkBinding(want); err != nil {
+		return nil, err
 	}
 
 	now := time.Now()
@@ -169,6 +152,32 @@ func (v *Verifier) Verify(compact string, want Expect) (*Proof, error) {
 		return nil, invalid("jti was already used")
 	}
 	return p, nil
+}
+
+// checkBinding checks that the claims name the session, the request and the
+// access token of want.
+func (p *Proof) checkBinding(want Expect) error {
+	if want.NoSession && (want.SessionID != "" || p.SessionID != "") {
+		return invalid("sid on a request that names no session")
+	}
+	if want.SessionID != "" && subtle.ConstantTimeCompare([]byte(p.SessionID), []byte(want.SessionID)) != 1 {
+		return invalid("sid does not name this session")
+	}
+	if p.Method != want.Method {
+		return invalid("htm does not match the request")
+	}
+	wantURL, err := normalizeURL(want.URL, true)
+	if err != nil {
+		return invalid("request URL: %v", err)
+	}
+	gotURL, err := normalizeURL(p.URL, false)
+	if err != nil || gotURL != wantURL {
+		return invalid("htu does not match the request")
+	}
+	if p.TokenHash != tokenHash(want.AccessToken) {
+		return invalid("ath does not match the access token")
+	}
+	return nil
 }
 
 // VerifyRequest checks the proof in the Authorization header of r. url is
