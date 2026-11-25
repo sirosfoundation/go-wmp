@@ -45,6 +45,13 @@ type ServerConfig struct {
 	// Service (embed wmp.SessionHandler). Default: wmp.NewSessionHandler.
 	NewHandler func(ctx context.Context, p wmp.Principal, sessionID string) (wmp.Handler, []wmp.PeerOption)
 
+	// Proof, when set, requires a per-request proof (WMP Core section
+	// 4.4.8) on every request that names a session. Use it when TLS is
+	// terminated in front of this handler without forwarding the client
+	// certificate. A request that names no session (wmp.session.create)
+	// is authenticated by Authenticate.
+	Proof *ProofConfig
+
 	// IdleTimeout drops the in-memory state of a session that had no request
 	// and no open event stream for this long. The stored session is kept and
 	// is rebuilt on its next request. Zero means never.
@@ -127,6 +134,16 @@ func (h *ServerHandler) WithPrincipal(p wmp.Principal) http.Handler {
 }
 
 func (h *ServerHandler) serveSecured(w http.ResponseWriter, r *http.Request) {
+	if pc := h.secured.cfg.Proof; pc != nil {
+		if p, bound, ok := pc.authenticate(r); ok {
+			h.ServeAuthenticated(w, r.WithContext(context.WithValue(r.Context(), proofKey{}, bound)), p)
+			return
+		} else if bound.presented {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), proofKey{}, proofState{}))
+	}
 	auth := h.secured.cfg.Authenticate
 	if auth == nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -217,6 +234,11 @@ func (h *ServerHandler) postSecured(w http.ResponseWriter, r *http.Request, p wm
 	}
 	env, id, ok := routeOf(w, r, body)
 	if !ok {
+		return
+	}
+
+	if !proofBinds(r, id) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -580,6 +602,10 @@ func (h *ServerHandler) getSecured(w http.ResponseWriter, r *http.Request, p wmp
 	id, ok := agreedSessionID([]string{r.URL.Query().Get("session_id"), r.Header.Get(headerSessionID)})
 	if !ok || id == "" {
 		http.Error(w, "missing or conflicting session id", http.StatusBadRequest)
+		return
+	}
+	if !proofBinds(r, id) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	sess, code := h.lookup(wmp.ContextWithPrincipal(r.Context(), p), p, id, false)
