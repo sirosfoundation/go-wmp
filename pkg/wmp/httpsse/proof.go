@@ -9,13 +9,17 @@ import (
 )
 
 // ProofConfig makes a secured handler require the per-request proof of WMP
-// Core section 4.4.8.
+// Core section 4.4.8. A request that names a session needs a proof whose
+// "sid" is that session. A wmp.session.create is authenticated by a proof
+// without a "sid", or, when it carries no proof, by Authenticate.
 type ProofConfig struct {
 	// Verifier checks the proofs. Required.
 	Verifier *proof.Verifier
 
 	// Principal maps a verified proof to the Principal it authenticates,
-	// from the leaf certificate's SAN or the key id. The session lookup
+	// from the leaf certificate's SAN or the key id. It decides who may
+	// create a session with a proof: go-wmp has verified the proof, not
+	// that its identity is welcome. The session lookup
 	// then admits the request only on a session that Principal created,
 	// which is the identity match of the verification's last step: a proof
 	// of another identity is answered as an unknown session (-31000, or 404
@@ -34,7 +38,7 @@ type proofKey struct{}
 // proofState is what serveSecured learned about the proof of a request.
 type proofState struct {
 	presented bool
-	sessionID string // the verified "sid"
+	sessionID string // the verified "sid"; empty when the proof has none
 }
 
 // authenticate verifies the proof of r, if it carries one. ok is false when
@@ -66,8 +70,8 @@ func (c *ProofConfig) authenticate(r *http.Request) (wmp.Principal, proofState, 
 // proofBinds reports whether the request may act on session id: a handler
 // that requires proofs admits a request naming a session only with a
 // verified proof whose "sid" is that session. A request that names none
-// (wmp.session.create) is admitted only as authenticated by Authenticate: a
-// proof is bound to an existing session and never creates one. A request
+// (wmp.session.create) is admitted with a proof that has no "sid", or
+// without a proof as authenticated by Authenticate. A request
 // that did not come through ServeHTTP (ServeAuthenticated, WithPrincipal)
 // was authenticated by the embedder and is not checked here.
 func proofBinds(r *http.Request, id string) bool {
@@ -76,7 +80,7 @@ func proofBinds(r *http.Request, id string) bool {
 		return true
 	}
 	if id == "" {
-		return !state.presented
+		return state.sessionID == ""
 	}
 	return state.presented && subtle.ConstantTimeCompare([]byte(state.sessionID), []byte(id)) == 1
 }

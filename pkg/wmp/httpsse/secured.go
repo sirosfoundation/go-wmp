@@ -49,7 +49,7 @@ type ServerConfig struct {
 	// 4.4.8) on every request that names a session. Use it when TLS is
 	// terminated in front of this handler without forwarding the client
 	// certificate. A request that names no session (wmp.session.create)
-	// is authenticated by Authenticate.
+	// is authenticated by a proof without a "sid" or by Authenticate.
 	Proof *ProofConfig
 
 	// IdleTimeout drops the in-memory state of a session that had no request

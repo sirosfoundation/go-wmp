@@ -236,6 +236,30 @@ func TestSkewBoundaryAndToken(t *testing.T) {
 	}
 }
 
+// The proof of a wmp.session.create carries no sid (WMP Core 4.4.8).
+func TestSessionCreateProofHasNoSid(t *testing.T) {
+	f := newFixture(t, elliptic.P256())
+	f.req.SessionID = ""
+	compact := f.proof(t)
+	payload, _ := b64.DecodeString(strings.Split(compact, ".")[1])
+	if strings.Contains(string(payload), `"sid"`) || !strings.HasSuffix(string(payload), `"}`) {
+		t.Fatalf("payload %s", payload)
+	}
+	p, err := f.verifier.Verify(compact, Expect{Method: "POST", URL: f.want.URL, NoSession: true})
+	if err != nil || p.SessionID != "" {
+		t.Fatalf("%v %+v", err, p)
+	}
+	// It is not a proof for a session.
+	if _, err := f.verifier.Verify(compact, f.want); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("on a session: %v", err)
+	}
+	// And a session's proof does not pass where none is named.
+	f.req.SessionID = "ses-a1b2c3d4"
+	if _, err := f.verifier.Verify(f.proof(t), Expect{Method: "POST", URL: f.want.URL, NoSession: true}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("sid on a create: %v", err)
+	}
+}
+
 func TestUnboundSessionIsReturnedToTheCaller(t *testing.T) {
 	f := newFixture(t, elliptic.P256())
 	f.want.SessionID = ""
@@ -368,7 +392,6 @@ func TestVerifyRefusesTamperingAndGarbage(t *testing.T) {
 func TestCreatorRefusesIncompleteInput(t *testing.T) {
 	f := newFixture(t, elliptic.P256())
 	for name, mutate := range map[string]func(){
-		"no session":    func() { f.req.SessionID = "" },
 		"no method":     func() { f.req.Method = "" },
 		"relative url":  func() { f.req.URL = "/wmp" },
 		"chain and kid": func() { f.creator.KeyID = "k" },

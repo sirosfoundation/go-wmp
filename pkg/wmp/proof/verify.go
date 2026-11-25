@@ -80,10 +80,13 @@ type Expect struct {
 	Method string
 	// URL is the URL the request was sent to, as the client saw it.
 	URL string
-	// SessionID is the session the request names. When it is empty the
-	// "sid" claim is not compared and the caller MUST compare the returned
-	// Proof.SessionID itself.
+	// SessionID is the session the request names. When it is empty and
+	// NoSession is false the "sid" claim is not compared and the caller
+	// MUST compare the returned Proof.SessionID itself.
 	SessionID string
+	// NoSession says the request names no session (wmp.session.create):
+	// the proof must then carry no "sid".
+	NoSession bool
 	// AccessToken is the bearer token the request also carries. When set,
 	// the proof must carry its hash in "ath"; when empty, a proof with an
 	// "ath" is refused.
@@ -123,6 +126,9 @@ func (v *Verifier) Verify(compact string, want Expect) (*Proof, error) {
 		return nil, err
 	}
 
+	if want.NoSession && (want.SessionID != "" || p.SessionID != "") {
+		return nil, invalid("sid on a request that names no session")
+	}
 	if want.SessionID != "" && subtle.ConstantTimeCompare([]byte(p.SessionID), []byte(want.SessionID)) != 1 {
 		return nil, invalid("sid does not name this session")
 	}
@@ -168,6 +174,9 @@ func (v *Verifier) Verify(compact string, want Expect) (*Proof, error) {
 // VerifyRequest checks the proof in the Authorization header of r. url is
 // the URL the client sent the request to; when it is empty it is taken from
 // r (see RequestURL), which is only right when no proxy rewrites the request.
+// When sessionID is empty the "sid" claim is not compared: the caller MUST
+// compare the returned Proof.SessionID with the session the request names
+// (none for a wmp.session.create).
 func (v *Verifier) VerifyRequest(r *http.Request, url, sessionID string) (*Proof, error) {
 	compact, ok := FromHeader(r.Header.Get("Authorization"))
 	if !ok {
@@ -308,8 +317,12 @@ func parseClaims(raw []byte) (Claims, error) {
 	if c.ID, err = stringMember(members, "jti"); err != nil {
 		return c, err
 	}
-	if c.SessionID, err = stringMember(members, "sid"); err != nil {
-		return c, err
+	// "sid" is omitted on a wmp.session.create; when present it is a
+	// non-empty string.
+	if _, ok := members["sid"]; ok {
+		if c.SessionID, err = stringMember(members, "sid"); err != nil {
+			return c, err
+		}
 	}
 	if _, ok := members["ath"]; ok {
 		if c.TokenHash, err = stringMember(members, "ath"); err != nil {
